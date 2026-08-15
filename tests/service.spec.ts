@@ -66,8 +66,9 @@ describe('TaskFlowService', () => {
   it('unimplemented actions fail with a stable error', () => {
     const service = new TaskFlowService()
     const run = service.submit({ title: '任务' })
-    const result = service.command(run.id, 'cancel' as never)
-    expect(result.ok).toBe(true)
+    const result = service.command(run.id, 'pause' as never)
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/not implemented/)
   })
 
   it('subscribe notifies on submit and cancel; unsubscribe stops it', () => {

@@ -18,6 +18,9 @@ import { TaskFlowService, type CommandAction, type SubmitRequest } from './servi
 /** Order of the announcement section within the tool-guidance band. */
 const SECTION_ORDER = 200
 
+/** Required services: systemPrompt for the announcement section. */
+export const inject = ['systemPrompt']
+
 /** Model-facing announcement: plugin presence, capabilities, and limits. */
 export const TASKFLOW_GUIDANCE = '本机已安装 dsh-taskflow 插件（DSH 全自动任务工作流编排）：任务提出后由 Codex CLI 规划拆分为 Issue 并发布看板，DSH 认领执行，Codex 只读审查决定打回或通过，按依赖序推进，最终人工验收。当前为 P0 骨架：仅支持提交/查看/取消运行，规划与执行引擎将在后续阶段启用。用户提到「工作流 / 任务流 / taskflow」时即指本插件，请据此协作。'
 
@@ -42,6 +45,30 @@ function sendJson(res: ServerResponse, body: unknown, status = 200): void {
     'Content-Length': Buffer.byteLength(payload),
   })
   res.end(payload)
+}
+
+/**
+ * Reject requests that are not same-origin POST with a JSON body. The host
+ * binds loopback by default but may be exposed on 0.0.0.0, and a CORS-safelisted
+ * text/plain POST would otherwise mutate the ledger without a preflight.
+ * @returns an error message when the request is rejected, else undefined.
+ */
+function guardMutation(req: IncomingMessage): string | undefined {
+  if (req.method !== 'POST') {
+    return 'taskflow: mutation routes require POST'
+  }
+  const contentType = req.headers['content-type'] ?? ''
+  if (!contentType.toLowerCase().startsWith('application/json')) {
+    return 'taskflow: mutation routes require application/json'
+  }
+  const origin = req.headers.origin
+  if (origin !== undefined) {
+    const host = req.headers.host
+    if (host === undefined || (origin !== `http://${host}` && origin !== `https://${host}`)) {
+      return 'taskflow: cross-origin request rejected'
+    }
+  }
+  return undefined
 }
 
 /** Read a JSON request body with a hard size cap. */
@@ -71,6 +98,11 @@ function readJsonBody(req: IncomingMessage, maxBytes: number): Promise<unknown> 
 
 /** POST /plugins/taskflow/submit — create a run from { title, description? }. */
 function handleSubmit(service: TaskFlowService, req: IncomingMessage, res: ServerResponse): void {
+  const guardError = guardMutation(req)
+  if (guardError !== undefined) {
+    sendJson(res, { ok: false, error: guardError }, 403)
+    return
+  }
   void readJsonBody(req, 64 * 1024).then((body) => {
     const request = (body ?? {}) as Partial<SubmitRequest>
     try {
@@ -86,6 +118,11 @@ function handleSubmit(service: TaskFlowService, req: IncomingMessage, res: Serve
 
 /** POST /plugins/taskflow/command — apply { runId, action } to a run. */
 function handleCommand(service: TaskFlowService, req: IncomingMessage, res: ServerResponse): void {
+  const guardError = guardMutation(req)
+  if (guardError !== undefined) {
+    sendJson(res, { ok: false, error: guardError }, 403)
+    return
+  }
   void readJsonBody(req, 64 * 1024).then((body) => {
     const { runId, action } = (body ?? {}) as { runId?: string; action?: CommandAction }
     if (typeof runId !== 'string' || runId === '') {
