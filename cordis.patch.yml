@@ -1,0 +1,7 @@
+# dsh-taskflow bundle layer: mounts the host-side orchestration service,
+# its same-origin HTTP routes, and the model-facing announcement section.
+# The browser half loads through the package's dsh.client manifest.
+- insert:
+    - id: taskflow
+      name: 'dsh-taskflow'
+      config: {}
