@@ -4,7 +4,7 @@ DSH 全自动任务工作流插件：任务提出后由 Codex CLI 规划拆分�
 
 ## 状态
 
-**P4（当前）**：已打通「提交任务 → Codex 规划拆分 Issue → DSH 串行认领执行 → 全部完成进入集成审查 → Codex 只读审查（PASS 人工验收 / REVISE 返工）→ 人工验收」的主链路。
+**P5（当前）**：已打通「提交任务 → Codex 规划拆分 Issue → DSH 按 DAG 并行认领执行（每个 Issue 独立 Git worktree）→ 成功后自动合并集成分支 → 全部完成进入集成审查 → Codex 只读审查（PASS 人工验收 / REVISE 返工）→ 人工验收」的主链路。
 
 已完成：
 
@@ -13,11 +13,12 @@ DSH 全自动任务工作流插件：任务提出后由 Codex CLI 规划拆分�
 - **P2**：Codex Planner——进程执行器、真实 JSONL 事件解析、严格输出 Schema、超时重试、规划状态流、repoRoot 白名单/规范化。
 - **P2.5**：规划并发与幂等收敛——显式幂等键、planning 单飞、持久化 PLANNING 转换后才应答、重启续跑。
 - **P3**：串行执行引擎——`READY → EXECUTING` 确定性认领（依赖拓扑序、一次一个）、`exec-result` 上报、失败即 `FAILED`、全部完成进入 `INTEGRATION_REVIEW`；支持 agent 驱动与自动化 Executor 双模式、重启恢复。
-- **P4**：Reviewer/Rework——`INTEGRATION_REVIEW` 后经 `/plugins/taskflow/review` 触发 Codex 只读审查（`codex exec review`，模型 `gpt-5.6-sol`、推理强度 `high`、只读沙箱）；PASS → `AWAITING_HUMAN`，REVISE → `EXECUTING` 并重置返工 Issue（含下游依赖）供串行执行器重新认领；审查记录持久化到 Run 聚合。
+- **P4**：Reviewer/Rework——`INTEGRATION_REVIEW` 后经 `/plugins/taskflow/review` 触发 Codex 只读审查（`codex exec review`，模型 `gpt-5.6-sol`、推理强度 `high`、只读沙箱）；PASS → `AWAITING_HUMAN`，REVISE → `EXECUTING` 并重置返工 Issue（含下游依赖）供执行器重新认领；审查记录持久化到 Run 聚合。
+- **P5**：DAG/Worktree——按 DAG 并行执行（`maxConcurrent` 配置，默认 1 保持串行兼容）；每个 Issue 在独立 Git worktree 中执行，成功后自动合并到集成分支 `taskflow/integration`，并清理 worktree/分支；执行/快照暴露 `workDir` 与 `branch`。
 
-当前版本 HEAD：`79dfd51`，测试套件 114 项（typecheck + vitest + build 通过）。
+当前版本 HEAD：`79dfd51`，测试套件 125 项（typecheck + vitest + build 通过）。
 
-后续阶段：P5 DAG/Worktree、P6 Board/迁移、P7 收口试运行。
+后续阶段：P6 Board/迁移、P7 收口试运行。
 
 ## HTTP 路由
 
@@ -27,7 +28,7 @@ DSH 全自动任务工作流插件：任务提出后由 Codex CLI 规划拆分�
 | POST | `/plugins/taskflow/submit` | 创建任务 Run |
 | POST | `/plugins/taskflow/command` | 执行命令（当前支持 cancel） |
 | POST | `/plugins/taskflow/plan` | 触发 Codex 规划 |
-| POST | `/plugins/taskflow/execute` | 启动/继续串行执行，认领当前 Issue |
+| POST | `/plugins/taskflow/execute` | 启动/继续执行，认领可调度 Issues（最多 maxConcurrent） |
 | POST | `/plugins/taskflow/exec-result` | 上报当前 Issue 执行结果 |
 | POST | `/plugins/taskflow/review` | 触发 P4 Codex 只读审查（PASS/REVISE） |
 
@@ -53,6 +54,7 @@ dsh plugin --profile web add <本仓库路径>
 - `src/dag.ts` — Issue 计划校验与依赖拓扑排序
 - `src/planner.ts` — Codex CLI 规划执行器
 - `src/reviewer.ts` — Codex CLI 只读审查执行器（PASS/REVISE）
+- `src/worktree.ts` — Git worktree 管理（建分支/合并/清理）
 - `src/executor.ts` — 执行器接口（agent 驱动 / 自动化双模式）
 - `src/client/` — 浏览器半体：`conversation.input.dock` 状态卡片（只读投影）
 - `build/` — 自 DSH checkout 拷贝的 client bundle 预设（保持与运行版本同步）
@@ -62,7 +64,7 @@ dsh plugin --profile web add <本仓库路径>
 
 ### What the model sees
 
-当前注入一段 `plugin:taskflow` 通告（order 200），声明插件存在、能力、HTTP 路由与当前 P4 阶段能力，模型可据此配合提交、规划、执行、结果上报与触发审查。
+当前注入一段 `plugin:taskflow` 通告（order 200），声明插件存在、能力、HTTP 路由与当前 P5 阶段能力，模型可据此配合提交、规划、并行执行、结果上报与触发审查。
 
 ### Token effect
 
@@ -70,7 +72,8 @@ dsh plugin --profile web add <本仓库路径>
 
 ## Known Limitations and Deferred Work
 
-- P5–P7 未实现：并行执行、worktree 隔离、看板/迁移、最终人工验收门。
+- P6–P7 未实现：看板/迁移、最终人工验收门。
 - P4 审查门为显式触发（`/plugins/taskflow/review`），不会在进入 `INTEGRATION_REVIEW` 后自动启动。
+- P5 并行执行默认 `maxConcurrent=1`，需通过插件配置调大；worktree 合并采用非快进合并，冲突会导致对应 Issue 失败。
 - 执行方为 DSH 会话或自动化 Executor 显式驱动；没有后台自动连续执行器。
 - 客户端卡片只读；写入全部走宿主受控路由。

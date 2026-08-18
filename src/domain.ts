@@ -58,6 +58,10 @@ export interface IssueExecution {
   summary?: string
   /** Failure message when failed. */
   error?: string
+  /** P5: isolated worktree path when this issue runs in a worktree. */
+  workDir?: string
+  /** P5: per-issue branch created for the worktree. */
+  branch?: string
 }
 
 /** P4 review verdict. */
@@ -97,6 +101,8 @@ const issueExecutionSchema = z.object({
   finishedAt: z.number().optional(),
   summary: z.string().optional(),
   error: z.string().optional(),
+  workDir: z.string().optional(),
+  branch: z.string().optional(),
 })
 
 const reviewSchema = z.object({
@@ -144,11 +150,10 @@ const runAggregateSchema = z.object({
   if (last.to !== run.status) {
     ctx.addIssue({ code: 'custom', message: `final transition '${last.to}' must equal run status '${run.status}'` })
   }
-  // Execution consistency: one entry per issue, all keys known, at most one
-  // running at a time (the serial-runner invariant survives restarts).
+  // Execution consistency: one entry per issue, all keys known. Multiple
+  // issues may be running concurrently (P5 DAG parallel execution).
   const issueKeys = new Set(run.issues.map((issue) => issue.key))
   const executedKeys = new Set<string>()
-  let runningCount = 0
   for (const execution of run.executions) {
     if (executedKeys.has(execution.key)) {
       ctx.addIssue({ code: 'custom', message: `duplicate execution for issue '${execution.key}'` })
@@ -157,10 +162,6 @@ const runAggregateSchema = z.object({
     if (!issueKeys.has(execution.key)) {
       ctx.addIssue({ code: 'custom', message: `execution references unknown issue '${execution.key}'` })
     }
-    if (execution.status === 'running') runningCount += 1
-  }
-  if (runningCount > 1) {
-    ctx.addIssue({ code: 'custom', message: 'at most one issue may be running at a time' })
   }
 })
 

@@ -11,6 +11,14 @@ import type { Executor } from '../src/executor.ts'
 import { ReviewerError, type ReviewInput, type Reviewer } from '../src/reviewer.ts'
 import { MemoryRepository } from '../src/repository.ts'
 import { TaskFlowService } from '../src/service.ts'
+import type { GitRunner } from '../src/worktree.ts'
+
+/** No-op git runner so service tests exercise orchestration, not real git. */
+const fakeGit: GitRunner = {
+  async run() {
+    return { exitCode: 0, stdout: 'master\n', stderr: '' }
+  },
+}
 
 /** Scriptable fake reviewer for service-level review-flow tests. */
 class FakeReviewer implements Reviewer {
@@ -33,9 +41,17 @@ const issueA: PlannedIssue = { key: 'issue-001', acceptance: '验收 A' }
 const issueB: PlannedIssue = { key: 'issue-002', acceptance: '验收 B', deps: ['issue-001'] }
 const issueC: PlannedIssue = { key: 'issue-003', acceptance: '验收 C', deps: ['issue-002'] }
 
-function harness(reviewer = new FakeReviewer(), executor?: Executor) {
+function harness(reviewer = new FakeReviewer(), executor?: Executor, options: { maxConcurrent?: number } = {}) {
   const repository = new MemoryRepository()
-  const service = new TaskFlowService(repository, () => 1000, undefined, ['C:/repo'], executor, reviewer)
+  const service = new TaskFlowService(
+    repository,
+    () => 1000,
+    undefined,
+    ['C:/repo'],
+    executor,
+    reviewer,
+    { git: fakeGit, ...options },
+  )
   return { repository, service, reviewer }
 }
 

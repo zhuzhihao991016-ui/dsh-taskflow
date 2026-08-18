@@ -12,6 +12,14 @@ import type { RunAggregate } from '../src/domain.ts'
 import type { ExecutionInput, ExecutionResult, Executor } from '../src/executor.ts'
 import { MemoryRepository } from '../src/repository.ts'
 import { TaskFlowService } from '../src/service.ts'
+import type { GitRunner } from '../src/worktree.ts'
+
+/** No-op git runner so service tests exercise orchestration, not real git. */
+const fakeGit: GitRunner = {
+  async run() {
+    return { exitCode: 0, stdout: 'master\n', stderr: '' }
+  },
+}
 
 /** Scriptable fake executor: records claim order, per-key results, optional
  * delay (concurrency) and an infrastructure error (throw). */
@@ -35,9 +43,17 @@ const issueA: PlannedIssue = { key: 'issue-001', acceptance: '验收 A' }
 const issueB: PlannedIssue = { key: 'issue-002', acceptance: '验收 B', deps: ['issue-001'] }
 const issueC: PlannedIssue = { key: 'issue-003', acceptance: '验收 C', deps: ['issue-001'] }
 
-function harness(executor?: Executor) {
+function harness(executor?: Executor, options: { maxConcurrent?: number } = {}) {
   const repository = new MemoryRepository()
-  const service = new TaskFlowService(repository, () => 1000, undefined, ['C:/repo'], executor)
+  const service = new TaskFlowService(
+    repository,
+    () => 1000,
+    undefined,
+    ['C:/repo'],
+    executor,
+    undefined,
+    { git: fakeGit, ...options },
+  )
   return { repository, service }
 }
 
@@ -72,7 +88,9 @@ describe('TaskFlowService.startExecution', () => {
     expect(result).toMatchObject({ ok: true, status: 'EXECUTING', currentIssue: 'issue-001', alreadyExecuting: false })
     const run = repository.getRun('run-0001') as RunAggregate
     expect(run.status).toBe('EXECUTING')
-    expect(run.executions).toEqual([{ key: 'issue-001', status: 'running', startedAt: 1000 }])
+    expect(run.executions[0]).toMatchObject({ key: 'issue-001', status: 'running', startedAt: 1000 })
+    expect(run.executions[0].workDir).toContain('.taskflow')
+    expect(run.executions[0].branch).toBe('taskflow/run-0001/issue-001')
     expect(run.transitions.map((t) => t.reason)).toEqual([
       'created', 'planning-started', 'planning-succeeded', 'execution-started',
     ])
@@ -88,9 +106,16 @@ describe('TaskFlowService.startExecution', () => {
       { key: 'issue-001', acceptance: '验收 A', deps: [], risk: null },
       { key: 'issue-002', acceptance: '验收 B', deps: ['issue-001'], risk: null },
     ])
-    expect(snapshot?.executions).toEqual([
-      { key: 'issue-001', status: 'running', startedAt: 1000, finishedAt: undefined, summary: undefined, error: undefined },
-    ])
+    expect(snapshot?.executions[0]).toMatchObject({
+      key: 'issue-001',
+      status: 'running',
+      startedAt: 1000,
+      finishedAt: undefined,
+      summary: undefined,
+      error: undefined,
+    })
+    expect(snapshot?.executions[0].workDir).toContain('.taskflow')
+    expect(snapshot?.executions[0].branch).toBe('taskflow/run-0001/issue-001')
   })
 
   it('executor mode: runs issues serially in dependency order to INTEGRATION_REVIEW', async () => {
@@ -228,7 +253,7 @@ describe('TaskFlowService.reportResult', () => {
     seedReady(repository, [issueA, issueB])
     await service.startExecution('run-0001')
     const report = await service.reportResult('run-0001', 'issue-002', { ok: true, summary: 'x' })
-    expect(report).toMatchObject({ ok: false, error: expect.stringContaining('not the current running issue') })
+    expect(report).toMatchObject({ ok: false, error: expect.stringContaining('not currently running') })
     const run = repository.getRun('run-0001') as RunAggregate
     expect(run.executions.find((e) => e.key === 'issue-001')?.status).toBe('running')
     expect(run.status).toBe('EXECUTING')
@@ -241,7 +266,7 @@ describe('TaskFlowService.reportResult', () => {
     // Report the claimed issue; nothing is claimed next until execute again.
     await service.reportResult('run-0001', 'issue-001', { ok: true, summary: '完成 A' })
     const report = await service.reportResult('run-0001', 'issue-002', { ok: true, summary: 'x' })
-    expect(report).toMatchObject({ ok: false, error: expect.stringContaining('no issue is currently running') })
+    expect(report).toMatchObject({ ok: false, error: expect.stringContaining('not currently running') })
   })
 
   it('rejects a result for a run that is not executing', async () => {
