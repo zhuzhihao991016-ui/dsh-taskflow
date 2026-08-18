@@ -13,11 +13,15 @@ import type { Planner } from '../src/service.ts'
 /** Scriptable fake planner for service-level plan-flow tests. */
 class FakePlanner implements Planner {
   calls = 0
+  delayMs = 0
   result: unknown = { issues: [] }
   error?: Error
 
   async plan(_input: PlanInput): Promise<unknown> {
     this.calls += 1
+    if (this.delayMs > 0) {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, this.delayMs))
+    }
     if (this.error !== undefined) throw this.error
     return this.result
   }
@@ -66,6 +70,23 @@ describe('TaskFlowService', () => {
     const first = await service.submit({ title: '任务', idempotencyKey: 'req-1' })
     const second = await service.submit({ title: '任务', idempotencyKey: 'req-1' })
     expect(second.id).toBe(first.id)
+    expect(service.list()).toHaveLength(1)
+  })
+
+  it('creates separate runs for same-title submits without a key', async () => {
+    const { service } = harness()
+    const first = await service.submit({ title: '同标题' })
+    const second = await service.submit({ title: '同标题' })
+    expect(first.id).not.toBe(second.id)
+    expect(service.list()).toHaveLength(2)
+  })
+
+  it('rejects the same idempotency key with a different request', async () => {
+    const { service } = harness()
+    await service.submit({ title: '任务', description: '原始', idempotencyKey: 'req-1' })
+    await expect(service.submit({ title: '任务', description: '改了', idempotencyKey: 'req-1' })).rejects.toThrow(
+      'different request',
+    )
     expect(service.list()).toHaveLength(1)
   })
 
@@ -255,6 +276,33 @@ describe('TaskFlowService.plan', () => {
     planner.result = PLAN
     service.resumePlanning()
     // resumePlanning is fire-and-forget; give the microtask queue a turn.
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 10))
+    expect(planner.calls).toBe(1)
+    expect(service.snapshot(run.id)?.status).toBe('READY')
+  })
+
+  it('runs the planner exactly once under concurrent plan calls', async () => {
+    const { service, planner } = harness()
+    planner.delayMs = 20
+    const run = await service.submit({ title: '并发规划', repoRoot: 'C:/repo' })
+    planner.result = PLAN
+    const results = await Promise.all([
+      service.plan(run.id, { wait: true }),
+      service.plan(run.id, { wait: true }),
+    ])
+    expect(planner.calls).toBe(1)
+    expect(results.every((result) => result.ok)).toBe(true)
+    expect(service.snapshot(run.id)?.status).toBe('READY')
+  })
+
+  it('does not double-run when resumePlanning overlaps an in-flight plan', async () => {
+    const { service, planner } = harness()
+    planner.delayMs = 20
+    const run = await service.submit({ title: '重叠规划', repoRoot: 'C:/repo' })
+    planner.result = PLAN
+    const first = service.plan(run.id, { wait: true })
+    service.resumePlanning()
+    await first
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 10))
     expect(planner.calls).toBe(1)
     expect(service.snapshot(run.id)?.status).toBe('READY')

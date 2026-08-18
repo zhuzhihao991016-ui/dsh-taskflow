@@ -95,6 +95,7 @@ function creationTransition(createdAt: number, idempotencyKey: string): RunTrans
  */
 export class TaskFlowService {
   private readonly listeners = new Set<() => void>()
+  private readonly planFlows = new Map<string, Promise<void>>()
   /** Serializes submits: idempotency check, id allocation, and insertion run
    * on one chain so overlapping requests can never double-allocate or
    * overwrite each other (single-writer host assumption). */
@@ -108,14 +109,27 @@ export class TaskFlowService {
     private readonly allowedRepoRoots: readonly string[] = [],
   ) {}
 
-  /** Submit a new workflow run; returns its RECEIVED snapshot. */
+  /** Submit a new workflow run; returns its RECEIVED snapshot. An explicit
+   * idempotencyKey deduplicates only when the normalized request matches the
+   * existing run; a different request under the same key is a stable conflict.
+   * Submits without a key always create a fresh run (no title-based dedup). */
   submit(request: SubmitRequest): Promise<RunSnapshot> {
     validateSubmit(request)
-    const idempotencyKey = request.idempotencyKey ?? `submit:${request.title.trim()}`
+    const explicitKey = request.idempotencyKey
     const job = async (): Promise<RunSnapshot> => {
-      const existing = this.findByIdempotency(idempotencyKey)
-      if (existing !== undefined) {
-        return this.snapshotOf(existing)
+      if (explicitKey !== undefined) {
+        const existing = this.findByExplicitKey(explicitKey)
+        if (existing !== undefined) {
+          if (
+            existing.title === request.title.trim()
+            && existing.description === (request.description?.trim() ?? '')
+          ) {
+            return this.snapshotOf(existing)
+          }
+          throw new Error(
+            `taskflow: idempotencyKey '${explicitKey}' is already used by run ${existing.id} with a different request`,
+          )
+        }
       }
 
       const now = this.now()
@@ -130,7 +144,7 @@ export class TaskFlowService {
         updatedAt: now,
         issueCount: 0,
         issues: [],
-        transitions: [creationTransition(now, idempotencyKey)],
+        transitions: [creationTransition(now, explicitKey !== undefined ? `submit:${explicitKey}` : `create:${id}`)],
       }
       // Parse before persist: a malformed aggregate must never reach the
       // medium (KvTable.put does not schema-check; open-time validation would
@@ -217,6 +231,10 @@ export class TaskFlowService {
    * planner runs in the background (Codex CLI, read-only) and the run moves
    * to READY (issues persisted) or FAILED. Idempotent per input: a repeated
    * plan for the same run/input reports alreadyPlanned without re-running.
+   * At most one planning flow runs per run: concurrent plan calls, repeated
+   * resumePlanning, and recovery overlapping an HTTP trigger all share the
+   * single in-flight flow (planFlows), so the planner never runs twice for
+   * the same run and exactly one terminal transition is appended.
    * @param runId - the run to plan.
    * @param options - wait: await the background flow (tests/CLI) instead of
    * returning right after the PLANNING transition.
@@ -236,34 +254,60 @@ export class TaskFlowService {
     if (run.transitions.some((t) => t.idempotencyKey === `plan:done:${inputHash}`)) {
       return { ok: true, runId, status: run.status, alreadyPlanned: true }
     }
-    if (run.status === 'PLANNING') {
-      // Persisted in-progress planning (host restarted after the PLANNING
-      // write but before the flow committed): resume the flow instead of the
-      // illegal PLANNING → PLANNING transition.
-      const resumed = this.runPlanning(runId, inputHash)
+    if (run.status !== 'RECEIVED' && run.status !== 'PLANNING') {
+      return { ok: false, error: `taskflow: illegal transition ${run.status} → PLANNING` }
+    }
+    // Single-flight: the whole operation (transition + planning flow) is
+    // registered synchronously at entry, so concurrent plan calls, repeated
+    // resumePlanning, and recovery overlapping an HTTP trigger all observe
+    // the in-flight flow before any await and never start a second one.
+    const inFlight = this.planFlows.get(runId)
+    if (inFlight !== undefined) {
       if (options.wait === true) {
-        await resumed.catch(() => undefined)
+        await inFlight.catch(() => undefined)
       }
-      return { ok: true, runId, status: 'PLANNING', alreadyPlanned: false }
+      return { ok: true, runId, status: run.status, alreadyPlanned: false }
     }
-    try {
-      await this.repository.updateRun(runId, (current) => {
-        assertTransition(current.status, 'PLANNING')
-        return this.withTransition(current, 'PLANNING', 'planning-started', `plan:start:${inputHash}`)
-      })
-      this.notify()
-    } catch (error) {
-      const message = (error as Error).message
-      if (message.startsWith('taskflow:')) {
-        return { ok: false, error: message }
-      }
-      throw error
-    }
-    const flow = this.runPlanning(runId, inputHash)
+    const flow = this.runPlanOnce(runId, inputHash)
+    this.planFlows.set(runId, flow)
+    void flow.finally(() => {
+      this.planFlows.delete(runId)
+    })
     if (options.wait === true) {
       await flow.catch(() => undefined)
     }
     return { ok: true, runId, status: 'PLANNING', alreadyPlanned: false }
+  }
+
+  /**
+   * The single in-flight planning operation for a run: transition to PLANNING
+   * (when RECEIVED), then run the planner and commit READY/FAILED. A failed
+   * transition (a concurrent flow already moved the run) exits quietly — that
+   * flow owns the planning. A persisted PLANNING run (host restart) skips the
+   * transition and resumes directly.
+   */
+  private async runPlanOnce(runId: string, inputHash: string): Promise<void> {
+    const run = this.repository.getRun(runId)
+    if (run === undefined) return
+    if (run.status === 'RECEIVED') {
+      try {
+        await this.repository.updateRun(runId, (current) => {
+          assertTransition(current.status, 'PLANNING')
+          return this.withTransition(current, 'PLANNING', 'planning-started', `plan:start:${inputHash}`)
+        })
+        this.notify()
+      } catch (error) {
+        const message = (error as Error).message
+        if (message.startsWith('taskflow:')) {
+          // A concurrent flow won the atomic transition; it owns the planning.
+          return
+        }
+        throw error
+      }
+    } else if (run.status !== 'PLANNING') {
+      return
+    }
+    await this.runPlanningBody(runId, inputHash)
   }
 
   /** Resume every persisted in-progress planning flow (called at host start). */
@@ -288,8 +332,8 @@ export class TaskFlowService {
     return createHash('sha256').update(`${run.title}\n${run.description}`).digest('hex').slice(0, 16)
   }
 
-  /** Background planning flow: planner → validate → READY/FAILED. */
-  private async runPlanning(runId: string, inputHash: string): Promise<void> {
+  /** Background planning body: planner → validate → READY/FAILED (single-flight via planFlows). */
+  private async runPlanningBody(runId: string, inputHash: string): Promise<void> {
     try {
       const run = this.repository.getRun(runId)
       if (run === undefined) return
@@ -366,9 +410,11 @@ export class TaskFlowService {
     return next
   }
 
-  private findByIdempotency(idempotencyKey: string): RunAggregate | undefined {
+  /** Find the run created under an explicit idempotency key (creation transition key `submit:<key>`). */
+  private findByExplicitKey(idempotencyKey: string): RunAggregate | undefined {
+    const target = `submit:${idempotencyKey}`
     return this.repository.listRuns().find((run) =>
-      run.transitions.some((transition) => transition.idempotencyKey === idempotencyKey),
+      run.transitions.some((transition) => transition.idempotencyKey === target),
     )
   }
 
