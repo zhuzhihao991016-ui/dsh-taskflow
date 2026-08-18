@@ -293,6 +293,15 @@ export class TaskFlowService {
           }
           throw error
         }
+        // The sibling registers its flow in the continuation that ran before
+        // ours (microtask FIFO), so re-read the map instead of using the
+        // pre-transition capture: wait:true must await the flow, not just the
+        // transition.
+        const flow = this.planFlows.get(runId)
+        if (options.wait === true && flow !== undefined) {
+          await flow.catch(() => undefined)
+        }
+        return { ok: true, runId, status: 'PLANNING', alreadyPlanned: false }
       }
       if (options.wait === true && inFlight !== undefined) {
         await inFlight.catch(() => undefined)

@@ -421,6 +421,8 @@ describe('TaskFlowService.plan', () => {
     let secondSettled = false
     const second = service.plan('run-0001', { wait: true }).then((result) => {
       secondSettled = true
+      // wait:true must not settle until the flow reached a terminal state.
+      expect(service.snapshot('run-0001')?.status).toBe('READY')
       return result
     })
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 20))
