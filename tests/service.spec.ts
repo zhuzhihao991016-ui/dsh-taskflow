@@ -113,6 +113,22 @@ describe('TaskFlowService', () => {
     expect(service.list()).toHaveLength(1)
   })
 
+  it('keeps user keys that look like generated encodings distinct', async () => {
+    const { service } = harness()
+    // Key `foo` is stored as `submit:foo`; a later request with the literal
+    // key `submit:foo` is a DIFFERENT key and must not alias it.
+    const first = await service.submit({ title: '甲', idempotencyKey: 'foo' })
+    const second = await service.submit({ title: '乙', idempotencyKey: 'submit:foo' })
+    expect(second.id).not.toBe(first.id)
+    expect(service.list()).toHaveLength(2)
+    // Unkeyed runs carry a generated `create:<runId>` marker; a user key that
+    // spells the marker must not match it either.
+    await service.submit({ title: '丙' })
+    const third = await service.submit({ title: '丁', idempotencyKey: 'create:run-0003' })
+    expect(third.id).not.toBe('run-0003')
+    expect(service.list()).toHaveLength(4)
+  })
+
   it('rejects a non-string idempotency key before persisting anything', async () => {
     const { service } = harness()
     expect(() => service.submit({ title: '任务', idempotencyKey: 123 as never })).toThrow(
@@ -377,6 +393,65 @@ describe('TaskFlowService.plan', () => {
     const service = new TaskFlowService(failing, () => 1000, planner, ['C:/repo'])
     await service.submit({ title: '故障', repoRoot: 'C:/repo' })
     await expect(service.plan('run-0001')).rejects.toThrow('backend unavailable')
+    expect(planner.calls).toBe(0)
+  })
+
+  it('does not answer a concurrent plan until the PLANNING transition is durable', async () => {
+    // While a sibling is still making the PLANNING transition durable, an
+    // overlapping plan call must not acknowledge: it awaits the SAME
+    // transition promise instead of returning a false 202 with stale status.
+    class GatedRepository extends MemoryRepository {
+      // `release` must be declared BEFORE `gate`: with define-semantics class
+      // fields, a later declaration would overwrite the value assigned by the
+      // earlier initializer.
+      release!: () => void
+      gate = new Promise<void>((resolvePromise) => { this.release = resolvePromise })
+
+      override async updateRun(id: string, fn: (current: RunAggregate) => RunAggregate): Promise<RunAggregate> {
+        await this.gate
+        return super.updateRun(id, fn)
+      }
+    }
+    const gated = new GatedRepository()
+    const planner = new FakePlanner()
+    planner.result = { issues: [{ key: 'issue-001', acceptance: '验收 A' }] }
+    const service = new TaskFlowService(gated, () => 1000, planner, ['C:/repo'])
+    await service.submit({ title: '门控规划', repoRoot: 'C:/repo' })
+    const first = service.plan('run-0001', { wait: true })
+    let secondSettled = false
+    const second = service.plan('run-0001', { wait: true }).then((result) => {
+      secondSettled = true
+      return result
+    })
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 20))
+    expect(secondSettled).toBe(false)
+    gated.release()
+    const results = await Promise.all([first, second])
+    expect(results.every((result) => result.ok)).toBe(true)
+    expect(planner.calls).toBe(1)
+    expect(service.snapshot('run-0001')?.status).toBe('READY')
+  })
+
+  it('propagates a failed PLANNING transition to overlapping plan calls', async () => {
+    // A backend outage during the transition must fail EVERY overlapping
+    // caller (no 202 for the run that never left RECEIVED).
+    class FailingRepository extends MemoryRepository {
+      override updateRun(id: string, fn: (current: RunAggregate) => RunAggregate): Promise<RunAggregate> {
+        if (id === 'run-0001') {
+          return Promise.reject(new Error('backend unavailable'))
+        }
+        return super.updateRun(id, fn)
+      }
+    }
+    const failing = new FailingRepository()
+    const planner = new FakePlanner()
+    const service = new TaskFlowService(failing, () => 1000, planner, ['C:/repo'])
+    await service.submit({ title: '故障并发', repoRoot: 'C:/repo' })
+    const results = await Promise.allSettled([
+      service.plan('run-0001'),
+      service.plan('run-0001'),
+    ])
+    expect(results.every((result) => result.status === 'rejected')).toBe(true)
     expect(planner.calls).toBe(0)
   })
 })

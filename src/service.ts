@@ -96,8 +96,12 @@ function creationTransition(createdAt: number, idempotencyKey: string): RunTrans
 export class TaskFlowService {
   private readonly listeners = new Set<() => void>()
   private readonly planFlows = new Map<string, Promise<void>>()
-  /** Runs whose PLANNING transition is in flight (single-flight gate at entry). */
-  private readonly startingPlans = new Set<string>()
+  /** Runs whose PLANNING transition is in flight: runId → the durable
+   * transition promise. Set synchronously at plan() entry (before any await)
+   * so overlapping callers await the SAME promise instead of acknowledging a
+   * not-yet-durable transition; the map entry is removed when the transition
+   * settles. */
+  private readonly startingTransitions = new Map<string, Promise<void>>()
   /** Serializes submits: idempotency check, id allocation, and insertion run
    * on one chain so overlapping requests can never double-allocate or
    * overwrite each other (single-writer host assumption). */
@@ -273,32 +277,58 @@ export class TaskFlowService {
     // recovery overlapping an HTTP trigger all observe it and never enter the
     // transition or start a second planner body.
     const inFlight = this.planFlows.get(runId)
-    const starting = this.startingPlans.has(runId)
-    if (inFlight !== undefined || starting) {
+    const starting = this.startingTransitions.get(runId)
+    if (inFlight !== undefined || starting !== undefined) {
+      if (starting !== undefined) {
+        // A sibling is making the PLANNING transition durable. Await the same
+        // promise so our ack is never a false 202 while the run is still
+        // RECEIVED; a failed transition propagates to every overlapping
+        // caller instead of being acknowledged.
+        try {
+          await starting
+        } catch (error) {
+          const message = (error as Error).message
+          if (message.startsWith('taskflow:')) {
+            return { ok: false, error: message }
+          }
+          throw error
+        }
+      }
       if (options.wait === true && inFlight !== undefined) {
         await inFlight.catch(() => undefined)
       }
-      return { ok: true, runId, status: run.status, alreadyPlanned: false }
+      return { ok: true, runId, status: 'PLANNING', alreadyPlanned: false }
     }
     if (run.status === 'RECEIVED') {
       // Await the durable PLANNING transition before acknowledging: the HTTP
       // route must never answer 202 for a run that is still RECEIVED or was
       // cancelled by a queued command. Only the planner body stays background.
-      this.startingPlans.add(runId)
+      let transition: Promise<void>
       try {
-        await this.repository.updateRun(runId, (current) => {
+        transition = this.repository.updateRun(runId, (current) => {
           assertTransition(current.status, 'PLANNING')
           return this.withTransition(current, 'PLANNING', 'planning-started', `plan:start:${inputHash}`)
-        })
-        this.notify()
+        }).then(() => { this.notify() })
+        this.startingTransitions.set(runId, transition)
+        void transition.then(
+          () => { this.startingTransitions.delete(runId) },
+          () => { this.startingTransitions.delete(runId) },
+        )
       } catch (error) {
         const message = (error as Error).message
         if (message.startsWith('taskflow:')) {
           return { ok: false, error: message }
         }
         throw error
-      } finally {
-        this.startingPlans.delete(runId)
+      }
+      try {
+        await transition
+      } catch (error) {
+        const message = (error as Error).message
+        if (message.startsWith('taskflow:')) {
+          return { ok: false, error: message }
+        }
+        throw error
       }
     }
     const flow = this.runPlanningBody(runId, inputHash)
@@ -416,13 +446,20 @@ export class TaskFlowService {
   /** Find the run created under an explicit idempotency key. Recognizes the
    * current encoding (`submit:<key>` on the creation transition) and the
    * legacy encoding (the bare key verbatim, stored by versions before the
-   * encoding change), so retries of legacy explicit keys stay idempotent. */
+   * encoding change), so retries of legacy explicit keys stay idempotent.
+   * The legacy arm excludes generated encodings (`submit:*` and `create:*`):
+   * a stored `submit:foo` is the current encoding of key `foo`, never a bare
+   * legacy key, and the `create:<runId>` markers of unkeyed runs are never
+   * matchable — so user keys that merely look like encodings stay distinct. */
   private findByExplicitKey(idempotencyKey: string): RunAggregate | undefined {
     const target = `submit:${idempotencyKey}`
     return this.repository.listRuns().find((run) => {
       const creation = run.transitions[0]
-      return creation !== undefined
-        && (creation.idempotencyKey === target || creation.idempotencyKey === idempotencyKey)
+      if (creation === undefined) return false
+      if (creation.idempotencyKey === target) return true
+      return !creation.idempotencyKey.startsWith('submit:')
+        && !creation.idempotencyKey.startsWith('create:')
+        && creation.idempotencyKey === idempotencyKey
     })
   }
 
