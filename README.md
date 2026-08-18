@@ -15,7 +15,7 @@ DSH 全自动任务工作流插件：任务提出后由 Codex CLI 规划拆分�
 - **P3**：串行执行引擎——`READY → EXECUTING` 确定性认领（依赖拓扑序、一次一个）、`exec-result` 上报、失败即 `FAILED`、全部完成进入 `INTEGRATION_REVIEW`；支持 agent 驱动与自动化 Executor 双模式、重启恢复。
 - **P4**：Reviewer/Rework——`INTEGRATION_REVIEW` 后经 `/plugins/taskflow/review` 触发 Codex 只读审查（`codex exec review`，模型 `gpt-5.6-sol`、推理强度 `high`、只读沙箱）；PASS → `AWAITING_HUMAN`，REVISE → `EXECUTING` 并重置返工 Issue（含下游依赖）供串行执行器重新认领；审查记录持久化到 Run 聚合。
 
-当前版本 HEAD：`636fd6c`，测试套件 114 项（typecheck + vitest + build 通过）。
+当前版本 HEAD：`79dfd51`，测试套件 114 项（typecheck + vitest + build 通过）。
 
 后续阶段：P5 DAG/Worktree、P6 Board/迁移、P7 收口试运行。
 
