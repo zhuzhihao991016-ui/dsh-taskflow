@@ -8,6 +8,7 @@
 
 import { z } from 'zod'
 import { defineDomain, domainTable } from '@deepseek-ai/dsh-storage-domain'
+import type { PlannedIssue } from './dag.ts'
 import { RUN_STATUSES, type RunStatus } from './state.ts'
 
 /** One recorded transition inside a run aggregate. */
@@ -29,9 +30,13 @@ export interface RunAggregate {
   status: RunStatus
   title: string
   description: string
+  /** Repo root the planner/executor work in; required for planning. */
+  repoRoot?: string
   createdAt: number
   updatedAt: number
   issueCount: number
+  /** Validated planned issues (P2); empty until a plan succeeds. */
+  issues: PlannedIssue[]
   /** Append-only; `transitions[transitions.length - 1].to` equals `status`. */
   transitions: RunTransition[]
 }
@@ -46,14 +51,23 @@ const transitionSchema = z.object({
   at: z.number(),
 })
 
+const plannedIssueSchema = z.object({
+  key: z.string().min(1),
+  acceptance: z.string().min(1),
+  deps: z.array(z.string()).default([]),
+  risk: z.enum(['L1', 'L2', 'L3']).optional(),
+})
+
 const runAggregateSchema = z.object({
   id: z.string().min(1),
   status: z.enum(RUN_STATUSES),
   title: z.string().min(1),
   description: z.string(),
+  repoRoot: z.string().optional(),
   createdAt: z.number(),
   updatedAt: z.number(),
   issueCount: z.number().int().min(0),
+  issues: z.array(plannedIssueSchema).default([]),
   transitions: z.array(transitionSchema),
 }).superRefine((run, ctx) => {
   // Aggregate history consistency: this runs at every domain open (the

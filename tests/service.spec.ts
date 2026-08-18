@@ -5,13 +5,29 @@
  */
 
 import { describe, expect, it } from 'vitest'
+import { PlannerError, type PlanInput } from '../src/planner.ts'
 import { MemoryRepository } from '../src/repository.ts'
 import { TaskFlowService, validateSubmit } from '../src/service.ts'
+import type { Planner } from '../src/service.ts'
+
+/** Scriptable fake planner for service-level plan-flow tests. */
+class FakePlanner implements Planner {
+  calls = 0
+  result: unknown = { issues: [] }
+  error?: Error
+
+  async plan(_input: PlanInput): Promise<unknown> {
+    this.calls += 1
+    if (this.error !== undefined) throw this.error
+    return this.result
+  }
+}
 
 function harness() {
   const repository = new MemoryRepository()
-  const service = new TaskFlowService(repository)
-  return { repository, service }
+  const planner = new FakePlanner()
+  const service = new TaskFlowService(repository, () => 1000, planner)
+  return { repository, service, planner }
 }
 
 describe('validateSubmit', () => {
@@ -135,5 +151,92 @@ describe('TaskFlowService', () => {
       first.status = 'ACCEPTED' as never
       expect(service.snapshot(run.id)?.status).toBe('RECEIVED')
     }
+  })
+})
+
+describe('TaskFlowService.plan', () => {
+  const PLAN = {
+    issues: [
+      { key: 'issue-001', acceptance: '验收 A' },
+      { key: 'issue-002', acceptance: '验收 B', deps: ['issue-001'], risk: 'L2' },
+    ],
+  }
+
+  async function submitReady(service: TaskFlowService, planner: FakePlanner, title = '任务') {
+    const run = await service.submit({ title, description: '描述', repoRoot: 'C:/repo' })
+    planner.result = PLAN
+    return run
+  }
+
+  it('moves RECEIVED → PLANNING → READY and persists the validated issues', async () => {
+    const { repository, service, planner } = harness()
+    const run = await submitReady(service, planner)
+    const result = await service.plan(run.id, { wait: true })
+
+    expect(result).toMatchObject({ ok: true, runId: run.id, status: 'PLANNING', alreadyPlanned: false })
+    expect(planner.calls).toBe(1)
+    const aggregate = repository.getRun(run.id)
+    expect(aggregate?.status).toBe('READY')
+    expect(aggregate?.issueCount).toBe(2)
+    expect(aggregate?.issues.map((issue) => issue.key)).toEqual(['issue-001', 'issue-002'])
+    expect(aggregate?.transitions.map((t) => t.reason)).toEqual([
+      'created', 'planning-started', 'planning-succeeded',
+    ])
+  })
+
+  it('rejects a cyclic plan and moves the run to FAILED', async () => {
+    const { service, planner } = harness()
+    const run = await submitReady(service, planner)
+    planner.result = {
+      issues: [
+        { key: 'a', acceptance: 'x', deps: ['b'] },
+        { key: 'b', acceptance: 'x', deps: ['a'] },
+      ],
+    }
+    await service.plan(run.id, { wait: true })
+    expect(service.snapshot(run.id)?.status).toBe('FAILED')
+  })
+
+  it('fails the run when the planner errors (infrastructure failure)', async () => {
+    const { service, planner } = harness()
+    const run = await submitReady(service, planner)
+    planner.error = new PlannerError('timeout', 'exceeded')
+    await service.plan(run.id, { wait: true })
+    expect(service.snapshot(run.id)?.status).toBe('FAILED')
+  })
+
+  it('requires repoRoot before starting a plan', async () => {
+    const { service } = harness()
+    const run = await service.submit({ title: '无仓库' })
+    const result = await service.plan(run.id)
+    expect(result).toMatchObject({ ok: false, error: expect.stringContaining('repoRoot') })
+    expect(service.snapshot(run.id)?.status).toBe('RECEIVED')
+  })
+
+  it('is idempotent: a repeated plan for the same input does not re-run the planner', async () => {
+    const { service, planner } = harness()
+    const run = await submitReady(service, planner)
+    await service.plan(run.id, { wait: true })
+    const again = await service.plan(run.id, { wait: true })
+    expect(again).toMatchObject({ ok: true, alreadyPlanned: true })
+    expect(planner.calls).toBe(1)
+  })
+
+  it('reports alreadyPlanned when planning a run that already has a plan for the same input', async () => {
+    const { service, planner } = harness()
+    const run = await submitReady(service, planner)
+    await service.plan(run.id, { wait: true })
+    const result = await service.plan(run.id)
+    expect(result).toMatchObject({ ok: true, alreadyPlanned: true })
+    expect(planner.calls).toBe(1)
+  })
+
+  it('rejects planning a run in a non-plannable state (cancelled, no plan)', async () => {
+    const { service, planner } = harness()
+    const run = await service.submit({ title: '任务', repoRoot: 'C:/repo' })
+    await service.command(run.id, 'cancel')
+    const result = await service.plan(run.id)
+    expect(result.ok).toBe(false)
+    expect(result).toMatchObject({ ok: false, error: expect.stringContaining('illegal transition') })
   })
 })

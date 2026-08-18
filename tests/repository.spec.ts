@@ -57,6 +57,7 @@ function sampleAggregate(id: string) {
     createdAt: 1,
     updatedAt: 1,
     issueCount: 0,
+    issues: [],
     transitions: [{
       seq: 0, from: 'RECEIVED' as const, to: 'RECEIVED' as const,
       reason: 'created', actor: 'host', idempotencyKey: `create:${id}`, at: 1,
@@ -196,5 +197,24 @@ describe('DomainRepository', () => {
       code: 'invalid-record',
     })
     await ctx.fiber.dispose()
+  })
+
+  it('opens a pre-P2 medium without the issues field (defaults to [])', async () => {
+    const root = await freshRoot()
+    const legacy = sampleAggregate('run-0001')
+    const { issues, ...withoutIssues } = legacy
+    void issues
+    await writeFile(
+      join(root, 'taskflow.json'),
+      JSON.stringify({
+        unit: { name: 'taskflow', version: 1 },
+        global: null,
+        tables: { runs: { 'run-0001': withoutIssues } },
+      }),
+      'utf8',
+    )
+    const mounted = await mount(root)
+    expect(mounted.repository.getRun('run-0001')?.issues).toEqual([])
+    await unmount(mounted.ctx, mounted.domain)
   })
 })

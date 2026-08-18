@@ -24,7 +24,7 @@ const SECTION_ORDER = 200
 export const inject = ['systemPrompt', 'storageDomain']
 
 /** Model-facing announcement: plugin presence, capabilities, and limits. */
-export const TASKFLOW_GUIDANCE = '本机已安装 dsh-taskflow 插件（DSH 全自动任务工作流编排）：任务提出后由 Codex CLI 规划拆分为 Issue 并发布看板，DSH 认领执行，Codex 只读审查决定打回或通过，按依赖序推进，最终人工验收。当前为 P1 阶段：运行台账已持久化（重启不丢，支持幂等提交与取消），规划与执行引擎将在后续阶段启用。用户提到「工作流 / 任务流 / taskflow」时即指本插件，请据此协作。'
+export const TASKFLOW_GUIDANCE = '本机已安装 dsh-taskflow 插件（DSH 全自动任务工作流编排）：任务提出后由 Codex CLI 规划拆分为 Issue 并发布看板，DSH 认领执行，Codex 只读审查决定打回或通过，按依赖序推进，最终人工验收。当前为 P2 阶段：运行台账已持久化，Codex 规划引擎已接入（提交时带 repoRoot 后经 /plan 触发规划，规划通过后运行进入 READY 并携带 Issue 清单）；执行引擎将在后续阶段启用。用户提到「工作流 / 任务流 / taskflow」时即指本插件，请据此协作。'
 
 /** Plugin config; schema defaults are applied by the loader. */
 export interface Config {
@@ -108,7 +108,7 @@ function readJsonBody(req: IncomingMessage, maxBytes: number): Promise<unknown> 
   })
 }
 
-/** POST /plugins/taskflow/submit — create a run from { title, description?, idempotencyKey? }. */
+/** POST /plugins/taskflow/submit — create a run from { title, description?, repoRoot?, idempotencyKey? }. */
 function handleSubmit(service: TaskFlowService, req: IncomingMessage, res: ServerResponse): void {
   const guardError = guardMutation(req)
   if (guardError !== undefined) {
@@ -120,9 +120,33 @@ function handleSubmit(service: TaskFlowService, req: IncomingMessage, res: Serve
     void service.submit({
       title: request.title ?? '',
       description: request.description,
+      repoRoot: request.repoRoot,
       idempotencyKey: request.idempotencyKey,
     }).then((run) => {
       sendJson(res, { ok: true, run })
+    }, (error) => {
+      sendJson(res, { ok: false, error: (error as Error).message }, errorStatus(error))
+    })
+  }, (error) => {
+    sendJson(res, { ok: false, error: (error as Error).message }, 400)
+  })
+}
+
+/** POST /plugins/taskflow/plan — start planning { runId }; the flow continues in the background. */
+function handlePlan(service: TaskFlowService, req: IncomingMessage, res: ServerResponse): void {
+  const guardError = guardMutation(req)
+  if (guardError !== undefined) {
+    sendJson(res, { ok: false, error: guardError }, 403)
+    return
+  }
+  void readJsonBody(req, 64 * 1024).then((body) => {
+    const { runId } = (body ?? {}) as { runId?: string }
+    if (typeof runId !== 'string' || runId === '') {
+      sendJson(res, { ok: false, error: 'taskflow: plan requires runId' }, 400)
+      return
+    }
+    void service.plan(runId).then((result) => {
+      sendJson(res, result.ok ? { ok: true, runId, status: result.status, alreadyPlanned: result.alreadyPlanned } : { ok: false, error: result.error }, result.ok ? 202 : 409)
     }, (error) => {
       sendJson(res, { ok: false, error: (error as Error).message }, errorStatus(error))
     })
@@ -209,6 +233,13 @@ export function apply(ctx: Context, config?: Config): Promise<void> {
             path: '/plugins/taskflow/command',
             handler: (req, res) => {
               handleCommand(service, req, res)
+            },
+          }),
+          webScope.webServer.register({
+            kind: 'exact',
+            path: '/plugins/taskflow/plan',
+            handler: (req, res) => {
+              handlePlan(service, req, res)
             },
           }),
         ]

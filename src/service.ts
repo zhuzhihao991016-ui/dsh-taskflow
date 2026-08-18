@@ -6,7 +6,13 @@
  * submit / snapshot / list / command / subscribe.
  */
 
+import { createHash } from 'node:crypto'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { runAggregateSchema, type RunAggregate, type RunTransition } from './domain.ts'
+import type { PlannedIssue } from './dag.ts'
+import { validatePlan } from './dag.ts'
+import { CodexPlanner, PlannerError, type PlanInput } from './planner.ts'
 import type { TaskFlowRepository } from './repository.ts'
 import { assertTransition, isTerminal, type RunStatus } from './state.ts'
 
@@ -28,8 +34,20 @@ export interface SubmitRequest {
   title: string
   /** Optional free-form goal/description. */
   description?: string
+  /** Repo root the planner/executor work in; required for planning. */
+  repoRoot?: string
   /** Optional client-supplied idempotency key; a repeated submit returns the existing run. */
   idempotencyKey?: string
+}
+
+/** Result of starting a plan; the flow continues in the background. */
+export type PlanStartResult =
+  | { ok: true; runId: string; status: RunStatus; alreadyPlanned: boolean }
+  | { ok: false; error: string }
+
+/** Planner abstraction (production: CodexPlanner; tests: fakes). */
+export interface Planner {
+  plan(input: PlanInput): Promise<unknown>
 }
 
 /** Commands the host accepts on a run (P1: cancel only). */
@@ -48,6 +66,9 @@ export function validateSubmit(request: SubmitRequest): void {
   }
   if (request.description !== undefined && typeof request.description !== 'string') {
     throw new Error('taskflow: description must be a string')
+  }
+  if (request.repoRoot !== undefined && typeof request.repoRoot !== 'string') {
+    throw new Error('taskflow: repoRoot must be a string')
   }
   if (request.idempotencyKey !== undefined && typeof request.idempotencyKey !== 'string') {
     throw new Error('taskflow: idempotencyKey must be a string')
@@ -82,6 +103,7 @@ export class TaskFlowService {
   constructor(
     private readonly repository: TaskFlowRepository,
     private readonly now: () => number = Date.now,
+    private readonly planner: Planner = new CodexPlanner(),
   ) {}
 
   /** Submit a new workflow run; returns its RECEIVED snapshot. */
@@ -101,9 +123,11 @@ export class TaskFlowService {
         status: 'RECEIVED',
         title: request.title.trim(),
         description: request.description?.trim() ?? '',
+        repoRoot: request.repoRoot?.trim() === '' ? undefined : request.repoRoot?.trim(),
         createdAt: now,
         updatedAt: now,
         issueCount: 0,
+        issues: [],
         transitions: [creationTransition(now, idempotencyKey)],
       }
       // Parse before persist: a malformed aggregate must never reach the
@@ -186,6 +210,129 @@ export class TaskFlowService {
     return () => { this.listeners.delete(listener) }
   }
 
+  /**
+   * Start planning for a run: RECEIVED → PLANNING immediately, then the
+   * planner runs in the background (Codex CLI, read-only) and the run moves
+   * to READY (issues persisted) or FAILED. Idempotent per input: a repeated
+   * plan for the same run/input reports alreadyPlanned without re-running.
+   * @param runId - the run to plan.
+   * @param options - wait: await the background flow (tests/CLI) instead of
+   * returning right after the PLANNING transition.
+   */
+  async plan(runId: string, options: { wait?: boolean } = {}): Promise<PlanStartResult> {
+    const run = this.repository.getRun(runId)
+    if (run === undefined) {
+      return { ok: false, error: `taskflow: unknown run ${runId}` }
+    }
+    if (run.repoRoot === undefined || run.repoRoot === '') {
+      return { ok: false, error: 'taskflow: run has no repoRoot; planning requires a repo root' }
+    }
+    const inputHash = this.planInputHash(run)
+    if (run.transitions.some((t) => t.idempotencyKey === `plan:done:${inputHash}`)) {
+      return { ok: true, runId, status: run.status, alreadyPlanned: true }
+    }
+    try {
+      await this.repository.updateRun(runId, (current) => {
+        assertTransition(current.status, 'PLANNING')
+        return this.withTransition(current, 'PLANNING', 'planning-started', `plan:start:${inputHash}`)
+      })
+      this.notify()
+    } catch (error) {
+      const message = (error as Error).message
+      if (message.startsWith('taskflow:')) {
+        return { ok: false, error: message }
+      }
+      throw error
+    }
+    const flow = this.runPlanning(runId, inputHash)
+    if (options.wait === true) {
+      await flow.catch(() => undefined)
+    }
+    return { ok: true, runId, status: 'PLANNING', alreadyPlanned: false }
+  }
+
+  private planInputHash(run: RunAggregate): string {
+    return createHash('sha256').update(`${run.title}\n${run.description}`).digest('hex').slice(0, 16)
+  }
+
+  /** Background planning flow: planner → validate → READY/FAILED. */
+  private async runPlanning(runId: string, inputHash: string): Promise<void> {
+    try {
+      const run = this.repository.getRun(runId)
+      if (run === undefined) return
+      const planObject = await this.planner.plan({
+        title: run.title,
+        description: run.description,
+        repoRoot: run.repoRoot ?? '',
+        workDir: join(defaultPlanRoot(), runId),
+      })
+      const rawIssues = (planObject as { issues?: unknown } | null)?.issues
+      const issues = Array.isArray(rawIssues) ? rawIssues as PlannedIssue[] : undefined
+      const verdict = issues === undefined
+        ? { ok: false as const, error: 'taskflow: planner output has no issues array' }
+        : validatePlan(issues)
+      if (!verdict.ok) {
+        await this.transitionTo(runId, 'FAILED', `planning-rejected: ${verdict.error}`, `plan:reject:${inputHash}`)
+        return
+      }
+      await this.repository.updateRun(runId, (current) => {
+        assertTransition(current.status, 'READY')
+        return this.withTransition(current, 'READY', 'planning-succeeded', `plan:done:${inputHash}`, {
+          issueCount: verdict.issues.length,
+          issues: [...verdict.issues],
+        })
+      })
+      this.notify()
+    } catch (error) {
+      const message = error instanceof PlannerError
+        ? error.message
+        : (error as Error).message
+      try {
+        await this.transitionTo(runId, 'FAILED', `planning-failed: ${message}`, `plan:fail:${inputHash}`)
+      } catch {
+        // The run is already terminal; the first transition attempt recorded the failure.
+      }
+    }
+  }
+
+  /** Atomically move a run to `to` with one new transition (state machine enforced inside). */
+  private async transitionTo(runId: string, to: RunStatus, reason: string, idempotencyKey: string): Promise<void> {
+    await this.repository.updateRun(runId, (current) => {
+      assertTransition(current.status, to)
+      return this.withTransition(current, to, reason, idempotencyKey)
+    })
+    this.notify()
+  }
+
+  /** Build the next aggregate: append one transition, stamp updatedAt, parse-before-persist. */
+  private withTransition(
+    current: RunAggregate,
+    to: RunStatus,
+    reason: string,
+    idempotencyKey: string,
+    patch: Partial<Pick<RunAggregate, 'issueCount' | 'issues'>> = {},
+  ): RunAggregate {
+    const seq = current.transitions.length
+    const transition: RunTransition = {
+      seq,
+      from: current.status,
+      to,
+      reason,
+      actor: 'host',
+      idempotencyKey,
+      at: this.now(),
+    }
+    const next: RunAggregate = {
+      ...current,
+      ...patch,
+      status: to,
+      updatedAt: transition.at,
+      transitions: [...current.transitions, transition],
+    }
+    runAggregateSchema.parse(next)
+    return next
+  }
+
   private findByIdempotency(idempotencyKey: string): RunAggregate | undefined {
     return this.repository.listRuns().find((run) =>
       run.transitions.some((transition) => transition.idempotencyKey === idempotencyKey),
@@ -223,3 +370,8 @@ export class TaskFlowService {
 
 /** Whether a status is terminal (exported for route/host convenience). */
 export { isTerminal }
+
+/** Spool root for planner artifacts: <DSH_HOME>/taskflow/plans/<runId>/. */
+function defaultPlanRoot(): string {
+  return join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'taskflow', 'plans')
+}
