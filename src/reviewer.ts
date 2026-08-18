@@ -52,6 +52,10 @@ export interface ReviewInput {
   executions: readonly IssueExecution[]
   /** Spool directory for this run's review artifacts. */
   workDir: string
+  /** P5: base commit SHA the execution started from; when present the review
+   * inspects the integration-branch diff against this SHA instead of
+   * uncommitted changes. */
+  baseSha?: string
 }
 
 /** Review outcome: PASS (human acceptance) or REVISE (rework selected issues). */
@@ -98,7 +102,9 @@ export function buildReviewPrompt(input: ReviewInput): string {
     executionLines === '' ? '（无）' : executionLines,
     '',
     '## 审查要求',
-    '- 只读审查当前仓库的未提交改动（uncommitted changes），不得修改任何文件',
+    input.baseSha !== undefined
+      ? `- 只读审查当前仓库相对基准 ${input.baseSha} 的改动（含已合并到集成分支的提交），不得修改任何文件`
+      : '- 只读审查当前仓库的未提交改动（uncommitted changes），不得修改任何文件',
     '- 判断全部 Issue 是否满足验收标准、整体是否可进入人工验收',
     '- 输出必须符合 --output-schema 给定的 JSON Schema，只输出 JSON',
     '- `verdict` 为 PASS 表示通过；REVISE 表示需要打回返工',
@@ -167,20 +173,39 @@ export class CodexReviewer {
     const prompt = buildReviewPrompt(input)
     // Canonicalize once: cwd is the repo root the review runs against.
     const repoRoot = resolve(input.repoRoot)
-    const command = [
-      this.cliPath,
-      'exec',
-      'review',
-      '--model', 'gpt-5.6-sol',
-      '--config', 'model_reasoning_effort="high"',
-      '--config', 'sandbox_mode="read-only"',
-      '--strict-config',
-      '--ephemeral',
-      '--uncommitted',
-      '--output-schema', schemaPath,
-      '--json',
-      '-',
-    ]
+    // With a base SHA (P5 integration-branch review) the `codex exec review
+    // --base` form cannot carry a custom prompt in Codex 0.146.0, so use the
+    // generic `codex exec` read-only form with --cd and include the base in
+    // the prompt. Without a base SHA keep the P4 `review --uncommitted` form.
+    const command = input.baseSha !== undefined
+      ? [
+          this.cliPath,
+          'exec',
+          '--model', 'gpt-5.6-sol',
+          '--config', 'model_reasoning_effort="high"',
+          '--config', 'sandbox_mode="read-only"',
+          '--strict-config',
+          '--ephemeral',
+          '--color', 'never',
+          '--cd', repoRoot,
+          '--output-schema', schemaPath,
+          '--json',
+          '-',
+        ]
+      : [
+          this.cliPath,
+          'exec',
+          'review',
+          '--model', 'gpt-5.6-sol',
+          '--config', 'model_reasoning_effort="high"',
+          '--config', 'sandbox_mode="read-only"',
+          '--strict-config',
+          '--ephemeral',
+          '--uncommitted',
+          '--output-schema', schemaPath,
+          '--json',
+          '-',
+        ]
 
     let lastError: ReviewerError | undefined
     for (let attempt = 0; attempt <= this.maxRetries; attempt += 1) {

@@ -90,32 +90,70 @@ export class WorktreeManager {
     return { workDir, branch }
   }
 
-  /** Merge an issue branch into the integration branch (non-fast-forward). */
+  /** Resolve the repository's current HEAD SHA (used as the review base). */
+  async getHeadSha(repoRoot: string): Promise<string> {
+    const result = await this.git.run(['rev-parse', 'HEAD'], repoRoot)
+    if (result.exitCode !== 0) {
+      throw new WorktreeError(`resolve HEAD failed: ${result.stderr.trim()}`)
+    }
+    const sha = result.stdout.trim()
+    if (sha === '') {
+      throw new WorktreeError('resolve HEAD returned an empty SHA')
+    }
+    return sha
+  }
+
+  /** Commit uncommitted worktree edits onto the issue branch before merging. */
+  async commitWorktreeEdits(workDir: string, message: string): Promise<void> {
+    const status = await this.git.run(['status', '--porcelain'], workDir)
+    if (status.exitCode !== 0) {
+      throw new WorktreeError(`worktree status failed: ${status.stderr.trim()}`)
+    }
+    if (status.stdout.trim() === '') return
+    const add = await this.git.run(['add', '-A'], workDir)
+    if (add.exitCode !== 0) {
+      throw new WorktreeError(`worktree add failed: ${add.stderr.trim()}`)
+    }
+    const commit = await this.git.run(['commit', '-m', message], workDir)
+    if (commit.exitCode !== 0) {
+      throw new WorktreeError(`worktree commit failed: ${commit.stderr.trim()}`)
+    }
+  }
+
+  /** Merge an issue branch into the integration branch (non-fast-forward).
+   * The merge runs in a dedicated integration worktree so the user's active
+   * checkout is never switched. */
   async mergeIssueWorktree(
     repoRoot: string,
     branch: string,
     message: string,
     integrationBranch: string,
   ): Promise<void> {
-    const current = await this.git.run(['rev-parse', '--abbrev-ref', 'HEAD'], repoRoot)
-    const original = current.stdout.trim() || 'HEAD'
-    const checkout = await this.git.run(['checkout', integrationBranch], repoRoot)
-    if (checkout.exitCode !== 0) {
-      throw new WorktreeError(`checkout integration branch failed: ${checkout.stderr.trim()}`)
-    }
-    const merge = await this.git.run(['merge', '--no-ff', branch, '-m', message], repoRoot)
-    if (merge.exitCode !== 0) {
-      if (original !== integrationBranch) {
-        await this.git.run(['checkout', original], repoRoot)
+    await this.ensureIntegrationBranch(repoRoot, integrationBranch)
+    const integrationWorktree = join(
+      resolve(repoRoot),
+      this.worktreesRoot,
+      '_integration',
+      branch.replace(/[^A-Za-z0-9._-]/g, '-'),
+    )
+    const add = await this.git.run(['worktree', 'add', '--detach', integrationWorktree, integrationBranch], repoRoot)
+    if (add.exitCode !== 0) {
+      // A previous failed merge may have left the path; force-remove and retry once.
+      await this.git.run(['worktree', 'remove', '--force', integrationWorktree], repoRoot).catch(() => undefined)
+      const retry = await this.git.run(['worktree', 'add', '--detach', integrationWorktree, integrationBranch], repoRoot)
+      if (retry.exitCode !== 0) {
+        throw new WorktreeError(`create integration worktree failed: ${retry.stderr.trim()}`)
       }
+    }
+    const merge = await this.git.run(['merge', '--no-ff', branch, '-m', message], integrationWorktree)
+    if (merge.exitCode !== 0) {
+      await this.git.run(['merge', '--abort'], integrationWorktree).catch(() => undefined)
+      await this.git.run(['worktree', 'remove', '--force', integrationWorktree], repoRoot).catch(() => undefined)
       throw new WorktreeError(`merge ${branch} failed: ${merge.stderr.trim()}`)
     }
-    if (original !== integrationBranch) {
-      const restore = await this.git.run(['checkout', original], repoRoot)
-      if (restore.exitCode !== 0) {
-        throw new WorktreeError(`restore original branch '${original}' failed: ${restore.stderr.trim()}`)
-      }
-    }
+    // Merge succeeded; cleanup of the temporary integration worktree is
+    // best-effort so a leftover path does not fail an already-merged issue.
+    await this.git.run(['worktree', 'remove', '--force', integrationWorktree], repoRoot).catch(() => undefined)
   }
 
   /** Remove a merged worktree and its branch (best-effort cleanup). */

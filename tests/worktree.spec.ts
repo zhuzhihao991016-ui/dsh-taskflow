@@ -63,35 +63,67 @@ describe('WorktreeManager', () => {
     ])
   })
 
-  it('merges an issue branch into the integration branch and restores the original branch', async () => {
+  it('merges an issue branch in a dedicated integration worktree', async () => {
     const git = new FakeGit()
-    git.resultFor = (args) => (
-      args[0] === 'rev-parse' && args[1] === '--abbrev-ref'
-        ? { exitCode: 0, stdout: 'main\n', stderr: '' }
-        : { exitCode: 0, stdout: '', stderr: '' }
-    )
     const manager = new WorktreeManager(git, '.taskflow/worktrees')
 
     await manager.mergeIssueWorktree(REPO, 'taskflow/run-0001/issue-001', 'taskflow run-0001 issue-001', 'taskflow/integration')
 
-    expect(git.calls).toEqual([
-      ['rev-parse', '--abbrev-ref', 'HEAD'],
-      ['checkout', 'taskflow/integration'],
-      ['merge', '--no-ff', 'taskflow/run-0001/issue-001', '-m', 'taskflow run-0001 issue-001'],
-      ['checkout', 'main'],
+    const integrationWorktree = join(resolve(REPO), '.taskflow', 'worktrees', '_integration', 'taskflow-run-0001-issue-001')
+    expect(git.calls).toContainEqual([
+      'worktree', 'add', '--detach', integrationWorktree, 'taskflow/integration',
     ])
+    expect(git.calls).toContainEqual([
+      'merge', '--no-ff', 'taskflow/run-0001/issue-001', '-m', 'taskflow run-0001 issue-001',
+    ])
+    expect(git.calls).toContainEqual(['worktree', 'remove', '--force', integrationWorktree])
+    expect(git.calls.some((args) => args[0] === 'checkout')).toBe(false)
   })
 
-  it('throws a stable WorktreeError when merge fails', async () => {
+  it('throws a stable WorktreeError when merge fails and aborts the merge', async () => {
     const git = new FakeGit()
-    git.resultFor = (args) => {
-      if (args[0] === 'merge') return { exitCode: 1, stdout: '', stderr: 'conflict' }
-      if (args[0] === 'rev-parse' && args[1] === '--abbrev-ref') return { exitCode: 0, stdout: 'main\n', stderr: '' }
-      return { exitCode: 0, stdout: '', stderr: '' }
-    }
+    git.resultFor = (args) => (
+      args[0] === 'merge' ? { exitCode: 1, stdout: '', stderr: 'conflict' } : { exitCode: 0, stdout: '', stderr: '' }
+    )
     const manager = new WorktreeManager(git, '.taskflow/worktrees')
 
     await expect(manager.mergeIssueWorktree(REPO, 'taskflow/run-0001/issue-001', 'msg', 'taskflow/integration')).rejects.toBeInstanceOf(WorktreeError)
+    expect(git.calls).toContainEqual(['merge', '--abort'])
+  })
+
+  it('resolves the repository HEAD SHA', async () => {
+    const git = new FakeGit()
+    git.resultFor = () => ({ exitCode: 0, stdout: 'abc123\n', stderr: '' })
+    const manager = new WorktreeManager(git, '.taskflow/worktrees')
+
+    await expect(manager.getHeadSha(REPO)).resolves.toBe('abc123')
+    expect(git.calls).toEqual([['rev-parse', 'HEAD']])
+  })
+
+  it('commits uncommitted worktree edits only when the worktree is dirty', async () => {
+    const git = new FakeGit()
+    git.resultFor = (args) => (
+      args[0] === 'status' ? { exitCode: 0, stdout: ' M file.txt\n', stderr: '' } : { exitCode: 0, stdout: '', stderr: '' }
+    )
+    const manager = new WorktreeManager(git, '.taskflow/worktrees')
+
+    await manager.commitWorktreeEdits('C:/worktree', 'taskflow run-0001 issue-001')
+
+    expect(git.calls).toEqual([
+      ['status', '--porcelain'],
+      ['add', '-A'],
+      ['commit', '-m', 'taskflow run-0001 issue-001'],
+    ])
+  })
+
+  it('skips commit when the worktree is clean', async () => {
+    const git = new FakeGit()
+    git.resultFor = () => ({ exitCode: 0, stdout: '', stderr: '' })
+    const manager = new WorktreeManager(git, '.taskflow/worktrees')
+
+    await manager.commitWorktreeEdits('C:/worktree', 'taskflow run-0001 issue-001')
+
+    expect(git.calls).toEqual([['status', '--porcelain']])
   })
 
   it('removes a merged worktree and its branch', async () => {

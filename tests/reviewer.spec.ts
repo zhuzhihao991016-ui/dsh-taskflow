@@ -154,6 +154,24 @@ describe('CodexReviewer', () => {
     expect(executor.requests[0].cwd).toBe(resolve('./repo'))
   })
 
+  it('uses generic codex exec with --cd and baseSha when reviewing an integration diff', async () => {
+    const root = await freshRoot()
+    const executor = new FakeExecutor()
+    executor.results = [{ exitCode: 0, stdout: agentMessageEvent(REVIEW_JSON), stderr: '', timedOut: false }]
+    const reviewer = new CodexReviewer(executor, 60_000)
+
+    await reviewer.review({ ...INPUT, baseSha: 'abc123', workDir: join(root, 's') })
+
+    expect(executor.requests).toHaveLength(1)
+    const request = executor.requests[0]
+    expect(request.command).not.toContain('review')
+    expect(request.command).toContain('--cd')
+    expect(request.command).toContain('--output-schema')
+    expect(request.command).not.toContain('--uncommitted')
+    expect(request.stdinText).toContain('abc123')
+    expect(request.cwd).toBe(resolve(INPUT.repoRoot))
+  })
+
   it('throws process-failed with stderr detail on a non-zero exit', async () => {
     const root = await freshRoot()
     const executor = new FakeExecutor()

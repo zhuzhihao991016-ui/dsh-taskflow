@@ -42,6 +42,8 @@ export interface RunSnapshot {
     reworkKeys: string[]
     at: number
   }
+  /** P5: base commit SHA captured when execution started. */
+  baseSha?: string
 }
 
 /** Projected planned issue (agent needs acceptance/deps to execute). */
@@ -181,6 +183,8 @@ export class TaskFlowService {
   private readonly startingExecutions = new Map<string, Promise<void>>()
   /** Runs whose P4 review flow is in flight (single-flight gate). */
   private readonly reviewFlows = new Map<string, Promise<void>>()
+  /** Per-repository merge serialization: repoRoot → tail promise. */
+  private readonly mergeTails = new Map<string, Promise<void>>()
   /** Serializes submits: idempotency check, id allocation, and insertion run
    * on one chain so overlapping requests can never double-allocate or
    * overwrite each other (single-writer host assumption). */
@@ -522,13 +526,26 @@ export class TaskFlowService {
     }
     if (run.status === 'READY') {
       // Await the durable EXECUTING transition before acknowledging; a failed
-      // write propagates to every overlapping caller (no false 202).
+      // write propagates to every overlapping caller (no false 202). The
+      // starting marker is set synchronously before the async base-SHA capture
+      // so concurrent startExecution calls share the same transition promise.
       let transition: Promise<void>
       try {
-        transition = this.repository.updateRun(runId, (current) => {
-          assertTransition(current.status, 'EXECUTING')
-          return this.withTransition(current, 'EXECUTING', 'execution-started', `exec:start:${runId}`)
-        }).then(() => { this.notify() })
+        transition = (async () => {
+          // Capture the base SHA before any worktree is created so the P4
+          // reviewer can later inspect the integration-branch diff.
+          let baseSha = run.baseSha
+          if (baseSha === undefined && run.repoRoot !== undefined) {
+            baseSha = await this.worktrees.getHeadSha(run.repoRoot)
+          }
+          await this.repository.updateRun(runId, (current) => {
+            assertTransition(current.status, 'EXECUTING')
+            return this.withTransition(current, 'EXECUTING', 'execution-started', `exec:start:${runId}`, {
+              baseSha,
+            })
+          })
+          this.notify()
+        })()
         this.startingExecutions.set(runId, transition)
         void transition.then(
           () => { this.startingExecutions.delete(runId) },
@@ -614,15 +631,22 @@ export class TaskFlowService {
     if (running === undefined) {
       return { ok: false, error: `taskflow: issue '${issueKey}' is not currently running` }
     }
+    const repoRoot = run.repoRoot
+    const workDir = running.workDir
+    const branch = running.branch
     let effectiveResult = result
-    if (result.ok && run.repoRoot !== undefined && running.workDir !== undefined && running.branch !== undefined) {
+    if (result.ok && repoRoot !== undefined && workDir !== undefined && branch !== undefined) {
       try {
-        await this.worktrees.mergeIssueWorktree(
-          run.repoRoot,
-          running.branch,
+        // Ensure uncommitted worktree edits are on the issue branch before the
+        // integration merge; otherwise merge would be a no-op and cleanup would
+        // silently discard the executor's work.
+        await this.worktrees.commitWorktreeEdits(workDir, `taskflow ${runId} ${issueKey}`)
+        await this.withMergeLock(repoRoot, () => this.worktrees.mergeIssueWorktree(
+          repoRoot,
+          branch,
           `taskflow ${runId} ${issueKey}`,
           this.integrationBranch,
-        )
+        ))
       } catch (error) {
         effectiveResult = { ok: false, error: `worktree merge failed: ${(error as Error).message}` }
       }
@@ -846,6 +870,21 @@ export class TaskFlowService {
     await this.reportResult(runId, issueKey, { ok: false, error })
   }
 
+  /** Serialize integration-branch merges per repository so concurrent
+   * reportResult calls cannot race checkout/merge/restore on the same repo. */
+  private async withMergeLock<T>(repoRoot: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.mergeTails.get(repoRoot) ?? Promise.resolve()
+    let release!: () => void
+    const current = new Promise<void>((resolvePromise) => { release = resolvePromise })
+    this.mergeTails.set(repoRoot, prev.then(() => current))
+    await prev.catch(() => undefined)
+    try {
+      return await fn()
+    } finally {
+      release()
+    }
+  }
+
   /** Reset a crash-stuck `running` issue back to pending (host-start resume). */
   private async resetStuckExecutions(runId: string): Promise<void> {
     await this.repository.updateRun(runId, (current) => {
@@ -913,6 +952,7 @@ export class TaskFlowService {
         issues: run.issues,
         executions: run.executions ?? [],
         workDir: join(defaultPlanRoot(), runId),
+        baseSha: run.baseSha,
       })
       const result = this.normalizeReviewResult(run, raw)
       if (result.verdict === 'PASS') {
@@ -1106,7 +1146,7 @@ export class TaskFlowService {
     to: RunStatus,
     reason: string,
     idempotencyKey: string,
-    patch: Partial<Pick<RunAggregate, 'issueCount' | 'issues' | 'executions' | 'review'>> = {},
+    patch: Partial<Pick<RunAggregate, 'issueCount' | 'issues' | 'executions' | 'review' | 'baseSha'>> = {},
   ): RunAggregate {
     const seq = current.transitions.length
     const transition: RunTransition = {
@@ -1197,6 +1237,7 @@ export class TaskFlowService {
         reworkKeys: [...run.review.reworkKeys],
         at: run.review.at,
       },
+      baseSha: run.baseSha,
     }
   }
 }

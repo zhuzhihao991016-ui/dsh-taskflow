@@ -44,6 +44,9 @@ export interface RunAggregate {
   executions: IssueExecution[]
   /** Latest Codex review record (P4); absent until a review completes. */
   review?: RunReview
+  /** P5: base commit SHA captured when execution starts; used by the reviewer
+   * to inspect the integration-branch diff instead of uncommitted changes. */
+  baseSha?: string
   /** Append-only; `transitions[transitions.length - 1].to` equals `status`. */
   transitions: RunTransition[]
 }
@@ -124,6 +127,7 @@ const runAggregateSchema = z.object({
   issues: z.array(plannedIssueSchema).default([]),
   executions: z.array(issueExecutionSchema).default([]),
   review: reviewSchema.optional(),
+  baseSha: z.string().optional(),
   transitions: z.array(transitionSchema),
 }).superRefine((run, ctx) => {
   // Aggregate history consistency: this runs at every domain open (the
