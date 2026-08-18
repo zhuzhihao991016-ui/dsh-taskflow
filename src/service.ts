@@ -165,7 +165,12 @@ export class TaskFlowService {
   submit(request: SubmitRequest): Promise<RunSnapshot> {
     validateSubmit(request)
     const explicitKey = request.idempotencyKey
-    const normalizedRepoRoot = request.repoRoot?.trim() === '' ? undefined : request.repoRoot?.trim()
+    // Canonicalize at submit: the ledger always stores the absolute root the
+    // planner resolves against (host cwd), so snapshots handed to executing
+    // DSH sessions identify the same repository regardless of their cwd.
+    const normalizedRepoRoot = request.repoRoot === undefined || request.repoRoot.trim() === ''
+      ? undefined
+      : resolve(request.repoRoot.trim())
     const job = async (): Promise<RunSnapshot> => {
       if (explicitKey !== undefined) {
         const existing = this.findByExplicitKey(explicitKey)

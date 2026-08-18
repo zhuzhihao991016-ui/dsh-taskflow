@@ -5,6 +5,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
+import { resolve } from 'node:path'
 import type { RunAggregate } from '../src/domain.ts'
 import { PlannerError, type PlanInput } from '../src/planner.ts'
 import { MemoryRepository } from '../src/repository.ts'
@@ -64,6 +65,17 @@ describe('TaskFlowService', () => {
     const run = await service.submit({ title: '  任务A  ', description: '  描述  ' })
     expect(run.title).toBe('任务A')
     expect(run.description).toBe('描述')
+  })
+
+  it('canonicalizes a relative repoRoot to the absolute host root at submit', async () => {
+    const { service } = harness()
+    const run = await service.submit({ title: '相对仓库', repoRoot: './repo', idempotencyKey: 'req-rel' })
+    // The ledger stores the same absolute path the planner resolves against,
+    // so executing DSH sessions see one unambiguous repository root.
+    expect(run.repoRoot).toBe(resolve('./repo'))
+    const again = await service.submit({ title: '相对仓库', repoRoot: '.\\repo', idempotencyKey: 'req-rel' })
+    expect(again.id).toBe(run.id)
+    expect(service.list()).toHaveLength(1)
   })
 
   it('repeated submit with the same idempotency key returns the existing run', async () => {
