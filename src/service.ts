@@ -10,7 +10,7 @@ import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join, resolve, sep } from 'node:path'
 import { runAggregateSchema, type IssueExecution, type RunAggregate, type RunTransition } from './domain.ts'
-import type { PlannedIssue } from './dag.ts'
+import type { PlannedIssue, RiskLevel } from './dag.ts'
 import { validatePlan } from './dag.ts'
 import type { ExecutionResult, Executor } from './executor.ts'
 import { CodexPlanner, PlannerError, type PlanInput } from './planner.ts'
@@ -23,12 +23,24 @@ export interface RunSnapshot {
   status: RunStatus
   title: string
   description: string
+  /** Repo root the executor works in (agent-driven execution needs it). */
+  repoRoot?: string
   createdAt: number
   updatedAt: number
   issueCount: number
   transitionCount: number
+  /** Validated planned issues (P2); empty until a plan succeeds. */
+  issues: IssueSnapshot[]
   /** Per-issue execution state (P3); empty until execution starts. */
   executions: IssueExecutionSnapshot[]
+}
+
+/** Projected planned issue (agent needs acceptance/deps to execute). */
+export interface IssueSnapshot {
+  key: string
+  acceptance: string
+  deps: string[]
+  risk?: RiskLevel | null
 }
 
 /** Projected per-issue execution state (no internal fields). */
@@ -481,7 +493,8 @@ export class TaskFlowService {
     }
     if (this.executor === undefined) {
       // Agent-driven mode: claim the first schedulable issue and hand it to
-      // the DSH session; reportResult advances the run afterwards.
+      // the DSH session; each reportResult records the outcome and the agent
+      // calls execute again to claim the next issue.
       const claim = await this.claimNextIssue(runId)
       const current = this.currentRunningIssue(runId)
       return {
@@ -513,10 +526,12 @@ export class TaskFlowService {
 
   /**
    * Report one issue's outcome to the serial runner. The issue must be the
-   * single current `running` issue (deterministic serial order); a success
-   * advances to the next schedulable issue, the last success moves the run to
-   * INTEGRATION_REVIEW, and a failure moves the run to FAILED. All checks
-   * re-run inside the repository's atomic RMW.
+   * single current `running` issue (deterministic serial order). Record-only:
+   * a success is recorded as `done` (the caller re-claims the next issue via
+   * startExecution, or the executor loop continues); the last success moves
+   * the run to INTEGRATION_REVIEW; a failure is recorded as `failed` and
+   * moves the run to FAILED. All checks re-run inside the repository's
+   * atomic RMW.
    */
   async reportResult(runId: string, issueKey: string, result: ExecutionResult): Promise<ExecutionReport> {
     const run = this.repository.getRun(runId)
@@ -853,10 +868,17 @@ export class TaskFlowService {
       status: run.status,
       title: run.title,
       description: run.description,
+      repoRoot: run.repoRoot,
       createdAt: run.createdAt,
       updatedAt: run.updatedAt,
       issueCount: run.issueCount,
       transitionCount: run.transitions.length,
+      issues: run.issues.map((issue) => ({
+        key: issue.key,
+        acceptance: issue.acceptance,
+        deps: [...(issue.deps ?? [])],
+        risk: issue.risk ?? null,
+      })),
       executions: (run.executions ?? []).map((execution) => ({
         key: execution.key,
         status: execution.status,

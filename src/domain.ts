@@ -8,6 +8,7 @@
 
 import { z } from 'zod'
 import { defineDomain, domainTable } from '@deepseek-ai/dsh-storage-domain'
+import { ISSUE_KEY_PATTERN } from './dag.ts'
 import type { PlannedIssue } from './dag.ts'
 import { RUN_STATUSES, type RunStatus } from './state.ts'
 
@@ -68,7 +69,7 @@ const transitionSchema = z.object({
 })
 
 const plannedIssueSchema = z.object({
-  key: z.string().min(1),
+  key: z.string().min(1).regex(ISSUE_KEY_PATTERN, 'unsafe issue key'),
   acceptance: z.string().min(1),
   deps: z.array(z.string()).default([]),
   // The planner schema models optional risk as nullable (strict outputs).
@@ -76,7 +77,7 @@ const plannedIssueSchema = z.object({
 })
 
 const issueExecutionSchema = z.object({
-  key: z.string().min(1),
+  key: z.string().min(1).regex(ISSUE_KEY_PATTERN, 'unsafe issue key'),
   status: z.enum(['pending', 'running', 'done', 'failed']),
   startedAt: z.number().optional(),
   finishedAt: z.number().optional(),

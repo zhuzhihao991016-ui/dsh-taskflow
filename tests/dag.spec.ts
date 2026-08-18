@@ -38,6 +38,18 @@ describe('validatePlan', () => {
     })
   })
 
+  it('rejects issue keys with separators, traversal, or whitespace', () => {
+    // Issue keys are used verbatim in spool paths; unsafe keys must never
+    // reach the ledger (path traversal / cross-run escape).
+    for (const key of ['../../other', 'a/b', 'a\\b', 'a b', '.', '..', '-x']) {
+      expect(validatePlan([issue(key)])).toMatchObject({
+        ok: false, error: expect.stringContaining('unsafe character'),
+      })
+    }
+    // The safe charset stays accepted (dots/underscores/hyphens inside).
+    expect(validatePlan([issue('issue-001'), issue('a.b_c-2', ['issue-001'])])).toMatchObject({ ok: true })
+  })
+
   it('rejects empty acceptance criteria', () => {
     expect(validatePlan([issue('a', [], '   ')])).toMatchObject({
       ok: false, error: expect.stringContaining('empty acceptance'),

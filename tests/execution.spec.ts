@@ -78,6 +78,21 @@ describe('TaskFlowService.startExecution', () => {
     ])
   })
 
+  it('snapshot exposes the repo root and full issue payload to the agent', async () => {
+    const { repository, service } = harness()
+    seedReady(repository, [issueA, issueB])
+    await service.startExecution('run-0001')
+    const snapshot = service.snapshot('run-0001')
+    expect(snapshot?.repoRoot).toBe('C:/repo')
+    expect(snapshot?.issues).toEqual([
+      { key: 'issue-001', acceptance: '验收 A', deps: [], risk: null },
+      { key: 'issue-002', acceptance: '验收 B', deps: ['issue-001'], risk: null },
+    ])
+    expect(snapshot?.executions).toEqual([
+      { key: 'issue-001', status: 'running', startedAt: 1000, finishedAt: undefined, summary: undefined, error: undefined },
+    ])
+  })
+
   it('executor mode: runs issues serially in dependency order to INTEGRATION_REVIEW', async () => {
     const executor = new FakeExecutor()
     const { repository, service } = harness(executor)

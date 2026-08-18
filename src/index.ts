@@ -27,7 +27,7 @@ const SECTION_ORDER = 200
 export const inject = ['systemPrompt', 'storageDomain']
 
 /** Model-facing announcement: plugin presence, capabilities, and limits. */
-export const TASKFLOW_GUIDANCE = '本机已安装 dsh-taskflow 插件（DSH 全自动任务工作流编排）：任务提出后由 Codex CLI 规划拆分为 Issue 并发布看板，DSH 认领执行，Codex 只读审查决定打回或通过，按依赖序推进，最终人工验收。当前为 P3 阶段：运行台账已持久化，Codex 规划引擎已接入（提交时带 repoRoot 后经 /plugins/taskflow/plan 触发规划，规划通过后运行进入 READY 并携带 Issue 清单）；串行执行引擎已启用（经 /plugins/taskflow/execute 启动执行，READY → EXECUTING，按依赖顺序每次只认领一个 Issue，响应含 currentIssue；执行方为 DSH 会话——完成 currentIssue 工作后经 /plugins/taskflow/exec-result 上报 { runId, issueKey, ok, summary|error }，每个 Issue 上报成功后再次调用 /execute 认领下一个，全部完成后运行自动进入 INTEGRATION_REVIEW 等待 P4 审查）。用户提到「工作流 / 任务流 / taskflow」时即指本插件，请据此协作。'
+export const TASKFLOW_GUIDANCE = '本机已安装 dsh-taskflow 插件（DSH 全自动任务工作流编排）：任务提出后由 Codex CLI 规划拆分为 Issue 并发布看板，DSH 认领执行，Codex 只读审查决定打回或通过，按依赖序推进，最终人工验收。当前为 P3 阶段：运行台账已持久化，Codex 规划引擎已接入（提交时带 repoRoot 后经 /plugins/taskflow/plan 触发规划，规划通过后运行进入 READY 并携带 Issue 清单）；串行执行引擎已启用（经 /plugins/taskflow/execute 启动执行，READY → EXECUTING，按依赖顺序每次只认领一个 Issue，响应含 currentIssue；issue 的验收标准/依赖/风险与仓库根可经 /plugins/taskflow/state 读取，执行方为 DSH 会话——完成 currentIssue 工作后经 /plugins/taskflow/exec-result 上报 { runId, issueKey, ok, summary|error }，每个 Issue 上报成功后再次调用 /execute 认领下一个，全部完成后运行自动进入 INTEGRATION_REVIEW 等待 P4 审查）。用户提到「工作流 / 任务流 / taskflow」时即指本插件，请据此协作。'
 
 /** Plugin config; schema defaults are applied by the loader. */
 export interface Config {

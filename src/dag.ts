@@ -27,6 +27,11 @@ export type PlanVerdict =
 /** Stable error prefix for plan violations. */
 const ERR = 'taskflow: invalid plan'
 
+/** Issue keys are used verbatim in spool paths (executor workDir), so only a
+ * safe charset is accepted: alphanumeric start, then alphanumerics, dots,
+ * underscores, and hyphens. Rejects separators, traversal, and whitespace. */
+export const ISSUE_KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
+
 /** Validate one plan: unique keys, present deps, no cycles, non-empty acceptance. */
 export function validatePlan(issues: readonly PlannedIssue[]): PlanVerdict {
   if (issues.length === 0) {
@@ -39,6 +44,9 @@ export function validatePlan(issues: readonly PlannedIssue[]): PlanVerdict {
       return { ok: false, error: `${ERR}: duplicate or empty issue key '${issue.key}'` }
     }
     keys.add(issue.key)
+    if (!ISSUE_KEY_PATTERN.test(issue.key)) {
+      return { ok: false, error: `${ERR}: issue key '${issue.key}' uses an unsafe character` }
+    }
     if (issue.acceptance.trim() === '') {
       return { ok: false, error: `${ERR}: issue '${issue.key}' has empty acceptance criteria` }
     }
