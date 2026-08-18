@@ -14,6 +14,7 @@ import type {} from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-storage-domain'
 import { TASKFLOW_DOMAIN } from './domain.ts'
+import { CodexPlanner } from './planner.ts'
 import { DomainRepository } from './repository.ts'
 import { TaskFlowService, type CommandAction, type SubmitRequest } from './service.ts'
 
@@ -32,11 +33,17 @@ export interface Config {
   announceToAgent?: boolean
   /** Master switch for the plugin. */
   enabled?: boolean
+  /** Canonical repo roots the planner may inspect; empty = planning disabled. */
+  allowedRepoRoots?: string[]
+  /** Codex CLI entry override; default resolves via CODEX_CLI_PATH or platform. */
+  codexCliPath?: string
 }
 
 export const Config: z<Config> = z.object({
   announceToAgent: z.boolean().default(true),
   enabled: z.boolean().default(true),
+  allowedRepoRoots: z.array(z.string()).default([]),
+  codexCliPath: z.string().default(''),
 })
 
 /** JSON response writer (same-origin routes; no secrets ever enter bodies). */
@@ -198,7 +205,15 @@ export function apply(ctx: Context, config?: Config): Promise<void> {
     // Return the close promise so lifecycle disposal awaits the domain drain
     // and the name frees before a potential reopen.
     scope.effect(() => () => domain.close(), 'dsh-taskflow: domain close')
-    const service = new TaskFlowService(new DomainRepository(domain))
+    const configuredCli = config?.codexCliPath
+    const cliPath = configuredCli !== undefined && configuredCli !== '' ? configuredCli : process.env.CODEX_CLI_PATH
+    const planner = new CodexPlanner(undefined, undefined, undefined, cliPath)
+    const service = new TaskFlowService(
+      new DomainRepository(domain),
+      undefined,
+      planner,
+      config?.allowedRepoRoots ?? [],
+    )
 
     if ((config?.announceToAgent ?? true) === true) {
       scope.effect(() => scope.systemPrompt.section({
@@ -207,6 +222,9 @@ export function apply(ctx: Context, config?: Config): Promise<void> {
         text: TASKFLOW_GUIDANCE,
       }), 'dsh-taskflow: guidance section')
     }
+
+    // Resume any planning flows persisted across a host restart.
+    service.resumePlanning()
 
     // Nested inject: routes only when the web server exists. Deliberately not
     // returned — an async inject callback's resolved value is collected as an

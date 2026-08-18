@@ -6,7 +6,7 @@
 
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   CodexPlanner,
@@ -14,6 +14,7 @@ import {
   buildPlanPrompt,
   lastAssistantText,
   parsePlanText,
+  resolveCodexCli,
   type ProcessExecutor,
   type ProcessResult,
 } from '../src/planner.ts'
@@ -54,10 +55,18 @@ function assistantEvent(text: string): string {
   })
 }
 
+/** Real `codex exec --json` event shape (verified against a live run). */
+function agentMessageEvent(text: string): string {
+  return JSON.stringify({
+    type: 'item.completed',
+    item: { id: 'item_0', type: 'agent_message', text },
+  })
+}
+
 const PLAN_JSON = JSON.stringify({
   issues: [
-    { key: 'issue-001', acceptance: '验收 A', deps: [] },
-    { key: 'issue-002', acceptance: '验收 B', deps: ['issue-001'] },
+    { key: 'issue-001', acceptance: '验收 A', deps: [], risk: null },
+    { key: 'issue-002', acceptance: '验收 B', deps: ['issue-001'], risk: 'L2' },
   ],
 })
 
@@ -71,6 +80,21 @@ describe('lastAssistantText', () => {
       assistantEvent(PLAN_JSON),
     ].join('\n')
     expect(lastAssistantText(stream)).toBe(PLAN_JSON)
+  })
+
+  it('extracts the agent_message text from the real codex exec event shape', () => {
+    const stream = [
+      JSON.stringify({ type: 'thread.started', payload: {} }),
+      agentMessageEvent('first'),
+      agentMessageEvent(PLAN_JSON),
+    ].join('\n')
+    expect(lastAssistantText(stream)).toBe(PLAN_JSON)
+  })
+
+  it('parses the captured real transcript fixture', async () => {
+    const { readFile } = await import('node:fs/promises')
+    const fixture = await readFile(join(__dirname, 'fixtures', 'codex-exec-real.jsonl'), 'utf8')
+    expect(lastAssistantText(fixture)).toBe('只回复两个字：收到')
   })
 
   it('ignores malformed lines and returns undefined without assistant output', () => {
@@ -92,7 +116,7 @@ describe('CodexPlanner', () => {
   it('runs codex exec with the gated argv, prompt on stdin, and returns the parsed plan', async () => {
     const root = await freshRoot()
     const executor = new FakeExecutor()
-    executor.results = [{ exitCode: 0, stdout: assistantEvent(PLAN_JSON), stderr: '', timedOut: false }]
+    executor.results = [{ exitCode: 0, stdout: agentMessageEvent(PLAN_JSON), stderr: '', timedOut: false }]
     const planner = new CodexPlanner(executor, 60_000)
 
     const plan = await planner.plan({ ...INPUT, workDir: join(root, 'spool') })
@@ -100,6 +124,7 @@ describe('CodexPlanner', () => {
     expect(plan).toEqual(JSON.parse(PLAN_JSON))
     expect(executor.requests).toHaveLength(1)
     const request = executor.requests[0]
+    const repoRoot = resolve(INPUT.repoRoot)
     expect(request.command).toEqual([
       expect.stringMatching(/codex\.js$/),
       'exec',
@@ -109,17 +134,44 @@ describe('CodexPlanner', () => {
       '--sandbox', 'read-only',
       '--ephemeral',
       '--color', 'never',
-      '--cd', 'C:/repo',
+      '--cd', repoRoot,
       '--output-schema', join(root, 'spool', 'plan.schema.json'),
       '--json',
       '-',
     ])
-    expect(request.cwd).toBe('C:/repo')
+    expect(request.cwd).toBe(repoRoot)
     expect(request.stdinText).toContain('升级后端')
     expect(request.stdinText).toContain('agtscp2.0')
-    // Schema file materialized in the spool dir.
-    const schema = JSON.parse(await readFile(join(root, 'spool', 'plan.schema.json'), 'utf8')) as { required?: string[] }
+    // Schema file materialized in the spool dir with the strict-outputs contract.
+    const schema = JSON.parse(await readFile(join(root, 'spool', 'plan.schema.json'), 'utf8')) as {
+      required?: string[]
+      additionalProperties?: boolean
+      properties?: { issues?: { items?: { required?: string[]; additionalProperties?: boolean } } }
+    }
     expect(schema.required).toContain('issues')
+    expect(schema.additionalProperties).toBe(false)
+    const issueItem = schema.properties?.issues?.items
+    expect(issueItem?.required).toEqual(['key', 'acceptance', 'deps', 'risk'])
+    expect(issueItem?.additionalProperties).toBe(false)
+  })
+
+  it('canonicalizes a relative repoRoot once for both cwd and --cd', async () => {
+    const root = await freshRoot()
+    const executor = new FakeExecutor()
+    executor.results = [{ exitCode: 0, stdout: agentMessageEvent(PLAN_JSON), stderr: '', timedOut: false }]
+    const planner = new CodexPlanner(executor, 60_000)
+    const base = join(root, 'repo')
+
+    await planner.plan({ ...INPUT, repoRoot: './repo', workDir: join(root, 's') })
+
+    expect(executor.requests).toHaveLength(1)
+    // The child's cwd is resolved relative to the parent cwd (process cwd),
+    // so './repo' becomes an absolute path; both slots must be equal.
+    expect(executor.requests[0].cwd).toBe(resolve('./repo'))
+    expect(executor.requests[0].command).toContain('--cd')
+    const cdIndex = executor.requests[0].command.indexOf('--cd')
+    expect(executor.requests[0].command[cdIndex + 1]).toBe(executor.requests[0].cwd)
+    void base
   })
 
   it('throws process-failed with stderr detail on a non-zero exit', async () => {
@@ -198,5 +250,33 @@ describe('PlannerError', () => {
     const error = new PlannerError('timeout', 'took too long')
     expect(error.message).toBe('taskflow: planner timeout: took too long')
     expect(error.code).toBe('timeout')
+  })
+})
+
+describe('resolveCodexCli', () => {
+  it('honors the CODEX_CLI_PATH override', () => {
+    const previous = process.env.CODEX_CLI_PATH
+    process.env.CODEX_CLI_PATH = 'C:/custom/codex.js'
+    try {
+      expect(resolveCodexCli()).toBe('C:/custom/codex.js')
+    } finally {
+      if (previous === undefined) delete process.env.CODEX_CLI_PATH
+      else process.env.CODEX_CLI_PATH = previous
+    }
+  })
+
+  it('falls back to a bare codex executable without APPDATA', () => {
+    const previous = process.env.CODEX_CLI_PATH
+    const appData = process.env.APPDATA
+    delete process.env.CODEX_CLI_PATH
+    process.env.APPDATA = ''
+    try {
+      expect(resolveCodexCli()).toBe('codex')
+    } finally {
+      if (previous === undefined) delete process.env.CODEX_CLI_PATH
+      else process.env.CODEX_CLI_PATH = previous
+      if (appData === undefined) delete process.env.APPDATA
+      else process.env.APPDATA = appData
+    }
   })
 })

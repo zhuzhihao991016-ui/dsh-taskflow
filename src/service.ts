@@ -8,7 +8,7 @@
 
 import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve, sep } from 'node:path'
 import { runAggregateSchema, type RunAggregate, type RunTransition } from './domain.ts'
 import type { PlannedIssue } from './dag.ts'
 import { validatePlan } from './dag.ts'
@@ -104,6 +104,8 @@ export class TaskFlowService {
     private readonly repository: TaskFlowRepository,
     private readonly now: () => number = Date.now,
     private readonly planner: Planner = new CodexPlanner(),
+    /** Canonical repo roots the planner may inspect; empty = planning disabled. */
+    private readonly allowedRepoRoots: readonly string[] = [],
   ) {}
 
   /** Submit a new workflow run; returns its RECEIVED snapshot. */
@@ -227,9 +229,22 @@ export class TaskFlowService {
     if (run.repoRoot === undefined || run.repoRoot === '') {
       return { ok: false, error: 'taskflow: run has no repoRoot; planning requires a repo root' }
     }
+    if (!this.isAllowedRepoRoot(run.repoRoot)) {
+      return { ok: false, error: `taskflow: repoRoot '${run.repoRoot}' is not in allowedRepoRoots` }
+    }
     const inputHash = this.planInputHash(run)
     if (run.transitions.some((t) => t.idempotencyKey === `plan:done:${inputHash}`)) {
       return { ok: true, runId, status: run.status, alreadyPlanned: true }
+    }
+    if (run.status === 'PLANNING') {
+      // Persisted in-progress planning (host restarted after the PLANNING
+      // write but before the flow committed): resume the flow instead of the
+      // illegal PLANNING → PLANNING transition.
+      const resumed = this.runPlanning(runId, inputHash)
+      if (options.wait === true) {
+        await resumed.catch(() => undefined)
+      }
+      return { ok: true, runId, status: 'PLANNING', alreadyPlanned: false }
     }
     try {
       await this.repository.updateRun(runId, (current) => {
@@ -249,6 +264,24 @@ export class TaskFlowService {
       await flow.catch(() => undefined)
     }
     return { ok: true, runId, status: 'PLANNING', alreadyPlanned: false }
+  }
+
+  /** Resume every persisted in-progress planning flow (called at host start). */
+  resumePlanning(): void {
+    for (const run of this.repository.listRuns()) {
+      if (run.status === 'PLANNING') {
+        void this.plan(run.id).catch(() => undefined)
+      }
+    }
+  }
+
+  private isAllowedRepoRoot(repoRoot: string): boolean {
+    if (this.allowedRepoRoots.length === 0) return false
+    const canonical = resolve(repoRoot)
+    return this.allowedRepoRoots.some((root) => {
+      const base = resolve(root)
+      return canonical === base || canonical.startsWith(base + sep)
+    })
   }
 
   private planInputHash(run: RunAggregate): string {

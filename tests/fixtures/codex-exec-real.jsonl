@@ -1,0 +1,8 @@
+{
+  "timestamp": "2026-08-18T00:00:00Z",
+  "type": "thread.started",
+  "payload": {}
+}
+{"timestamp":"2026-08-18T00:00:00Z","type":"turn.started","payload":{}}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"只回复两个字：收到"}}
+{"type":"turn.completed","turn":{"id":"turn_0","status":"completed"},"item":{}}

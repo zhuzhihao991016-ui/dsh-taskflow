@@ -26,7 +26,7 @@ class FakePlanner implements Planner {
 function harness() {
   const repository = new MemoryRepository()
   const planner = new FakePlanner()
-  const service = new TaskFlowService(repository, () => 1000, planner)
+  const service = new TaskFlowService(repository, () => 1000, planner, ['C:/repo'])
   return { repository, service, planner }
 }
 
@@ -211,6 +211,53 @@ describe('TaskFlowService.plan', () => {
     const result = await service.plan(run.id)
     expect(result).toMatchObject({ ok: false, error: expect.stringContaining('repoRoot') })
     expect(service.snapshot(run.id)?.status).toBe('RECEIVED')
+  })
+
+  it('rejects a repoRoot outside the configured allowlist', async () => {
+    const { service } = harness()
+    const run = await service.submit({ title: '越界', repoRoot: 'D:/other' })
+    const result = await service.plan(run.id)
+    expect(result).toMatchObject({ ok: false, error: expect.stringContaining('not in allowedRepoRoots') })
+    expect(service.snapshot(run.id)?.status).toBe('RECEIVED')
+  })
+
+  it('resumes a persisted PLANNING run instead of re-transitioning', async () => {
+    const { repository, service, planner } = harness()
+    const run = await service.submit({ title: '中断的规划', repoRoot: 'C:/repo' })
+    // Simulate a host restart mid-plan: the run is persisted in PLANNING with
+    // the planning-started transition but no plan:done.
+    await repository.updateRun(run.id, (current) => ({
+      ...current,
+      status: 'PLANNING' as const,
+      transitions: [...current.transitions, {
+        seq: 1, from: 'RECEIVED' as const, to: 'PLANNING' as const,
+        reason: 'planning-started', actor: 'host', idempotencyKey: 'plan:start:abc', at: 1001,
+      }],
+    }))
+    planner.result = PLAN
+    const result = await service.plan(run.id, { wait: true })
+    expect(result).toMatchObject({ ok: true, status: 'PLANNING' })
+    expect(planner.calls).toBe(1)
+    expect(service.snapshot(run.id)?.status).toBe('READY')
+  })
+
+  it('resumePlanning re-runs every persisted PLANNING run', async () => {
+    const { repository, service, planner } = harness()
+    const run = await service.submit({ title: '重启续跑', repoRoot: 'C:/repo' })
+    await repository.updateRun(run.id, (current) => ({
+      ...current,
+      status: 'PLANNING' as const,
+      transitions: [...current.transitions, {
+        seq: 1, from: 'RECEIVED' as const, to: 'PLANNING' as const,
+        reason: 'planning-started', actor: 'host', idempotencyKey: 'plan:start:abc', at: 1001,
+      }],
+    }))
+    planner.result = PLAN
+    service.resumePlanning()
+    // resumePlanning is fire-and-forget; give the microtask queue a turn.
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 10))
+    expect(planner.calls).toBe(1)
+    expect(service.snapshot(run.id)?.status).toBe('READY')
   })
 
   it('is idempotent: a repeated plan for the same input does not re-run the planner', async () => {

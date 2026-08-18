@@ -15,8 +15,8 @@ export interface PlannedIssue {
   acceptance: string
   /** Dependency keys; each must reference an existing issue. */
   deps?: readonly string[]
-  /** Risk level; defaults to L1 when absent. */
-  risk?: RiskLevel
+  /** Risk level; null/undefined when absent (the planner schema models it nullable). */
+  risk?: RiskLevel | null
 }
 
 /** Validation result: the accepted plan or a stable rejection reason. */
@@ -42,7 +42,7 @@ export function validatePlan(issues: readonly PlannedIssue[]): PlanVerdict {
     if (issue.acceptance.trim() === '') {
       return { ok: false, error: `${ERR}: issue '${issue.key}' has empty acceptance criteria` }
     }
-    if (issue.risk !== undefined && !['L1', 'L2', 'L3'].includes(issue.risk)) {
+    if (issue.risk !== undefined && issue.risk !== null && !['L1', 'L2', 'L3'].includes(issue.risk)) {
       return { ok: false, error: `${ERR}: issue '${issue.key}' has invalid risk '${String(issue.risk)}'` }
     }
   }

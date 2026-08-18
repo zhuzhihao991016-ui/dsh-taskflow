@@ -8,8 +8,9 @@
  */
 
 import { spawn } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import type { PlannedIssue } from './dag.ts'
 
 /** Stable error code for planner failures (surfaced in run transitions). */
@@ -114,22 +115,27 @@ export function buildPlanPrompt(input: PlanInput): string {
   ].join('\n')
 }
 
-/** The JSON Schema handed to `codex exec --output-schema`. */
+/** The JSON Schema handed to `codex exec --output-schema`. Codex applies
+ * strict Structured Outputs: every object must set `additionalProperties:
+ * false` and every declared property must be required (optional values are
+ * modeled as nullable). Verified against a real `codex exec --json` run. */
 export const PLAN_OUTPUT_SCHEMA: Record<string, unknown> = {
   $schema: 'http://json-schema.org/draft-07/schema#',
   type: 'object',
+  additionalProperties: false,
   required: ['issues'],
   properties: {
     issues: {
       type: 'array',
       items: {
         type: 'object',
-        required: ['key', 'acceptance'],
+        additionalProperties: false,
+        required: ['key', 'acceptance', 'deps', 'risk'],
         properties: {
           key: { type: 'string', minLength: 1 },
           acceptance: { type: 'string', minLength: 1 },
           deps: { type: 'array', items: { type: 'string' } },
-          risk: { enum: ['L1', 'L2', 'L3'] },
+          risk: { type: ['string', 'null'], enum: ['L1', 'L2', 'L3', null] },
         },
       },
     },
@@ -144,17 +150,31 @@ export async function writePlanSchema(workDir: string): Promise<string> {
   return path
 }
 
-/** Extract the last assistant text message from a codex `--json` event stream. */
+/**
+ * Extract the last assistant text message from a `codex exec --json` event
+ * stream. The production CLI emits `item.completed` events whose `item` is an
+ * `agent_message` with `text` (verified against a real run); the
+ * `response_item`/`payload.message` shape is kept as a secondary fallback for
+ * other CLI builds.
+ */
 export function lastAssistantText(stdout: string): string | undefined {
   let last: string | undefined
   for (const line of stdout.split(/\r?\n/)) {
     const trimmed = line.trim()
     if (trimmed === '') continue
-    let event: { type?: string; payload?: { type?: string; role?: string; content?: Array<{ type?: string; text?: string }> } }
+    let event: {
+      type?: string
+      item?: { type?: string; text?: string }
+      payload?: { type?: string; role?: string; content?: Array<{ type?: string; text?: string }> }
+    }
     try {
       event = JSON.parse(trimmed) as typeof event
     } catch {
       continue // malformed line: skip, do not fail the parse of the rest
+    }
+    if (event.type === 'item.completed' && event.item?.type === 'agent_message' && event.item.text !== undefined) {
+      if (event.item.text !== '') last = event.item.text
+      continue
     }
     if (event.type === 'response_item' && event.payload?.type === 'message' && event.payload.role === 'assistant') {
       const text = (event.payload.content ?? [])
@@ -185,6 +205,26 @@ export const DEFAULT_PLAN_TIMEOUT_MS = 15 * 60 * 1000
 export const DEFAULT_PLAN_MAX_RETRIES = 1
 
 /**
+ * Resolve the Codex CLI entry to spawn. Order: explicit `CODEX_CLI_PATH`
+ * environment override, the npm-global node entry on Windows, else the bare
+ * `codex` executable (Unix PATH lookup by the spawned node process).
+ */
+export function resolveCodexCli(): string {
+  const explicit = process.env.CODEX_CLI_PATH
+  if (explicit !== undefined && explicit !== '') {
+    return explicit
+  }
+  if (process.platform === 'win32') {
+    const appData = process.env.APPDATA
+    if (appData !== undefined && appData !== '') {
+      const candidate = join(appData, 'npm', 'node_modules', '@openai', 'codex', 'bin', 'codex.js')
+      if (existsSync(candidate)) return candidate
+    }
+  }
+  return 'codex'
+}
+
+/**
  * The Codex planner adapter: runs `codex exec` read-only + ephemeral with a
  * strict output schema, parses the final assistant message, and returns the
  * raw plan object. Service-level validation (validatePlan) stays in the
@@ -195,25 +235,18 @@ export class CodexPlanner {
     private readonly executor: ProcessExecutor = spawnCodexProcess,
     private readonly timeoutMs: number = DEFAULT_PLAN_TIMEOUT_MS,
     private readonly maxRetries: number = DEFAULT_PLAN_MAX_RETRIES,
+    private readonly cliPath: string = resolveCodexCli(),
   ) {}
-
-  /** Codex CLI node entry (npm global). */
-  private static readonly CODEX_CLI = join(
-    process.env.APPDATA ?? '',
-    'npm',
-    'node_modules',
-    '@openai',
-    'codex',
-    'bin',
-    'codex.js',
-  )
 
   /** Produce a plan object for one run; never mutates the repo (read-only + ephemeral). */
   async plan(input: PlanInput): Promise<unknown> {
     const schemaPath = await writePlanSchema(input.workDir)
     const prompt = buildPlanPrompt(input)
+    // Canonicalize once: cwd and --cd share one absolute path so a relative
+    // repoRoot can never resolve as repo/repo.
+    const repoRoot = resolve(input.repoRoot)
     const command = [
-      this.cliPath(),
+      this.cliPath,
       'exec',
       '--model', 'gpt-5.6-sol',
       '--config', 'model_reasoning_effort="max"',
@@ -221,7 +254,7 @@ export class CodexPlanner {
       '--sandbox', 'read-only',
       '--ephemeral',
       '--color', 'never',
-      '--cd', input.repoRoot,
+      '--cd', repoRoot,
       '--output-schema', schemaPath,
       '--json',
       '-',
@@ -231,7 +264,7 @@ export class CodexPlanner {
     for (let attempt = 0; attempt <= this.maxRetries; attempt += 1) {
       const result = await this.executor.run({
         command,
-        cwd: input.repoRoot,
+        cwd: repoRoot,
         stdinText: prompt,
         timeoutMs: this.timeoutMs,
       })
@@ -254,9 +287,5 @@ export class CodexPlanner {
       }
     }
     throw lastError ?? new PlannerError('process-failed', 'planner failed')
-  }
-
-  private cliPath(): string {
-    return CodexPlanner.CODEX_CLI
   }
 }

@@ -55,7 +55,8 @@ const plannedIssueSchema = z.object({
   key: z.string().min(1),
   acceptance: z.string().min(1),
   deps: z.array(z.string()).default([]),
-  risk: z.enum(['L1', 'L2', 'L3']).optional(),
+  // The planner schema models optional risk as nullable (strict outputs).
+  risk: z.enum(['L1', 'L2', 'L3']).nullable().optional(),
 })
 
 const runAggregateSchema = z.object({
