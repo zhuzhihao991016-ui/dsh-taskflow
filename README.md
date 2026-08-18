@@ -16,7 +16,7 @@ DSH 全自动任务工作流插件：任务提出后由 Codex CLI 规划拆分�
 - **P4**：Reviewer/Rework——`INTEGRATION_REVIEW` 后经 `/plugins/taskflow/review` 触发 Codex 只读审查（`codex exec review`，模型 `gpt-5.6-sol`、推理强度 `high`、只读沙箱）；PASS → `AWAITING_HUMAN`，REVISE → `EXECUTING` 并重置返工 Issue（含下游依赖）供执行器重新认领；审查记录持久化到 Run 聚合。
 - **P5**：DAG/Worktree——按 DAG 并行执行（`maxConcurrent` 配置，默认 1 保持串行兼容）；每个 Issue 在独立 Git worktree 中执行，成功后自动合并到集成分支 `taskflow/integration`，并清理 worktree/分支；执行/快照暴露 `workDir` 与 `branch`。
 
-当前版本 HEAD：`79dfd51`，测试套件 125 项（typecheck + vitest + build 通过）。
+当前版本 HEAD：`219eaf3`，测试套件 125 项（typecheck + vitest + build 通过）。
 
 后续阶段：P6 Board/迁移、P7 收口试运行。
 
