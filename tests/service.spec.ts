@@ -5,6 +5,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
+import type { RunAggregate } from '../src/domain.ts'
 import { PlannerError, type PlanInput } from '../src/planner.ts'
 import { MemoryRepository } from '../src/repository.ts'
 import { TaskFlowService, validateSubmit } from '../src/service.ts'
@@ -87,6 +88,28 @@ describe('TaskFlowService', () => {
     await expect(service.submit({ title: '任务', description: '改了', idempotencyKey: 'req-1' })).rejects.toThrow(
       'different request',
     )
+    expect(service.list()).toHaveLength(1)
+  })
+
+  it('rejects the same idempotency key with a different repoRoot', async () => {
+    const { service } = harness()
+    await service.submit({ title: '任务', repoRoot: 'C:/repo', idempotencyKey: 'req-2' })
+    await expect(service.submit({ title: '任务', repoRoot: 'C:/other', idempotencyKey: 'req-2' })).rejects.toThrow(
+      'different request',
+    )
+    expect(service.list()).toHaveLength(1)
+  })
+
+  it('recognizes legacy bare-key encodings for idempotent retries', async () => {
+    const { repository, service } = harness()
+    const run = await service.submit({ title: '旧数据', idempotencyKey: 'req-legacy' })
+    // Rewrite the creation transition key to the pre-encoding format (bare key).
+    await repository.updateRun(run.id, (current) => ({
+      ...current,
+      transitions: [{ ...current.transitions[0], idempotencyKey: 'req-legacy' }],
+    }))
+    const retry = await service.submit({ title: '旧数据', idempotencyKey: 'req-legacy' })
+    expect(retry.id).toBe(run.id)
     expect(service.list()).toHaveLength(1)
   })
 
@@ -333,5 +356,27 @@ describe('TaskFlowService.plan', () => {
     const result = await service.plan(run.id)
     expect(result.ok).toBe(false)
     expect(result).toMatchObject({ ok: false, error: expect.stringContaining('illegal transition') })
+  })
+
+  it('does not acknowledge a plan whose durable transition fails', async () => {
+    // A repository whose PLANNING write fails (e.g. backend outage) must make
+    // plan() fail instead of answering 202 with the run still RECEIVED.
+    class FailingRepository extends MemoryRepository {
+      override updateRun(id: string, fn: (current: RunAggregate) => RunAggregate): Promise<RunAggregate> {
+        if (id === 'run-0001') {
+          // A backend outage does not carry the taskflow: client-conflict
+          // prefix, so plan() must propagate it (thrown) instead of answering
+          // a result — the route turns that into 5xx.
+          return Promise.reject(new Error('backend unavailable'))
+        }
+        return super.updateRun(id, fn)
+      }
+    }
+    const failing = new FailingRepository()
+    const planner = new FakePlanner()
+    const service = new TaskFlowService(failing, () => 1000, planner, ['C:/repo'])
+    await service.submit({ title: '故障', repoRoot: 'C:/repo' })
+    await expect(service.plan('run-0001')).rejects.toThrow('backend unavailable')
+    expect(planner.calls).toBe(0)
   })
 })

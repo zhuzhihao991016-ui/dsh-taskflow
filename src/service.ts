@@ -96,6 +96,8 @@ function creationTransition(createdAt: number, idempotencyKey: string): RunTrans
 export class TaskFlowService {
   private readonly listeners = new Set<() => void>()
   private readonly planFlows = new Map<string, Promise<void>>()
+  /** Runs whose PLANNING transition is in flight (single-flight gate at entry). */
+  private readonly startingPlans = new Set<string>()
   /** Serializes submits: idempotency check, id allocation, and insertion run
    * on one chain so overlapping requests can never double-allocate or
    * overwrite each other (single-writer host assumption). */
@@ -110,12 +112,14 @@ export class TaskFlowService {
   ) {}
 
   /** Submit a new workflow run; returns its RECEIVED snapshot. An explicit
-   * idempotencyKey deduplicates only when the normalized request matches the
-   * existing run; a different request under the same key is a stable conflict.
-   * Submits without a key always create a fresh run (no title-based dedup). */
+   * idempotencyKey deduplicates only when the normalized request (title,
+   * description, and repoRoot) matches the existing run; a different request
+   * under the same key is a stable conflict. Submits without a key always
+   * create a fresh run (no title-based dedup). */
   submit(request: SubmitRequest): Promise<RunSnapshot> {
     validateSubmit(request)
     const explicitKey = request.idempotencyKey
+    const normalizedRepoRoot = request.repoRoot?.trim() === '' ? undefined : request.repoRoot?.trim()
     const job = async (): Promise<RunSnapshot> => {
       if (explicitKey !== undefined) {
         const existing = this.findByExplicitKey(explicitKey)
@@ -123,6 +127,7 @@ export class TaskFlowService {
           if (
             existing.title === request.title.trim()
             && existing.description === (request.description?.trim() ?? '')
+            && this.sameRepoRoot(existing.repoRoot, normalizedRepoRoot)
           ) {
             return this.snapshotOf(existing)
           }
@@ -139,7 +144,7 @@ export class TaskFlowService {
         status: 'RECEIVED',
         title: request.title.trim(),
         description: request.description?.trim() ?? '',
-        repoRoot: request.repoRoot?.trim() === '' ? undefined : request.repoRoot?.trim(),
+        repoRoot: normalizedRepoRoot,
         createdAt: now,
         updatedAt: now,
         issueCount: 0,
@@ -157,6 +162,12 @@ export class TaskFlowService {
     const result = this.submitTail.then(job)
     this.submitTail = result.then(() => undefined, () => undefined)
     return result
+  }
+
+  private sameRepoRoot(a: string | undefined, b: string | undefined): boolean {
+    if (a === undefined && b === undefined) return true
+    if (a === undefined || b === undefined) return false
+    return resolve(a) === resolve(b)
   }
 
   /** Read one run projection; undefined when the id is unknown. */
@@ -257,39 +268,23 @@ export class TaskFlowService {
     if (run.status !== 'RECEIVED' && run.status !== 'PLANNING') {
       return { ok: false, error: `taskflow: illegal transition ${run.status} → PLANNING` }
     }
-    // Single-flight: the whole operation (transition + planning flow) is
-    // registered synchronously at entry, so concurrent plan calls, repeated
-    // resumePlanning, and recovery overlapping an HTTP trigger all observe
-    // the in-flight flow before any await and never start a second one.
+    // Single-flight at entry: the starting marker is set synchronously before
+    // any await, so concurrent plan calls, repeated resumePlanning, and
+    // recovery overlapping an HTTP trigger all observe it and never enter the
+    // transition or start a second planner body.
     const inFlight = this.planFlows.get(runId)
-    if (inFlight !== undefined) {
-      if (options.wait === true) {
+    const starting = this.startingPlans.has(runId)
+    if (inFlight !== undefined || starting) {
+      if (options.wait === true && inFlight !== undefined) {
         await inFlight.catch(() => undefined)
       }
       return { ok: true, runId, status: run.status, alreadyPlanned: false }
     }
-    const flow = this.runPlanOnce(runId, inputHash)
-    this.planFlows.set(runId, flow)
-    void flow.finally(() => {
-      this.planFlows.delete(runId)
-    })
-    if (options.wait === true) {
-      await flow.catch(() => undefined)
-    }
-    return { ok: true, runId, status: 'PLANNING', alreadyPlanned: false }
-  }
-
-  /**
-   * The single in-flight planning operation for a run: transition to PLANNING
-   * (when RECEIVED), then run the planner and commit READY/FAILED. A failed
-   * transition (a concurrent flow already moved the run) exits quietly — that
-   * flow owns the planning. A persisted PLANNING run (host restart) skips the
-   * transition and resumes directly.
-   */
-  private async runPlanOnce(runId: string, inputHash: string): Promise<void> {
-    const run = this.repository.getRun(runId)
-    if (run === undefined) return
     if (run.status === 'RECEIVED') {
+      // Await the durable PLANNING transition before acknowledging: the HTTP
+      // route must never answer 202 for a run that is still RECEIVED or was
+      // cancelled by a queued command. Only the planner body stays background.
+      this.startingPlans.add(runId)
       try {
         await this.repository.updateRun(runId, (current) => {
           assertTransition(current.status, 'PLANNING')
@@ -299,15 +294,23 @@ export class TaskFlowService {
       } catch (error) {
         const message = (error as Error).message
         if (message.startsWith('taskflow:')) {
-          // A concurrent flow won the atomic transition; it owns the planning.
-          return
+          return { ok: false, error: message }
         }
         throw error
+      } finally {
+        this.startingPlans.delete(runId)
       }
-    } else if (run.status !== 'PLANNING') {
-      return
     }
-    await this.runPlanningBody(runId, inputHash)
+    const flow = this.runPlanningBody(runId, inputHash)
+    this.planFlows.set(runId, flow)
+    void flow.then(
+      () => { this.planFlows.delete(runId) },
+      () => { this.planFlows.delete(runId) },
+    )
+    if (options.wait === true) {
+      await flow.catch(() => undefined)
+    }
+    return { ok: true, runId, status: 'PLANNING', alreadyPlanned: false }
   }
 
   /** Resume every persisted in-progress planning flow (called at host start). */
@@ -410,12 +413,17 @@ export class TaskFlowService {
     return next
   }
 
-  /** Find the run created under an explicit idempotency key (creation transition key `submit:<key>`). */
+  /** Find the run created under an explicit idempotency key. Recognizes the
+   * current encoding (`submit:<key>` on the creation transition) and the
+   * legacy encoding (the bare key verbatim, stored by versions before the
+   * encoding change), so retries of legacy explicit keys stay idempotent. */
   private findByExplicitKey(idempotencyKey: string): RunAggregate | undefined {
     const target = `submit:${idempotencyKey}`
-    return this.repository.listRuns().find((run) =>
-      run.transitions.some((transition) => transition.idempotencyKey === target),
-    )
+    return this.repository.listRuns().find((run) => {
+      const creation = run.transitions[0]
+      return creation !== undefined
+        && (creation.idempotencyKey === target || creation.idempotencyKey === idempotencyKey)
+    })
   }
 
   private nextRunId(): string {
