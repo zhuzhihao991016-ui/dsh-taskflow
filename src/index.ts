@@ -1,11 +1,10 @@
 /**
- * dsh-taskflow host half: mounts the orchestration service, its same-origin
- * JSON routes (/plugins/taskflow/state, /plugins/taskflow/submit,
- * /plugins/taskflow/command), and a model-facing announcement section.
- *
- * P0 is the vertical slice: service skeleton + HTTP + client card. The
- * planner, executor, reviewer, and scheduler adapters mount in later phases
- * without changing the service surface or the routes' wire contract.
+ * dsh-taskflow host half: opens the taskflow storage domain, mounts the
+ * orchestration service over its repository, registers the same-origin JSON
+ * routes (/plugins/taskflow/state|submit|command), and injects a
+ * model-facing announcement section. P1 adds the durable run-aggregate
+ * ledger (storage domain); the planner, executor, reviewer, and scheduler
+ * adapters mount in later phases without changing the service surface.
  */
 
 import type { Context } from '@deepseek-ai/cordis'
@@ -13,16 +12,19 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-system-prompt'
+import type {} from '@deepseek-ai/dsh-storage-domain'
+import { TASKFLOW_DOMAIN } from './domain.ts'
+import { DomainRepository } from './repository.ts'
 import { TaskFlowService, type CommandAction, type SubmitRequest } from './service.ts'
 
 /** Order of the announcement section within the tool-guidance band. */
 const SECTION_ORDER = 200
 
-/** Required services: systemPrompt for the announcement section. */
-export const inject = ['systemPrompt']
+/** Required services: systemPrompt for the announcement, storageDomain for the ledger. */
+export const inject = ['systemPrompt', 'storageDomain']
 
 /** Model-facing announcement: plugin presence, capabilities, and limits. */
-export const TASKFLOW_GUIDANCE = '本机已安装 dsh-taskflow 插件（DSH 全自动任务工作流编排）：任务提出后由 Codex CLI 规划拆分为 Issue 并发布看板，DSH 认领执行，Codex 只读审查决定打回或通过，按依赖序推进，最终人工验收。当前为 P0 骨架：仅支持提交/查看/取消运行，规划与执行引擎将在后续阶段启用。用户提到「工作流 / 任务流 / taskflow」时即指本插件，请据此协作。'
+export const TASKFLOW_GUIDANCE = '本机已安装 dsh-taskflow 插件（DSH 全自动任务工作流编排）：任务提出后由 Codex CLI 规划拆分为 Issue 并发布看板，DSH 认领执行，Codex 只读审查决定打回或通过，按依赖序推进，最终人工验收。当前为 P1 阶段：运行台账已持久化（重启不丢，支持幂等提交与取消），规划与执行引擎将在后续阶段启用。用户提到「工作流 / 任务流 / taskflow」时即指本插件，请据此协作。'
 
 /** Plugin config; schema defaults are applied by the loader. */
 export interface Config {
@@ -96,7 +98,7 @@ function readJsonBody(req: IncomingMessage, maxBytes: number): Promise<unknown> 
   })
 }
 
-/** POST /plugins/taskflow/submit — create a run from { title, description? }. */
+/** POST /plugins/taskflow/submit — create a run from { title, description?, idempotencyKey? }. */
 function handleSubmit(service: TaskFlowService, req: IncomingMessage, res: ServerResponse): void {
   const guardError = guardMutation(req)
   if (guardError !== undefined) {
@@ -105,12 +107,15 @@ function handleSubmit(service: TaskFlowService, req: IncomingMessage, res: Serve
   }
   void readJsonBody(req, 64 * 1024).then((body) => {
     const request = (body ?? {}) as Partial<SubmitRequest>
-    try {
-      const run = service.submit({ title: request.title ?? '', description: request.description })
+    void service.submit({
+      title: request.title ?? '',
+      description: request.description,
+      idempotencyKey: request.idempotencyKey,
+    }).then((run) => {
       sendJson(res, { ok: true, run })
-    } catch (error) {
+    }, (error) => {
       sendJson(res, { ok: false, error: (error as Error).message }, 400)
-    }
+    })
   }, (error) => {
     sendJson(res, { ok: false, error: (error as Error).message }, 400)
   })
@@ -133,60 +138,68 @@ function handleCommand(service: TaskFlowService, req: IncomingMessage, res: Serv
       sendJson(res, { ok: false, error: 'taskflow: unsupported action' }, 400)
       return
     }
-    const result = service.command(runId, action)
-    sendJson(res, result.ok ? { ok: true } : { ok: false, error: result.error }, result.ok ? 200 : 409)
+    void service.command(runId, action).then((result) => {
+      sendJson(res, result.ok ? { ok: true } : { ok: false, error: result.error }, result.ok ? 200 : 409)
+    })
   }, (error) => {
     sendJson(res, { ok: false, error: (error as Error).message }, 400)
   })
 }
 
 /**
- * Mount the host half: service, announcement section, and HTTP routes.
- * Routes register only when the web server service exists (headless boots
- * skip them via the nested inject).
- * @param ctx - plugin context (systemPrompt injected).
+ * Mount the host half: open the durable domain, assemble the service, then
+ * register the announcement section and HTTP routes (routes only when the
+ * web server service exists).
+ * @param ctx - plugin context (systemPrompt + storageDomain injected).
  * @param config - resolved plugin config.
  */
-export function apply(ctx: Context, config?: Config): void {
-  const service = new TaskFlowService()
-
-  if ((config?.enabled ?? true) === false) return
-  if ((config?.announceToAgent ?? true) === true) {
-    ctx.effect(() => ctx.systemPrompt.section({
-      name: 'plugin:taskflow',
-      order: SECTION_ORDER,
-      text: TASKFLOW_GUIDANCE,
-    }), 'dsh-taskflow: guidance section')
+export function apply(ctx: Context, config?: Config): Promise<void> {
+  if ((config?.enabled ?? true) === false) {
+    return Promise.resolve()
   }
+  const fiber = ctx.inject(['systemPrompt', 'storageDomain'], async (scope: Context) => {
+    const domain = await scope.storageDomain.open(TASKFLOW_DOMAIN)
+    scope.effect(() => () => { void domain.close() }, 'dsh-taskflow: domain close')
+    const service = new TaskFlowService(new DomainRepository(domain))
 
-  ctx.inject(['webServer'], (scope: Context) => {
-    scope.effect(() => {
-      const disposeRoutes = [
-        scope.webServer.register({
-          kind: 'exact',
-          path: '/plugins/taskflow/state',
-          handler: (_req, res) => {
-            sendJson(res, { ok: true, runs: service.list() })
-          },
-        }),
-        scope.webServer.register({
-          kind: 'exact',
-          path: '/plugins/taskflow/submit',
-          handler: (req, res) => {
-            handleSubmit(service, req, res)
-          },
-        }),
-        scope.webServer.register({
-          kind: 'exact',
-          path: '/plugins/taskflow/command',
-          handler: (req, res) => {
-            handleCommand(service, req, res)
-          },
-        }),
-      ]
-      return () => {
-        for (const dispose of disposeRoutes) dispose()
-      }
-    }, 'dsh-taskflow: http routes')
+    if ((config?.announceToAgent ?? true) === true) {
+      scope.effect(() => scope.systemPrompt.section({
+        name: 'plugin:taskflow',
+        order: SECTION_ORDER,
+        text: TASKFLOW_GUIDANCE,
+      }), 'dsh-taskflow: guidance section')
+    }
+
+    return scope.inject(['webServer'], (webScope: Context) => {
+      webScope.effect(() => {
+        const disposeRoutes = [
+          webScope.webServer.register({
+            kind: 'exact',
+            path: '/plugins/taskflow/state',
+            handler: (_req, res) => {
+              sendJson(res, { ok: true, runs: service.list() })
+            },
+          }),
+          webScope.webServer.register({
+            kind: 'exact',
+            path: '/plugins/taskflow/submit',
+            handler: (req, res) => {
+              handleSubmit(service, req, res)
+            },
+          }),
+          webScope.webServer.register({
+            kind: 'exact',
+            path: '/plugins/taskflow/command',
+            handler: (req, res) => {
+              handleCommand(service, req, res)
+            },
+          }),
+        ]
+        return () => {
+          for (const dispose of disposeRoutes) dispose()
+        }
+      }, 'dsh-taskflow: http routes')
+    })
   })
+  return Promise.resolve(fiber).then(() => {})
 }

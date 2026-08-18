@@ -1,8 +1,10 @@
 /**
- * dsh-taskflow runtime invariant: the ledger is plain in-memory state in P0
- * (P1 moves it to a storage-domain aggregate), so there is no durable
- * cross-domain relation to assert yet; service behavior is covered by unit
- * tests.
+ * dsh-taskflow runtime invariant: the run aggregate's transition legality is
+ * enforced at the write boundary (the service's repository update runs
+ * assertTransition before persisting, inside the domain's atomic RMW), so no
+ * illegal transition can ever be stored; aggregate round-trip validity is
+ * re-checked by the storage domain's zod schema on every open. Service
+ * behavior and the state machine are covered by unit tests.
  */
 
 import type { Context } from '@deepseek-ai/cordis'
@@ -15,7 +17,8 @@ export const inject = ['invariants']
 /** Register the package's (currently empty) invariant contribution. */
 export function apply(ctx: Context): void {
   ctx.effect(() => ctx.invariants.register('dsh-taskflow', () => {
-    // No runtime invariant: P0 台账在内存中，无持久数据关系可断言；P1 引入
-    // storage-domain 聚合后在此登记对应的数据关系不变量。
+    // No runtime invariant: 状态迁移合法性在写入边界由 assertTransition 强制
+    // （仓库原子 update 内），聚合 schema 由 storage-domain 打开时全量校验；
+    // 此处无可独立观察的跨域数据关系。
   }), 'dsh-taskflow: invariants')
 }
