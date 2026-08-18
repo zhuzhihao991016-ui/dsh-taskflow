@@ -68,7 +68,7 @@ export function TaskFlowStatus(_props: TaskFlowStatusProps): ReactElement {
       : 'taskflow'
 
   return (
-    <span className={css.chip} data-testid="taskflow-chip" title="DSH 任务工作流（P1：持久内核）">
+    <span className={css.chip} data-testid="taskflow-chip" title="DSH 任务工作流（P3：串行执行）">
       <span className={active !== undefined && active > 0 ? css.dotActive : css.dot} aria-hidden="true" />
       {label}
     </span>

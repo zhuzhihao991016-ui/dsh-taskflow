@@ -37,8 +37,24 @@ export interface RunAggregate {
   issueCount: number
   /** Validated planned issues (P2); empty until a plan succeeds. */
   issues: PlannedIssue[]
+  /** Per-issue execution state (P3); empty until execution starts. Exactly
+   * one entry is `running` at a time (serial runner); `done`/`failed` are
+   * terminal per issue. */
+  executions: IssueExecution[]
   /** Append-only; `transitions[transitions.length - 1].to` equals `status`. */
   transitions: RunTransition[]
+}
+
+/** One issue's execution state inside a run. */
+export interface IssueExecution {
+  key: string
+  status: 'pending' | 'running' | 'done' | 'failed'
+  startedAt?: number
+  finishedAt?: number
+  /** Executor's human-readable result when done. */
+  summary?: string
+  /** Failure message when failed. */
+  error?: string
 }
 
 const transitionSchema = z.object({
@@ -59,6 +75,15 @@ const plannedIssueSchema = z.object({
   risk: z.enum(['L1', 'L2', 'L3']).nullable().optional(),
 })
 
+const issueExecutionSchema = z.object({
+  key: z.string().min(1),
+  status: z.enum(['pending', 'running', 'done', 'failed']),
+  startedAt: z.number().optional(),
+  finishedAt: z.number().optional(),
+  summary: z.string().optional(),
+  error: z.string().optional(),
+})
+
 const runAggregateSchema = z.object({
   id: z.string().min(1),
   status: z.enum(RUN_STATUSES),
@@ -69,6 +94,7 @@ const runAggregateSchema = z.object({
   updatedAt: z.number(),
   issueCount: z.number().int().min(0),
   issues: z.array(plannedIssueSchema).default([]),
+  executions: z.array(issueExecutionSchema).default([]),
   transitions: z.array(transitionSchema),
 }).superRefine((run, ctx) => {
   // Aggregate history consistency: this runs at every domain open (the
@@ -94,6 +120,24 @@ const runAggregateSchema = z.object({
   const last = transitions[transitions.length - 1]
   if (last.to !== run.status) {
     ctx.addIssue({ code: 'custom', message: `final transition '${last.to}' must equal run status '${run.status}'` })
+  }
+  // Execution consistency: one entry per issue, all keys known, at most one
+  // running at a time (the serial-runner invariant survives restarts).
+  const issueKeys = new Set(run.issues.map((issue) => issue.key))
+  const executedKeys = new Set<string>()
+  let runningCount = 0
+  for (const execution of run.executions) {
+    if (executedKeys.has(execution.key)) {
+      ctx.addIssue({ code: 'custom', message: `duplicate execution for issue '${execution.key}'` })
+    }
+    executedKeys.add(execution.key)
+    if (!issueKeys.has(execution.key)) {
+      ctx.addIssue({ code: 'custom', message: `execution references unknown issue '${execution.key}'` })
+    }
+    if (execution.status === 'running') runningCount += 1
+  }
+  if (runningCount > 1) {
+    ctx.addIssue({ code: 'custom', message: 'at most one issue may be running at a time' })
   }
 })
 

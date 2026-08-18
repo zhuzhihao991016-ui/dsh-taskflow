@@ -9,9 +9,10 @@
 import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join, resolve, sep } from 'node:path'
-import { runAggregateSchema, type RunAggregate, type RunTransition } from './domain.ts'
+import { runAggregateSchema, type IssueExecution, type RunAggregate, type RunTransition } from './domain.ts'
 import type { PlannedIssue } from './dag.ts'
 import { validatePlan } from './dag.ts'
+import type { ExecutionResult, Executor } from './executor.ts'
 import { CodexPlanner, PlannerError, type PlanInput } from './planner.ts'
 import type { TaskFlowRepository } from './repository.ts'
 import { assertTransition, isTerminal, type RunStatus } from './state.ts'
@@ -26,6 +27,18 @@ export interface RunSnapshot {
   updatedAt: number
   issueCount: number
   transitionCount: number
+  /** Per-issue execution state (P3); empty until execution starts. */
+  executions: IssueExecutionSnapshot[]
+}
+
+/** Projected per-issue execution state (no internal fields). */
+export interface IssueExecutionSnapshot {
+  key: string
+  status: 'pending' | 'running' | 'done' | 'failed'
+  startedAt?: number
+  finishedAt?: number
+  summary?: string
+  error?: string
 }
 
 /** A user-submitted workflow request. */
@@ -44,6 +57,14 @@ export interface SubmitRequest {
 export type PlanStartResult =
   | { ok: true; runId: string; status: RunStatus; alreadyPlanned: boolean }
   | { ok: false; error: string }
+
+/** Result of starting the serial execution; currentIssue is the claimed issue. */
+export type ExecutionStartResult =
+  | { ok: true; runId: string; status: RunStatus; alreadyExecuting: boolean; currentIssue?: string }
+  | { ok: false; error: string }
+
+/** Result of reporting one issue outcome. */
+export type ExecutionReport = { ok: true } | { ok: false; error: string }
 
 /** Planner abstraction (production: CodexPlanner; tests: fakes). */
 export interface Planner {
@@ -102,6 +123,12 @@ export class TaskFlowService {
    * not-yet-durable transition; the map entry is removed when the transition
    * settles. */
   private readonly startingTransitions = new Map<string, Promise<void>>()
+  /** Runs whose serial execution flow is in flight (single-flight gate). */
+  private readonly executionFlows = new Map<string, Promise<void>>()
+  /** Runs whose READY → EXECUTING transition is in flight: runId → the durable
+   * transition promise, shared by overlapping execute calls (same pattern as
+   * startingTransitions for planning). */
+  private readonly startingExecutions = new Map<string, Promise<void>>()
   /** Serializes submits: idempotency check, id allocation, and insertion run
    * on one chain so overlapping requests can never double-allocate or
    * overwrite each other (single-writer host assumption). */
@@ -113,6 +140,9 @@ export class TaskFlowService {
     private readonly planner: Planner = new CodexPlanner(),
     /** Canonical repo roots the planner may inspect; empty = planning disabled. */
     private readonly allowedRepoRoots: readonly string[] = [],
+    /** Optional automated executor; unset = agent-driven mode (a DSH session
+     * claims the current issue and reports via exec-result). */
+    private readonly executor?: Executor,
   ) {}
 
   /** Submit a new workflow run; returns its RECEIVED snapshot. An explicit
@@ -153,6 +183,7 @@ export class TaskFlowService {
         updatedAt: now,
         issueCount: 0,
         issues: [],
+        executions: [],
         transitions: [creationTransition(now, explicitKey !== undefined ? `submit:${explicitKey}` : `create:${id}`)],
       }
       // Parse before persist: a malformed aggregate must never reach the
@@ -361,6 +392,335 @@ export class TaskFlowService {
     }
   }
 
+  /**
+   * Start the serial execution of a READY run: READY → EXECUTING (durable,
+   * awaited before any ack), then exactly one issue is claimed (`running`) —
+   * the first schedulable issue in deterministic dependency order. With an
+   * executor installed the serial loop runs in the background (claim →
+   * execute → report → next); without one the DSH session claims the issue,
+   * performs it, reports the outcome via reportResult (record-only), and
+   * calls execute again to claim the next issue. Single-flight: overlapping
+   * calls, resume overlaps, and recovery share one flow per run. Completing
+   * every issue moves the run to INTEGRATION_REVIEW (the P4 review gate); a
+   * failed issue moves it to FAILED.
+   * @param runId - the run to execute.
+   * @param options - wait: await the background flow (tests/CLI) instead of
+   * returning right after the EXECUTING transition and first claim.
+   */
+  async startExecution(runId: string, options: { wait?: boolean } = {}): Promise<ExecutionStartResult> {
+    const run = this.repository.getRun(runId)
+    if (run === undefined) {
+      return { ok: false, error: `taskflow: unknown run ${runId}` }
+    }
+    if (run.issues.length === 0) {
+      return { ok: false, error: 'taskflow: run has no issues; execution requires a published plan' }
+    }
+    if (run.status !== 'READY' && run.status !== 'EXECUTING') {
+      return { ok: false, error: `taskflow: illegal transition ${run.status} → EXECUTING` }
+    }
+    // Single-flight at entry (synchronous, before any await).
+    const inFlight = this.executionFlows.get(runId)
+    const starting = this.startingExecutions.get(runId)
+    if (inFlight !== undefined || starting !== undefined) {
+      if (starting !== undefined) {
+        try {
+          await starting
+        } catch (error) {
+          const message = (error as Error).message
+          if (message.startsWith('taskflow:')) {
+            return { ok: false, error: message }
+          }
+          throw error
+        }
+        const flow = this.executionFlows.get(runId)
+        if (options.wait === true && flow !== undefined) {
+          await flow.catch(() => undefined)
+        }
+      } else if (options.wait === true && inFlight !== undefined) {
+        await inFlight.catch(() => undefined)
+      }
+      const current = this.currentRunningIssue(runId)
+      return {
+        ok: true,
+        runId,
+        status: 'EXECUTING',
+        alreadyExecuting: true,
+        currentIssue: current?.key,
+      }
+    }
+    if (run.status === 'READY') {
+      // Await the durable EXECUTING transition before acknowledging; a failed
+      // write propagates to every overlapping caller (no false 202).
+      let transition: Promise<void>
+      try {
+        transition = this.repository.updateRun(runId, (current) => {
+          assertTransition(current.status, 'EXECUTING')
+          return this.withTransition(current, 'EXECUTING', 'execution-started', `exec:start:${runId}`)
+        }).then(() => { this.notify() })
+        this.startingExecutions.set(runId, transition)
+        void transition.then(
+          () => { this.startingExecutions.delete(runId) },
+          () => { this.startingExecutions.delete(runId) },
+        )
+      } catch (error) {
+        const message = (error as Error).message
+        if (message.startsWith('taskflow:')) {
+          return { ok: false, error: message }
+        }
+        throw error
+      }
+      try {
+        await transition
+      } catch (error) {
+        const message = (error as Error).message
+        if (message.startsWith('taskflow:')) {
+          return { ok: false, error: message }
+        }
+        throw error
+      }
+    }
+    if (this.executor === undefined) {
+      // Agent-driven mode: claim the first schedulable issue and hand it to
+      // the DSH session; reportResult advances the run afterwards.
+      const claim = await this.claimNextIssue(runId)
+      const current = this.currentRunningIssue(runId)
+      return {
+        ok: true,
+        runId,
+        status: 'EXECUTING',
+        alreadyExecuting: false,
+        currentIssue: current?.key ?? claim?.key,
+      }
+    }
+    const flow = this.runExecutionBody(runId)
+    this.executionFlows.set(runId, flow)
+    void flow.then(
+      () => { this.executionFlows.delete(runId) },
+      () => { this.executionFlows.delete(runId) },
+    )
+    if (options.wait === true) {
+      await flow.catch(() => undefined)
+    }
+    const current = this.currentRunningIssue(runId)
+    return {
+      ok: true,
+      runId,
+      status: 'EXECUTING',
+      alreadyExecuting: false,
+      currentIssue: current?.key,
+    }
+  }
+
+  /**
+   * Report one issue's outcome to the serial runner. The issue must be the
+   * single current `running` issue (deterministic serial order); a success
+   * advances to the next schedulable issue, the last success moves the run to
+   * INTEGRATION_REVIEW, and a failure moves the run to FAILED. All checks
+   * re-run inside the repository's atomic RMW.
+   */
+  async reportResult(runId: string, issueKey: string, result: ExecutionResult): Promise<ExecutionReport> {
+    const run = this.repository.getRun(runId)
+    if (run === undefined) {
+      return { ok: false, error: `taskflow: unknown run ${runId}` }
+    }
+    if (run.status !== 'EXECUTING') {
+      return { ok: false, error: `taskflow: cannot report a result for run ${runId} in status ${run.status}` }
+    }
+    const running = (run.executions ?? []).find((execution) => execution.status === 'running')
+    if (running === undefined) {
+      return { ok: false, error: 'taskflow: no issue is currently running' }
+    }
+    if (running.key !== issueKey) {
+      return {
+        ok: false,
+        error: `taskflow: issue '${issueKey}' is not the current running issue ('${running.key}')`,
+      }
+    }
+    try {
+      await this.repository.updateRun(runId, (current) => {
+        const currentExecutions = current.executions ?? []
+        const currentRunning = currentExecutions.find((execution) => execution.status === 'running')
+        if (currentRunning === undefined || currentRunning.key !== issueKey) {
+          throw new Error(`taskflow: issue '${issueKey}' is not the current running issue`)
+        }
+        const now = this.now()
+        const finished: IssueExecution = result.ok
+          ? {
+              key: issueKey,
+              status: 'done',
+              startedAt: currentRunning.startedAt,
+              finishedAt: now,
+              summary: result.summary,
+            }
+          : {
+              key: issueKey,
+              status: 'failed',
+              startedAt: currentRunning.startedAt,
+              finishedAt: now,
+              error: result.error,
+            }
+        const executionsNext = [
+          ...currentExecutions.filter((execution) => execution.key !== issueKey),
+          finished,
+        ]
+        if (!result.ok) {
+          assertTransition(current.status, 'FAILED')
+          return this.withTransition(current, 'FAILED', `execution-failed: ${issueKey}: ${result.error}`, `exec:fail:${runId}`, {
+            executions: executionsNext,
+          })
+        }
+        const doneKeys = new Set(executionsNext.filter((execution) => execution.status === 'done').map((execution) => execution.key))
+        const allDone = current.issues.every((issue) => doneKeys.has(issue.key))
+        if (allDone) {
+          assertTransition(current.status, 'INTEGRATION_REVIEW')
+          return this.withTransition(current, 'INTEGRATION_REVIEW', 'execution-completed', `exec:done:${runId}`, {
+            executions: executionsNext,
+          })
+        }
+        const next: RunAggregate = {
+          ...current,
+          updatedAt: now,
+          executions: executionsNext,
+        }
+        runAggregateSchema.parse(next)
+        return next
+      })
+      this.notify()
+      return { ok: true }
+    } catch (error) {
+      const message = (error as Error).message
+      if (message.startsWith('taskflow:')) {
+        return { ok: false, error: message }
+      }
+      throw error
+    }
+  }
+
+  /** Resume every persisted EXECUTING run (called at host start): a `running`
+   * issue stuck by a crash is reset to pending (deterministic re-claim) and
+   * the serial flow restarts (with an executor) or the first schedulable
+   * issue is claimed (agent-driven mode). */
+  resumeExecution(): void {
+    for (const run of this.repository.listRuns()) {
+      if (run.status === 'EXECUTING') {
+        void this.resetStuckExecutions(run.id)
+          .then(() => this.startExecution(run.id))
+          .catch(() => undefined)
+      }
+    }
+  }
+
+  /**
+   * Durable claim of the next schedulable issue: no issue may be running, and
+   * the candidate must be pending with all dependencies done, chosen in
+   * deterministic topological order (stable by issue key). Re-checks inside
+   * the atomic RMW so concurrent claims can never double-claim.
+   * @returns the claimed issue, or undefined when nothing is schedulable.
+   */
+  private async claimNextIssue(runId: string): Promise<{ key: string; issue: PlannedIssue } | undefined> {
+    let claimed: { key: string; issue: PlannedIssue } | undefined
+    await this.repository.updateRun(runId, (current) => {
+      if (current.status !== 'EXECUTING') return current
+      const executions = current.executions ?? []
+      if (executions.some((execution) => execution.status === 'running')) return current
+      const doneKeys = new Set(executions.filter((execution) => execution.status === 'done').map((execution) => execution.key))
+      const candidate = this.topologicalOrder(current)
+        .find((issue) => !doneKeys.has(issue.key) && (issue.deps ?? []).every((dependency) => doneKeys.has(dependency)))
+      if (candidate === undefined) return current
+      claimed = { key: candidate.key, issue: candidate }
+      const next: RunAggregate = {
+        ...current,
+        updatedAt: this.now(),
+        executions: [
+          ...executions.filter((execution) => execution.key !== candidate.key),
+          { key: candidate.key, status: 'running', startedAt: this.now() },
+        ],
+      }
+      runAggregateSchema.parse(next)
+      return next
+    })
+    if (claimed !== undefined) this.notify()
+    return claimed
+  }
+
+  /** Reset a crash-stuck `running` issue back to pending (host-start resume). */
+  private async resetStuckExecutions(runId: string): Promise<void> {
+    await this.repository.updateRun(runId, (current) => {
+      if ((current.executions ?? []).every((execution) => execution.status !== 'running')) return current
+      const next: RunAggregate = {
+        ...current,
+        updatedAt: this.now(),
+        executions: (current.executions ?? []).map((execution) => (
+          execution.status === 'running' ? { ...execution, status: 'pending' as const } : execution
+        )),
+      }
+      runAggregateSchema.parse(next)
+      return next
+    })
+    this.notify()
+  }
+
+  /** The serial executor loop: claim → execute → report → next, until done. */
+  private async runExecutionBody(runId: string): Promise<void> {
+    while (this.executor !== undefined) {
+      const claim = await this.claimNextIssue(runId)
+      if (claim === undefined) return
+      const run = this.repository.getRun(runId)
+      if (run === undefined || run.repoRoot === undefined) return
+      let result: ExecutionResult
+      try {
+        result = await this.executor.execute({
+          runId,
+          issue: claim.issue,
+          repoRoot: run.repoRoot,
+          workDir: join(defaultPlanRoot(), runId, claim.issue.key),
+        })
+      } catch (error) {
+        // An executor infrastructure crash is a run failure, not a client
+        // conflict: strip any taskflow: prefix so the record lands as FAILED.
+        result = { ok: false, error: (error as Error).message.replace(/^taskflow:\s*/, '') }
+      }
+      const report = await this.reportResult(runId, claim.issue.key, result)
+      if (!report.ok || !result.ok) return
+    }
+  }
+
+  /** The single `running` issue of a run, if any. */
+  private currentRunningIssue(runId: string): IssueExecution | undefined {
+    const run = this.repository.getRun(runId)
+    return (run?.executions ?? []).find((execution) => execution.status === 'running')
+  }
+
+  /** Deterministic topological order of the run's issues (stable by key). */
+  private topologicalOrder(run: RunAggregate): PlannedIssue[] {
+    const byKey = new Map(run.issues.map((issue) => [issue.key, issue]))
+    const indegree = new Map(run.issues.map((issue) => [issue.key, (issue.deps ?? []).length]))
+    const dependents = new Map<string, string[]>()
+    for (const issue of run.issues) {
+      for (const dependency of issue.deps ?? []) {
+        const list = dependents.get(dependency) ?? []
+        list.push(issue.key)
+        dependents.set(dependency, list)
+      }
+    }
+    const queue = run.issues.filter((issue) => (issue.deps ?? []).length === 0).map((issue) => issue.key).sort()
+    const order: PlannedIssue[] = []
+    const seen = new Set<string>()
+    while (queue.length > 0) {
+      const key = queue.shift() as string
+      if (seen.has(key)) continue
+      seen.add(key)
+      order.push(byKey.get(key) as PlannedIssue)
+      for (const dependent of (dependents.get(key) ?? []).sort()) {
+        const remaining = (indegree.get(dependent) ?? 1) - 1
+        indegree.set(dependent, remaining)
+        if (remaining === 0) queue.push(dependent)
+      }
+      queue.sort()
+    }
+    return order
+  }
+
   private isAllowedRepoRoot(repoRoot: string): boolean {
     if (this.allowedRepoRoots.length === 0) return false
     const canonical = resolve(repoRoot)
@@ -429,7 +789,7 @@ export class TaskFlowService {
     to: RunStatus,
     reason: string,
     idempotencyKey: string,
-    patch: Partial<Pick<RunAggregate, 'issueCount' | 'issues'>> = {},
+    patch: Partial<Pick<RunAggregate, 'issueCount' | 'issues' | 'executions'>> = {},
   ): RunAggregate {
     const seq = current.transitions.length
     const transition: RunTransition = {
@@ -497,6 +857,14 @@ export class TaskFlowService {
       updatedAt: run.updatedAt,
       issueCount: run.issueCount,
       transitionCount: run.transitions.length,
+      executions: (run.executions ?? []).map((execution) => ({
+        key: execution.key,
+        status: execution.status,
+        startedAt: execution.startedAt,
+        finishedAt: execution.finishedAt,
+        summary: execution.summary,
+        error: execution.error,
+      })),
     }
   }
 }

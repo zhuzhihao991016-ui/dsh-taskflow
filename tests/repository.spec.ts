@@ -58,6 +58,7 @@ function sampleAggregate(id: string) {
     updatedAt: 1,
     issueCount: 0,
     issues: [],
+    executions: [],
     transitions: [{
       seq: 0, from: 'RECEIVED' as const, to: 'RECEIVED' as const,
       reason: 'created', actor: 'host', idempotencyKey: `create:${id}`, at: 1,
@@ -216,5 +217,79 @@ describe('DomainRepository', () => {
     const mounted = await mount(root)
     expect(mounted.repository.getRun('run-0001')?.issues).toEqual([])
     await unmount(mounted.ctx, mounted.domain)
+  })
+
+  it('opens a pre-P3 medium without the executions field (defaults to [])', async () => {
+    const root = await freshRoot()
+    const p2Era = {
+      ...sampleAggregate('run-0001'),
+      status: 'READY' as const,
+      issueCount: 1,
+      issues: [{ key: 'issue-001', acceptance: '验收 A' }],
+      transitions: [
+        ...sampleAggregate('run-0001').transitions,
+        {
+          seq: 1, from: 'RECEIVED' as const, to: 'PLANNING' as const,
+          reason: 'planning-started', actor: 'host', idempotencyKey: 'plan:start:abc', at: 2,
+        },
+        {
+          seq: 2, from: 'PLANNING' as const, to: 'READY' as const,
+          reason: 'planning-succeeded', actor: 'host', idempotencyKey: 'plan:done:abc', at: 3,
+        },
+      ],
+    }
+    const { executions, ...withoutExecutions } = p2Era
+    void executions
+    await writeFile(
+      join(root, 'taskflow.json'),
+      JSON.stringify({
+        unit: { name: 'taskflow', version: 1 },
+        global: null,
+        tables: { runs: { 'run-0001': withoutExecutions } },
+      }),
+      'utf8',
+    )
+    const mounted = await mount(root)
+    expect(mounted.repository.getRun('run-0001')?.status).toBe('READY')
+    await unmount(mounted.ctx, mounted.domain)
+  })
+
+  it('fails closed on duplicate or unknown-issue executions', async () => {
+    const root = await freshRoot()
+    const base = sampleAggregate('run-0001')
+    const bad = {
+      ...base,
+      status: 'EXECUTING' as const,
+      issueCount: 1,
+      issues: [{ key: 'issue-001', acceptance: '验收 A' }],
+      executions: [
+        { key: 'issue-001', status: 'running' },
+        { key: 'issue-999', status: 'done' },
+      ],
+      transitions: [
+        ...base.transitions,
+        {
+          seq: 1, from: 'RECEIVED' as const, to: 'EXECUTING' as const,
+          reason: 'execution-started', actor: 'host', idempotencyKey: 'exec:start:run-0001', at: 2,
+        },
+      ],
+    }
+    await writeFile(
+      join(root, 'taskflow.json'),
+      JSON.stringify({
+        unit: { name: 'taskflow', version: 1 },
+        global: null,
+        tables: { runs: { 'run-0001': bad } },
+      }),
+      'utf8',
+    )
+    const ctx = new Context()
+    await ctx.plugin(Storage)
+    await ctx.plugin(StorageJson, { root })
+    await ctx.plugin(StorageDomain, { backend: 'json' })
+    await expect(ctx.storageDomain.open(TASKFLOW_DOMAIN)).rejects.toMatchObject({
+      code: 'invalid-record',
+    })
+    await ctx.fiber.dispose()
   })
 })
