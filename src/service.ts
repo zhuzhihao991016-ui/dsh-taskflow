@@ -9,11 +9,12 @@
 import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join, resolve, sep } from 'node:path'
-import { runAggregateSchema, type IssueExecution, type RunAggregate, type RunTransition } from './domain.ts'
+import { runAggregateSchema, type IssueExecution, type ReviewVerdict, type RunAggregate, type RunTransition } from './domain.ts'
 import type { PlannedIssue, RiskLevel } from './dag.ts'
 import { validatePlan } from './dag.ts'
 import type { ExecutionResult, Executor } from './executor.ts'
 import { CodexPlanner, PlannerError, type PlanInput } from './planner.ts'
+import { CodexReviewer, ReviewerError, type Reviewer, type ReviewResult } from './reviewer.ts'
 import type { TaskFlowRepository } from './repository.ts'
 import { assertTransition, isTerminal, type RunStatus } from './state.ts'
 
@@ -33,6 +34,13 @@ export interface RunSnapshot {
   issues: IssueSnapshot[]
   /** Per-issue execution state (P3); empty until execution starts. */
   executions: IssueExecutionSnapshot[]
+  /** Latest Codex review result (P4); absent until a review completes. */
+  review?: {
+    verdict: ReviewVerdict
+    summary: string
+    reworkKeys: string[]
+    at: number
+  }
 }
 
 /** Projected planned issue (agent needs acceptance/deps to execute). */
@@ -77,6 +85,11 @@ export type ExecutionStartResult =
 
 /** Result of reporting one issue outcome. */
 export type ExecutionReport = { ok: true } | { ok: false; error: string }
+
+/** Result of starting the P4 review gate. */
+export type ReviewStartResult =
+  | { ok: true; runId: string; status: RunStatus; alreadyReviewing: boolean; verdict?: ReviewVerdict }
+  | { ok: false; error: string }
 
 /** Planner abstraction (production: CodexPlanner; tests: fakes). */
 export interface Planner {
@@ -141,6 +154,8 @@ export class TaskFlowService {
    * transition promise, shared by overlapping execute calls (same pattern as
    * startingTransitions for planning). */
   private readonly startingExecutions = new Map<string, Promise<void>>()
+  /** Runs whose P4 review flow is in flight (single-flight gate). */
+  private readonly reviewFlows = new Map<string, Promise<void>>()
   /** Serializes submits: idempotency check, id allocation, and insertion run
    * on one chain so overlapping requests can never double-allocate or
    * overwrite each other (single-writer host assumption). */
@@ -155,6 +170,8 @@ export class TaskFlowService {
     /** Optional automated executor; unset = agent-driven mode (a DSH session
      * claims the current issue and reports via exec-result). */
     private readonly executor?: Executor,
+    /** Optional Codex reviewer; default is the production CodexReviewer. */
+    private readonly reviewer: Reviewer = new CodexReviewer(),
   ) {}
 
   /** Submit a new workflow run; returns its RECEIVED snapshot. An explicit
@@ -631,6 +648,57 @@ export class TaskFlowService {
   }
 
   /**
+   * Start the P4 review gate for an INTEGRATION_REVIEW run. The review runs in
+   * the background (Codex CLI, read-only); PASS moves the run to
+   * AWAITING_HUMAN, REVISE moves it back to EXECUTING and resets the selected
+   * (or all) issue executions to pending so the serial runner re-claims them.
+   * Single-flight: overlapping calls share one flow per run.
+   * @param runId - the run to review.
+   * @param options - wait: await the background flow (tests/CLI) instead of
+   * returning right after the review flow starts.
+   */
+  async startReview(runId: string, options: { wait?: boolean } = {}): Promise<ReviewStartResult> {
+    const run = this.repository.getRun(runId)
+    if (run === undefined) {
+      return { ok: false, error: `taskflow: unknown run ${runId}` }
+    }
+    if (run.status !== 'INTEGRATION_REVIEW') {
+      return { ok: false, error: `taskflow: illegal transition ${run.status} → INTEGRATION_REVIEW` }
+    }
+    const inFlight = this.reviewFlows.get(runId)
+    if (inFlight !== undefined) {
+      if (options.wait === true) {
+        await inFlight.catch(() => undefined)
+      }
+      const current = this.repository.getRun(runId)
+      return {
+        ok: true,
+        runId,
+        status: current?.status ?? 'INTEGRATION_REVIEW',
+        alreadyReviewing: true,
+        verdict: current?.review?.verdict,
+      }
+    }
+    const flow = this.runReviewBody(runId)
+    this.reviewFlows.set(runId, flow)
+    void flow.then(
+      () => { this.reviewFlows.delete(runId) },
+      () => { this.reviewFlows.delete(runId) },
+    )
+    if (options.wait === true) {
+      await flow.catch(() => undefined)
+    }
+    const current = this.repository.getRun(runId)
+    return {
+      ok: true,
+      runId,
+      status: current?.status ?? 'INTEGRATION_REVIEW',
+      alreadyReviewing: false,
+      verdict: current?.review?.verdict,
+    }
+  }
+
+  /**
    * Durable claim of the next schedulable issue: no issue may be running, and
    * the candidate must be pending with all dependencies done, chosen in
    * deterministic topological order (stable by issue key). Re-checks inside
@@ -703,6 +771,113 @@ export class TaskFlowService {
       const report = await this.reportResult(runId, claim.issue.key, result)
       if (!report.ok || !result.ok) return
     }
+  }
+
+  /** Background P4 review body: reviewer → PASS/REVISE transition
+   * (single-flight via reviewFlows). */
+  private async runReviewBody(runId: string): Promise<void> {
+    try {
+      const run = this.repository.getRun(runId)
+      if (run === undefined) return
+      if (run.repoRoot === undefined || run.repoRoot === '') {
+        await this.transitionTo(runId, 'FAILED', 'review-failed: run has no repoRoot', `review:fail:${runId}`)
+        return
+      }
+      const raw = await this.reviewer.review({
+        runId,
+        title: run.title,
+        description: run.description,
+        repoRoot: run.repoRoot,
+        issues: run.issues,
+        executions: run.executions ?? [],
+        workDir: join(defaultPlanRoot(), runId),
+      })
+      const result = this.normalizeReviewResult(run, raw)
+      if (result.verdict === 'PASS') {
+        await this.repository.updateRun(runId, (current) => {
+          assertTransition(current.status, 'AWAITING_HUMAN')
+          return this.withTransition(current, 'AWAITING_HUMAN', 'review-passed', `review:pass:${runId}`, {
+            review: { verdict: 'PASS', summary: result.summary, reworkKeys: [], at: this.now() },
+          })
+        })
+        this.notify()
+        return
+      }
+      const reworkKeys = this.reworkClosure(run, result.reworkKeys)
+      await this.repository.updateRun(runId, (current) => {
+        assertTransition(current.status, 'EXECUTING')
+        return this.withTransition(current, 'EXECUTING', 'review-revise', `review:revise:${runId}`, {
+          executions: this.resetReworkExecutions(current.executions ?? [], reworkKeys),
+          review: { verdict: 'REVISE', summary: result.summary, reworkKeys: [...reworkKeys], at: this.now() },
+        })
+      })
+      this.notify()
+    } catch (error) {
+      const message = error instanceof ReviewerError
+        ? error.message
+        : (error as Error).message
+      try {
+        await this.transitionTo(runId, 'FAILED', `review-failed: ${message}`, `review:fail:${runId}`)
+      } catch {
+        // The run is already terminal; the first transition attempt recorded the failure.
+      }
+    }
+  }
+
+  /** Validate/normalize a raw reviewer object into a ReviewResult. Unknown
+   * rework keys are ignored; an empty (or fully filtered) list means all
+   * issues are reworked. */
+  private normalizeReviewResult(run: RunAggregate, raw: unknown): ReviewResult {
+    const object = (raw ?? {}) as { verdict?: unknown; summary?: unknown; reworkKeys?: unknown }
+    if (object.verdict !== 'PASS' && object.verdict !== 'REVISE') {
+      throw new ReviewerError('parse-failed', 'reviewer output has invalid verdict')
+    }
+    if (typeof object.summary !== 'string') {
+      throw new ReviewerError('parse-failed', 'reviewer output has invalid summary')
+    }
+    const knownKeys = new Set(run.issues.map((issue) => issue.key))
+    const reworkKeys = Array.isArray(object.reworkKeys)
+      ? object.reworkKeys.filter((key): key is string => typeof key === 'string' && knownKeys.has(key))
+      : []
+    return { verdict: object.verdict, summary: object.summary, reworkKeys }
+  }
+
+  /** Compute the transitive rework closure: selected keys plus every issue that
+   * depends on them (directly or indirectly). An empty selection means all
+   * issues are reworked. */
+  private reworkClosure(run: RunAggregate, keys: readonly string[]): Set<string> {
+    const selected = new Set(keys.length === 0 ? run.issues.map((issue) => issue.key) : keys)
+    const dependents = new Map<string, string[]>()
+    for (const issue of run.issues) {
+      for (const dependency of issue.deps ?? []) {
+        const list = dependents.get(dependency) ?? []
+        list.push(issue.key)
+        dependents.set(dependency, list)
+      }
+    }
+    const closure = new Set<string>()
+    const queue = [...selected]
+    while (queue.length > 0) {
+      const key = queue.shift() as string
+      if (closure.has(key)) continue
+      closure.add(key)
+      for (const dependent of dependents.get(key) ?? []) {
+        if (!closure.has(dependent)) queue.push(dependent)
+      }
+    }
+    return closure
+  }
+
+  /** Reset reworked (and transitively affected) done/failed issues to pending. */
+  private resetReworkExecutions(
+    executions: readonly IssueExecution[],
+    reworkKeys: ReadonlySet<string>,
+  ): IssueExecution[] {
+    return executions.map((execution) => {
+      if (execution.status !== 'done' && execution.status !== 'failed') return execution
+      if (!reworkKeys.has(execution.key)) return execution
+      return { key: execution.key, status: 'pending' as const }
+    })
   }
 
   /** The single `running` issue of a run, if any. */
@@ -809,7 +984,7 @@ export class TaskFlowService {
     to: RunStatus,
     reason: string,
     idempotencyKey: string,
-    patch: Partial<Pick<RunAggregate, 'issueCount' | 'issues' | 'executions'>> = {},
+    patch: Partial<Pick<RunAggregate, 'issueCount' | 'issues' | 'executions' | 'review'>> = {},
   ): RunAggregate {
     const seq = current.transitions.length
     const transition: RunTransition = {
@@ -892,6 +1067,12 @@ export class TaskFlowService {
         summary: execution.summary,
         error: execution.error,
       })),
+      review: run.review === undefined ? undefined : {
+        verdict: run.review.verdict,
+        summary: run.review.summary,
+        reworkKeys: [...run.review.reworkKeys],
+        at: run.review.at,
+      },
     }
   }
 }

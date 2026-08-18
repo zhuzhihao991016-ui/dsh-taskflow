@@ -42,6 +42,8 @@ export interface RunAggregate {
    * one entry is `running` at a time (serial runner); `done`/`failed` are
    * terminal per issue. */
   executions: IssueExecution[]
+  /** Latest Codex review record (P4); absent until a review completes. */
+  review?: RunReview
   /** Append-only; `transitions[transitions.length - 1].to` equals `status`. */
   transitions: RunTransition[]
 }
@@ -56,6 +58,18 @@ export interface IssueExecution {
   summary?: string
   /** Failure message when failed. */
   error?: string
+}
+
+/** P4 review verdict. */
+export type ReviewVerdict = 'PASS' | 'REVISE'
+
+/** The latest Codex review record persisted on a run. */
+export interface RunReview {
+  verdict: ReviewVerdict
+  summary: string
+  /** Issue keys selected for rework; empty means all issues. */
+  reworkKeys: string[]
+  at: number
 }
 
 const transitionSchema = z.object({
@@ -85,6 +99,13 @@ const issueExecutionSchema = z.object({
   error: z.string().optional(),
 })
 
+const reviewSchema = z.object({
+  verdict: z.enum(['PASS', 'REVISE']),
+  summary: z.string(),
+  reworkKeys: z.array(z.string()).default([]),
+  at: z.number(),
+})
+
 const runAggregateSchema = z.object({
   id: z.string().min(1),
   status: z.enum(RUN_STATUSES),
@@ -96,6 +117,7 @@ const runAggregateSchema = z.object({
   issueCount: z.number().int().min(0),
   issues: z.array(plannedIssueSchema).default([]),
   executions: z.array(issueExecutionSchema).default([]),
+  review: reviewSchema.optional(),
   transitions: z.array(transitionSchema),
 }).superRefine((run, ctx) => {
   // Aggregate history consistency: this runs at every domain open (the
