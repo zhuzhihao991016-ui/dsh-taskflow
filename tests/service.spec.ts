@@ -73,7 +73,8 @@ describe('TaskFlowService', () => {
     // The ledger stores the same absolute path the planner resolves against,
     // so executing DSH sessions see one unambiguous repository root.
     expect(run.repoRoot).toBe(resolve('./repo'))
-    const again = await service.submit({ title: '相对仓库', repoRoot: '.\\repo', idempotencyKey: 'req-rel' })
+    // Portable relative spellings that resolve to the same root dedupe.
+    const again = await service.submit({ title: '相对仓库', repoRoot: 'repo', idempotencyKey: 'req-rel' })
     expect(again.id).toBe(run.id)
     expect(service.list()).toHaveLength(1)
   })
