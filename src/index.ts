@@ -49,6 +49,16 @@ function sendJson(res: ServerResponse, body: unknown, status = 200): void {
   res.end(payload)
 }
 
+/** Whether an error is a client (validation/state) error with a stable taskflow: message. */
+function isClientError(error: unknown): boolean {
+  return (error as Error).message.startsWith('taskflow:')
+}
+
+/** Map a thrown error to its HTTP status: 4xx for client errors, 500 for the rest. */
+function errorStatus(error: unknown): number {
+  return isClientError(error) ? 400 : 500
+}
+
 /**
  * Reject requests that are not same-origin POST with a JSON body. The host
  * binds loopback by default but may be exposed on 0.0.0.0, and a CORS-safelisted
@@ -114,7 +124,7 @@ function handleSubmit(service: TaskFlowService, req: IncomingMessage, res: Serve
     }).then((run) => {
       sendJson(res, { ok: true, run })
     }, (error) => {
-      sendJson(res, { ok: false, error: (error as Error).message }, 400)
+      sendJson(res, { ok: false, error: (error as Error).message }, errorStatus(error))
     })
   }, (error) => {
     sendJson(res, { ok: false, error: (error as Error).message }, 400)
@@ -140,6 +150,8 @@ function handleCommand(service: TaskFlowService, req: IncomingMessage, res: Serv
     }
     void service.command(runId, action).then((result) => {
       sendJson(res, result.ok ? { ok: true } : { ok: false, error: result.error }, result.ok ? 200 : 409)
+    }, (error) => {
+      sendJson(res, { ok: false, error: (error as Error).message }, errorStatus(error))
     })
   }, (error) => {
     sendJson(res, { ok: false, error: (error as Error).message }, 400)
@@ -159,7 +171,9 @@ export function apply(ctx: Context, config?: Config): Promise<void> {
   }
   const fiber = ctx.inject(['systemPrompt', 'storageDomain'], async (scope: Context) => {
     const domain = await scope.storageDomain.open(TASKFLOW_DOMAIN)
-    scope.effect(() => () => { void domain.close() }, 'dsh-taskflow: domain close')
+    // Return the close promise so lifecycle disposal awaits the domain drain
+    // and the name frees before a potential reopen.
+    scope.effect(() => () => domain.close(), 'dsh-taskflow: domain close')
     const service = new TaskFlowService(new DomainRepository(domain))
 
     if ((config?.announceToAgent ?? true) === true) {
@@ -170,7 +184,10 @@ export function apply(ctx: Context, config?: Config): Promise<void> {
       }), 'dsh-taskflow: guidance section')
     }
 
-    return scope.inject(['webServer'], (webScope: Context) => {
+    // Nested inject: routes only when the web server exists. Deliberately not
+    // returned — an async inject callback's resolved value is collected as an
+    // effect and a Fiber would be rejected as an invalid effect.
+    scope.inject(['webServer'], (webScope: Context) => {
       webScope.effect(() => {
         const disposeRoutes = [
           webScope.webServer.register({

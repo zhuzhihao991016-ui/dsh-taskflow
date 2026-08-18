@@ -53,6 +53,24 @@ describe('TaskFlowService', () => {
     expect(service.list()).toHaveLength(1)
   })
 
+  it('rejects a non-string idempotency key before persisting anything', async () => {
+    const { service } = harness()
+    expect(() => service.submit({ title: '任务', idempotencyKey: 123 as never })).toThrow(
+      'idempotencyKey must be a string',
+    )
+    expect(service.list()).toHaveLength(0)
+  })
+
+  it('serializes concurrent submits without id collisions or overwrites', async () => {
+    const { service } = harness()
+    const runs = await Promise.all(
+      [1, 2, 3, 4, 5].map((n) => service.submit({ title: `任务${n}` })),
+    )
+    const ids = runs.map((run) => run.id)
+    expect(new Set(ids).size).toBe(5)
+    expect(service.list()).toHaveLength(5)
+  })
+
   it('snapshot returns undefined for an unknown id', async () => {
     const { service } = harness()
     expect(service.snapshot('run-9999')).toBeUndefined()

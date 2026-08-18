@@ -6,7 +6,7 @@
  * submit / snapshot / list / command / subscribe.
  */
 
-import type { RunAggregate, RunTransition } from './domain.ts'
+import { runAggregateSchema, type RunAggregate, type RunTransition } from './domain.ts'
 import type { TaskFlowRepository } from './repository.ts'
 import { assertTransition, isTerminal, type RunStatus } from './state.ts'
 
@@ -41,10 +41,16 @@ export interface CommandResult {
   error?: string
 }
 
-/** Validate a submit request; throws with a stable message on violation. */
+/** Validate a submit request; throws a stable `taskflow:` error on violation. */
 export function validateSubmit(request: SubmitRequest): void {
   if (typeof request.title !== 'string' || request.title.trim() === '') {
     throw new Error('taskflow: submit requires a non-empty title')
+  }
+  if (request.description !== undefined && typeof request.description !== 'string') {
+    throw new Error('taskflow: description must be a string')
+  }
+  if (request.idempotencyKey !== undefined && typeof request.idempotencyKey !== 'string') {
+    throw new Error('taskflow: idempotencyKey must be a string')
   }
 }
 
@@ -68,6 +74,10 @@ function creationTransition(createdAt: number, idempotencyKey: string): RunTrans
  */
 export class TaskFlowService {
   private readonly listeners = new Set<() => void>()
+  /** Serializes submits: idempotency check, id allocation, and insertion run
+   * on one chain so overlapping requests can never double-allocate or
+   * overwrite each other (single-writer host assumption). */
+  private submitTail: Promise<void> = Promise.resolve()
 
   constructor(
     private readonly repository: TaskFlowRepository,
@@ -75,29 +85,38 @@ export class TaskFlowService {
   ) {}
 
   /** Submit a new workflow run; returns its RECEIVED snapshot. */
-  async submit(request: SubmitRequest): Promise<RunSnapshot> {
+  submit(request: SubmitRequest): Promise<RunSnapshot> {
     validateSubmit(request)
     const idempotencyKey = request.idempotencyKey ?? `submit:${request.title.trim()}`
-    const existing = this.findByIdempotency(idempotencyKey)
-    if (existing !== undefined) {
-      return this.snapshotOf(existing)
-    }
+    const job = async (): Promise<RunSnapshot> => {
+      const existing = this.findByIdempotency(idempotencyKey)
+      if (existing !== undefined) {
+        return this.snapshotOf(existing)
+      }
 
-    const now = this.now()
-    const id = this.nextRunId()
-    const aggregate: RunAggregate = {
-      id,
-      status: 'RECEIVED',
-      title: request.title.trim(),
-      description: request.description?.trim() ?? '',
-      createdAt: now,
-      updatedAt: now,
-      issueCount: 0,
-      transitions: [creationTransition(now, idempotencyKey)],
+      const now = this.now()
+      const id = this.nextRunId()
+      const aggregate: RunAggregate = {
+        id,
+        status: 'RECEIVED',
+        title: request.title.trim(),
+        description: request.description?.trim() ?? '',
+        createdAt: now,
+        updatedAt: now,
+        issueCount: 0,
+        transitions: [creationTransition(now, idempotencyKey)],
+      }
+      // Parse before persist: a malformed aggregate must never reach the
+      // medium (KvTable.put does not schema-check; open-time validation would
+      // then fail the whole plugin on the next restart).
+      runAggregateSchema.parse(aggregate)
+      await this.repository.insertRun(aggregate)
+      this.notify()
+      return this.snapshotOf(aggregate)
     }
-    await this.repository.insertRun(aggregate)
-    this.notify()
-    return this.snapshotOf(aggregate)
+    const result = this.submitTail.then(job)
+    this.submitTail = result.then(() => undefined, () => undefined)
+    return result
   }
 
   /** Read one run projection; undefined when the id is unknown. */
@@ -139,17 +158,25 @@ export class TaskFlowService {
           idempotencyKey: `command:cancel:${runId}:${seq}`,
           at: this.now(),
         }
-        return {
+        const next: RunAggregate = {
           ...current,
           status: 'CANCELLED',
           updatedAt: transition.at,
           transitions: [...current.transitions, transition],
         }
+        runAggregateSchema.parse(next)
+        return next
       })
       this.notify()
       return { ok: true }
     } catch (error) {
-      return { ok: false, error: (error as Error).message }
+      const message = (error as Error).message
+      if (message.startsWith('taskflow:')) {
+        return { ok: false, error: message }
+      }
+      // Repository/backend failures are not request conflicts: propagate so
+      // the route can answer 5xx and the client may retry.
+      throw error
     }
   }
 

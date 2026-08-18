@@ -165,4 +165,36 @@ describe('DomainRepository', () => {
     })
     await ctx.fiber.dispose()
   })
+
+  it('fails closed on an inconsistent aggregate history (status vs final transition)', async () => {
+    const root = await freshRoot()
+    const inconsistent = {
+      ...sampleAggregate('run-0001'),
+      status: 'RECEIVED',
+      transitions: [
+        ...sampleAggregate('run-0001').transitions,
+        {
+          seq: 1, from: 'RECEIVED' as const, to: 'CANCELLED' as const,
+          reason: 'cancelled', actor: 'host', idempotencyKey: 'cancel:1', at: 2,
+        },
+      ],
+    }
+    await writeFile(
+      join(root, 'taskflow.json'),
+      JSON.stringify({
+        unit: { name: 'taskflow', version: 1 },
+        global: null,
+        tables: { runs: { 'run-0001': inconsistent } },
+      }),
+      'utf8',
+    )
+    const ctx = new Context()
+    await ctx.plugin(Storage)
+    await ctx.plugin(StorageJson, { root })
+    await ctx.plugin(StorageDomain, { backend: 'json' })
+    await expect(ctx.storageDomain.open(TASKFLOW_DOMAIN)).rejects.toMatchObject({
+      code: 'invalid-record',
+    })
+    await ctx.fiber.dispose()
+  })
 })

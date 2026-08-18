@@ -55,6 +55,31 @@ const runAggregateSchema = z.object({
   updatedAt: z.number(),
   issueCount: z.number().int().min(0),
   transitions: z.array(transitionSchema),
+}).superRefine((run, ctx) => {
+  // Aggregate history consistency: this runs at every domain open (the
+  // integrity boundary), so a structurally valid but inconsistent medium
+  // fails closed instead of poisoning the running ledger.
+  const transitions = run.transitions
+  if (transitions.length === 0) {
+    ctx.addIssue({ code: 'custom', message: 'transitions must not be empty' })
+    return
+  }
+  const first = transitions[0]
+  if (first.seq !== 0 || first.from !== 'RECEIVED' || first.to !== 'RECEIVED') {
+    ctx.addIssue({ code: 'custom', message: 'first transition must be the RECEIVED creation (seq 0)' })
+  }
+  for (let i = 1; i < transitions.length; i += 1) {
+    if (transitions[i].seq !== transitions[i - 1].seq + 1) {
+      ctx.addIssue({ code: 'custom', message: `transition seq must be contiguous at index ${i}` })
+    }
+    if (transitions[i].from !== transitions[i - 1].to) {
+      ctx.addIssue({ code: 'custom', message: `transition chain must be continuous at index ${i}` })
+    }
+  }
+  const last = transitions[transitions.length - 1]
+  if (last.to !== run.status) {
+    ctx.addIssue({ code: 'custom', message: `final transition '${last.to}' must equal run status '${run.status}'` })
+  }
 })
 
 /** The taskflow domain declaration (version 1; a medium stamped otherwise rejects at open). */
@@ -67,3 +92,6 @@ export const TASKFLOW_DOMAIN = defineDomain({
 })
 
 export type TaskFlowDomain = typeof TASKFLOW_DOMAIN
+
+/** Exported for write-path validation in the service (parse before persist). */
+export { runAggregateSchema }
