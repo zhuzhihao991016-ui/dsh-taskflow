@@ -19,7 +19,7 @@ DSH 全自动任务工作流插件：任务提出后由 Codex CLI 规划拆分�
 - **P7**：人工验收门/收口——`/plugins/taskflow/human-decision` 支持 `accept|rework`；`accept` 进入 `ACCEPTED` 终态，`rework` 回到 `PLANNING` 并清空执行记录；补齐服务、路由与 HTTP 契约测试。
 - **P8.0**：契约冻结——新增 `src/contracts.ts` 定义 Executor v2、控制动作、事件/详情/配置契约；`Config` 增加自动化配置项并默认关闭；补充契约测试。
 
-当前版本 HEAD：`539cddc`，测试套件 164 项（typecheck + vitest + build 通过）。
+当前版本 HEAD：`f93ed25`，测试套件 164 项（typecheck + vitest + build 通过）。
 
 后续阶段：P8.1 持久控制元数据与 Run 级 Git 隔离。
 
