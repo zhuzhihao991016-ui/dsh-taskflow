@@ -148,6 +148,14 @@ export interface CommandResult {
   error?: string
 }
 
+/** Final human acceptance decision on an AWAITING_HUMAN run (P7). */
+export type HumanDecision = 'accept' | 'rework'
+
+/** Result of a human acceptance decision. */
+export type HumanDecisionResult =
+  | { ok: true; runId: string; status: RunStatus }
+  | { ok: false; error: string }
+
 /** P5 execution/worktree options. */
 export interface TaskFlowOptions {
   /** Maximum number of issues that may run concurrently (default 1 = serial). */
@@ -360,6 +368,57 @@ export class TaskFlowService {
       })
       this.notify()
       return { ok: true }
+    } catch (error) {
+      const message = (error as Error).message
+      if (message.startsWith('taskflow:')) {
+        return { ok: false, error: message }
+      }
+      // Repository/backend failures are not request conflicts: propagate so
+      // the route can answer 5xx and the client may retry.
+      throw error
+    }
+  }
+
+  /**
+   * Apply the final human acceptance decision to an AWAITING_HUMAN run.
+   * `accept` moves the run to the terminal ACCEPTED state; `rework` moves it
+   * back to PLANNING and clears the previous executions so a fresh plan can
+   * replace the issue set without leaving stale execution references. The
+   * transition check runs inside the repository's atomic update.
+   */
+  async decideHuman(runId: string, decision: HumanDecision, actor = 'human'): Promise<HumanDecisionResult> {
+    if (decision !== 'accept' && decision !== 'rework') {
+      return { ok: false, error: `taskflow: unsupported human decision '${String(decision)}'` }
+    }
+    if (this.repository.getRun(runId) === undefined) {
+      return { ok: false, error: `taskflow: unknown run ${runId}` }
+    }
+    try {
+      const updated = await this.repository.updateRun(runId, (current) => {
+        const to: RunStatus = decision === 'accept' ? 'ACCEPTED' : 'PLANNING'
+        assertTransition(current.status, to)
+        const seq = current.transitions.length
+        const transition: RunTransition = {
+          seq,
+          from: current.status,
+          to,
+          reason: decision === 'accept' ? 'human-accepted' : 'human-rework',
+          actor,
+          idempotencyKey: `human:${decision}:${runId}:${seq}`,
+          at: this.now(),
+        }
+        const next: RunAggregate = {
+          ...current,
+          ...(decision === 'rework' ? { executions: [] } : {}),
+          status: to,
+          updatedAt: transition.at,
+          transitions: [...current.transitions, transition],
+        }
+        runAggregateSchema.parse(next)
+        return next
+      })
+      this.notify()
+      return { ok: true, runId, status: updated.status }
     } catch (error) {
       const message = (error as Error).message
       if (message.startsWith('taskflow:')) {

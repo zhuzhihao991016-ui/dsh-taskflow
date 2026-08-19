@@ -4,7 +4,7 @@ DSH 全自动任务工作流插件：任务提出后由 Codex CLI 规划拆分�
 
 ## 状态
 
-**P6（当前）**：在看板投影与卡片迁移——服务端新增 `/plugins/taskflow/board` 只读看板快照（待办/进行中/待审查/已完成/失败五列），浏览器端把输入 dock 的状态卡片升级为可点击看板弹层，卡片随 Run/Issue 状态自动在列间迁移。
+**P7（当前）**：收口阶段——新增 `/plugins/taskflow/human-decision` 最终人工验收门：`accept` 将 `AWAITING_HUMAN` 运行置为 `ACCEPTED` 终态，`rework` 打回 `PLANNING` 并清空旧执行记录以便重新规划，形成“提出→规划→执行→审查→人工验收”的完整闭环。
 
 已完成：
 
@@ -16,10 +16,11 @@ DSH 全自动任务工作流插件：任务提出后由 Codex CLI 规划拆分�
 - **P4**：Reviewer/Rework——`INTEGRATION_REVIEW` 后经 `/plugins/taskflow/review` 触发 Codex 只读审查（无 baseSha 时使用 `codex exec review --uncommitted`，有 baseSha 时使用通用 `codex exec --cd` 审查集成 diff；模型 `gpt-5.6-sol`、推理强度 `high`、只读沙箱）；PASS → `AWAITING_HUMAN`，REVISE → `EXECUTING` 并重置返工 Issue（含下游依赖）供执行器重新认领；审查记录持久化到 Run 聚合。
 - **P5**：DAG/Worktree——按 DAG 并行执行（`maxConcurrent` 配置，默认 1 保持串行兼容）；每个 Issue 在独立 Git worktree 中执行，成功后自动提交 worktree 内未提交改动、经专用 integration worktree 串行合并到集成分支 `taskflow/integration`，再清理 worktree/分支；执行/快照暴露 `workDir`、`branch` 与 `baseSha`。
 - **P6**：Board/迁移——`/plugins/taskflow/board` 只读看板快照、纯函数 `buildBoard`、浏览器看板弹层（点击状态卡片打开，五列卡片随状态自动迁移）。
+- **P7**：人工验收门/收口——`/plugins/taskflow/human-decision` 支持 `accept|rework`；`accept` 进入 `ACCEPTED` 终态，`rework` 回到 `PLANNING` 并清空执行记录；补齐服务、路由与 HTTP 契约测试。
 
-当前版本 HEAD：`d02145c`，测试套件 139 项（typecheck + vitest + build 通过）。
+当前版本 HEAD：`d02145c`，测试套件 146 项（typecheck + vitest + build 通过）。
 
-后续阶段：P7 收口试运行。
+后续阶段：在真实 DSH 环境中做一次端到端收口试运行。
 
 ## HTTP 路由
 
@@ -33,6 +34,7 @@ DSH 全自动任务工作流插件：任务提出后由 Codex CLI 规划拆分�
 | POST | `/plugins/taskflow/execute` | 启动/继续执行，认领可调度 Issues（最多 maxConcurrent） |
 | POST | `/plugins/taskflow/exec-result` | 上报当前 Issue 执行结果 |
 | POST | `/plugins/taskflow/review` | 触发 P4 Codex 只读审查（PASS/REVISE） |
+| POST | `/plugins/taskflow/human-decision` | P7 最终人工验收（`accept` 通过 / `rework` 打回重新规划） |
 
 ## 开发
 
@@ -50,7 +52,7 @@ dsh plugin --profile web add <本仓库路径>
 ## 目录结构
 
 - `src/index.ts` — 宿主入口：服务装配、system prompt 段、HTTP 路由（webServer 存在时经嵌套 inject 注册）
-- `src/service.ts` — TaskFlowService：submit/snapshot/list/command/subscribe、plan、startExecution/reportResult、board（P6 看板投影）
+- `src/service.ts` — TaskFlowService：submit/snapshot/list/command/subscribe、plan、startExecution/reportResult、startReview/decideHuman、board（P6 看板投影 / P7 人工验收门）
 - `src/domain.ts` / `src/repository.ts` — storage-domain 持久化聚合与原子读写
 - `src/state.ts` — Run 状态机与合法迁移表
 - `src/dag.ts` — Issue 计划校验与依赖拓扑排序
@@ -66,7 +68,7 @@ dsh plugin --profile web add <本仓库路径>
 
 ### What the model sees
 
-当前注入一段 `plugin:taskflow` 通告（order 200），声明插件存在、能力、HTTP 路由与当前 P6 阶段能力，模型可据此配合提交、规划、并行执行、结果上报、触发审查与查看看板。
+当前注入一段 `plugin:taskflow` 通告（order 200），声明插件存在、能力、HTTP 路由与当前 P7 阶段能力，模型可据此配合提交、规划、并行执行、结果上报、触发审查、人工验收与查看看板。
 
 ### Token effect
 
@@ -74,8 +76,8 @@ dsh plugin --profile web add <本仓库路径>
 
 ## Known Limitations and Deferred Work
 
-- P7 未实现：最终人工验收门与收口试运行。
 - P4 审查门为显式触发（`/plugins/taskflow/review`），不会在进入 `INTEGRATION_REVIEW` 后自动启动。
+- P7 人工验收门为显式触发（`/plugins/taskflow/human-decision`），不会在 `AWAITING_HUMAN` 后自动验收。
 - P5 并行执行默认 `maxConcurrent=1`，需通过插件配置调大；worktree 合并采用非快进合并，冲突会导致对应 Issue 失败。
 - 执行方为 DSH 会话或自动化 Executor 显式驱动；没有后台自动连续执行器。
 - 客户端卡片只读；写入全部走宿主受控路由。

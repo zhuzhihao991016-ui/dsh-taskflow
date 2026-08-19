@@ -1,11 +1,12 @@
 /**
  * dsh-taskflow host half: opens the taskflow storage domain, mounts the
  * orchestration service over its repository, registers the same-origin JSON
- * routes (/plugins/taskflow/state|board|submit|command|plan|execute|exec-result|review),
+ * routes (/plugins/taskflow/state|board|submit|command|plan|execute|exec-result|review|human-decision),
  * and injects a model-facing announcement section. P5 adds DAG parallel
  * execution with Git worktree isolation (maxConcurrent, per-issue worktrees,
  * auto-merge to an integration branch) on top of the P4 Codex review gate;
- * P6 adds the read-only kanban board projection.
+ * P6 adds the read-only kanban board projection; P7 adds the final human
+ * acceptance gate and closes the loop for pilot runs.
  */
 
 import type { Context } from '@deepseek-ai/cordis'
@@ -18,7 +19,7 @@ import { TASKFLOW_DOMAIN } from './domain.ts'
 import type { ExecutionResult } from './executor.ts'
 import { CodexPlanner } from './planner.ts'
 import { DomainRepository } from './repository.ts'
-import { TaskFlowService, type CommandAction, type SubmitRequest } from './service.ts'
+import { TaskFlowService, type CommandAction, type HumanDecision, type SubmitRequest } from './service.ts'
 
 /** Order of the announcement section within the tool-guidance band. */
 const SECTION_ORDER = 200
@@ -27,7 +28,7 @@ const SECTION_ORDER = 200
 export const inject = ['systemPrompt', 'storageDomain']
 
 /** Model-facing announcement: plugin presence, capabilities, and limits. */
-export const TASKFLOW_GUIDANCE = '本机已安装 dsh-taskflow 插件（DSH 全自动任务工作流编排）：任务提出后由 Codex CLI 规划拆分为 Issue 并发布看板，DSH 认领执行（串行/并行 + Git worktree 隔离），Codex 只读审查决定打回或通过，按依赖序推进，最终人工验收。当前为 P6 阶段：运行台账已持久化，Codex 规划引擎已接入（提交时带 repoRoot 后经 /plugins/taskflow/plan 触发规划，规划通过后运行进入 READY 并携带 Issue 清单）；执行引擎已启用（经 /plugins/taskflow/execute 启动执行，READY → EXECUTING，按 DAG 依赖每次认领最多 maxConcurrent 个可调度 Issue，响应含 currentIssues；每个 Issue 在独立 Git worktree 中执行，workDir/branch 可从 state/execute 响应读取；完成 currentIssue 后经 /plugins/taskflow/exec-result 上报 { runId, issueKey, ok, summary|error }，成功后自动合并到集成分支，全部完成后运行自动进入 INTEGRATION_REVIEW）；P4 审查门已启用（经 /plugins/taskflow/review 触发 Codex 只读审查，PASS 进入 AWAITING_HUMAN 等待人工验收，REVISE 打回 EXECUTING 并重置返工 Issue）；P6 看板已启用（GET /plugins/taskflow/board 返回五列看板快照，浏览器端状态卡片可打开看板）。用户提到「工作流 / 任务流 / taskflow」时即指本插件，请据此协作。'
+export const TASKFLOW_GUIDANCE = '本机已安装 dsh-taskflow 插件（DSH 全自动任务工作流编排）：任务提出后由 Codex CLI 规划拆分为 Issue 并发布看板，DSH 认领执行（串行/并行 + Git worktree 隔离），Codex 只读审查决定打回或通过，按依赖序推进，最终人工验收。当前为 P7 阶段：运行台账已持久化，Codex 规划引擎已接入（提交时带 repoRoot 后经 /plugins/taskflow/plan 触发规划，规划通过后运行进入 READY 并携带 Issue 清单）；执行引擎已启用（经 /plugins/taskflow/execute 启动执行，READY → EXECUTING，按 DAG 依赖每次认领最多 maxConcurrent 个可调度 Issue，响应含 currentIssues；每个 Issue 在独立 Git worktree 中执行，workDir/branch 可从 state/execute 响应读取；完成 currentIssue 后经 /plugins/taskflow/exec-result 上报 { runId, issueKey, ok, summary|error }，成功后自动合并到集成分支，全部完成后运行自动进入 INTEGRATION_REVIEW）；P4 审查门已启用（经 /plugins/taskflow/review 触发 Codex 只读审查，PASS 进入 AWAITING_HUMAN 等待人工验收，REVISE 打回 EXECUTING 并重置返工 Issue）；P6 看板已启用（GET /plugins/taskflow/board 返回五列看板快照，浏览器端状态卡片可打开看板）；P7 人工验收门已启用（POST /plugins/taskflow/human-decision 提交 { runId, decision: accept|rework }，accept 进入 ACCEPTED 终态，rework 回到 PLANNING 重新规划）。用户提到「工作流 / 任务流 / taskflow」时即指本插件，请据此协作。'
 
 /** Plugin config; schema defaults are applied by the loader. */
 export interface Config {
@@ -285,6 +286,36 @@ function handleReview(service: TaskFlowService, req: IncomingMessage, res: Serve
   })
 }
 
+/** POST /plugins/taskflow/human-decision — apply { runId, decision: accept|rework } (P7). */
+export function handleHumanDecision(service: TaskFlowService, req: IncomingMessage, res: ServerResponse): void {
+  const guardError = guardMutation(req)
+  if (guardError !== undefined) {
+    sendJson(res, { ok: false, error: guardError }, 403)
+    return
+  }
+  void readJsonBody(req, 64 * 1024).then((body) => {
+    const parsed = (body ?? {}) as { runId?: unknown; decision?: unknown }
+    if (typeof parsed.runId !== 'string' || parsed.runId === '') {
+      sendJson(res, { ok: false, error: 'taskflow: human-decision requires runId' }, 400)
+      return
+    }
+    if (parsed.decision !== 'accept' && parsed.decision !== 'rework') {
+      sendJson(res, { ok: false, error: 'taskflow: human-decision requires decision (accept|rework)' }, 400)
+      return
+    }
+    const decision: HumanDecision = parsed.decision
+    void service.decideHuman(parsed.runId, decision).then((result) => {
+      sendJson(res, result.ok
+        ? { ok: true, runId: parsed.runId, status: result.status }
+        : { ok: false, error: result.error }, result.ok ? 200 : 409)
+    }, (error) => {
+      sendJson(res, { ok: false, error: (error as Error).message }, errorStatus(error))
+    })
+  }, (error) => {
+    sendJson(res, { ok: false, error: (error as Error).message }, 400)
+  })
+}
+
 /** GET /plugins/taskflow/board — read-only board snapshot; non-GET rejected. */
 export function handleBoard(service: TaskFlowService, req: IncomingMessage, res: ServerResponse): void {
   if (req.method !== 'GET') {
@@ -399,6 +430,13 @@ export function apply(ctx: Context, config?: Config): Promise<void> {
             path: '/plugins/taskflow/review',
             handler: (req, res) => {
               handleReview(service, req, res)
+            },
+          }),
+          webScope.webServer.register({
+            kind: 'exact',
+            path: '/plugins/taskflow/human-decision',
+            handler: (req, res) => {
+              handleHumanDecision(service, req, res)
             },
           }),
         ]
