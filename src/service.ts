@@ -382,9 +382,10 @@ export class TaskFlowService {
   /**
    * Apply the final human acceptance decision to an AWAITING_HUMAN run.
    * `accept` moves the run to the terminal ACCEPTED state; `rework` moves it
-   * back to PLANNING and clears the previous executions so a fresh plan can
-   * replace the issue set without leaving stale execution references. The
-   * transition check runs inside the repository's atomic update.
+   * back to PLANNING and clears the previous executions, review, and base SHA
+   * so a fresh plan can replace the issue set without stale state leaking into
+   * the next cycle. The transition check runs inside the repository's atomic
+   * update.
    */
   async decideHuman(runId: string, decision: HumanDecision, actor = 'human'): Promise<HumanDecisionResult> {
     if (decision !== 'accept' && decision !== 'rework') {
@@ -409,7 +410,7 @@ export class TaskFlowService {
         }
         const next: RunAggregate = {
           ...current,
-          ...(decision === 'rework' ? { executions: [] } : {}),
+          ...(decision === 'rework' ? { executions: [], review: undefined, baseSha: undefined } : {}),
           status: to,
           updatedAt: transition.at,
           transitions: [...current.transitions, transition],
@@ -461,7 +462,17 @@ export class TaskFlowService {
       return { ok: false, error: `taskflow: repoRoot '${run.repoRoot}' is not in allowedRepoRoots` }
     }
     const inputHash = this.planInputHash(run)
-    if (run.transitions.some((t) => t.idempotencyKey === `plan:done:${inputHash}`)) {
+    // A `human-rework` transition invalidates every earlier `plan:done`
+    // marker: after the human sends a run back to PLANNING, the same
+    // title/description must be allowed to invoke the planner again instead of
+    // being treated as already-planned.
+    const lastReworkSeq = run.transitions
+      .filter((t) => t.reason === 'human-rework')
+      .reduce((max, t) => Math.max(max, t.seq), -1)
+    const hasPlanDone = run.transitions.some((t) =>
+      t.idempotencyKey === `plan:done:${inputHash}` && t.seq > lastReworkSeq
+    )
+    if (hasPlanDone) {
       return { ok: true, runId, status: run.status, alreadyPlanned: true }
     }
     if (run.status !== 'RECEIVED' && run.status !== 'PLANNING') {

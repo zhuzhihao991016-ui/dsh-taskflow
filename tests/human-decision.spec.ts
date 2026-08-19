@@ -9,8 +9,9 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { PlannedIssue } from '../src/dag.ts'
 import type { RunAggregate } from '../src/domain.ts'
 import { handleHumanDecision } from '../src/index.ts'
+import type { PlanInput } from '../src/planner.ts'
 import { MemoryRepository } from '../src/repository.ts'
-import { TaskFlowService } from '../src/service.ts'
+import { TaskFlowService, type Planner } from '../src/service.ts'
 import type { GitRunner } from '../src/worktree.ts'
 
 /** No-op git runner so service tests exercise orchestration, not real git. */
@@ -18,6 +19,15 @@ const fakeGit: GitRunner = {
   async run() {
     return { exitCode: 0, stdout: 'master\n', stderr: '' }
   },
+}
+
+class FakePlanner implements Planner {
+  calls = 0
+
+  async plan(_input: PlanInput): Promise<unknown> {
+    this.calls += 1
+    return { issues: [{ key: 'issue-001', acceptance: '验收 A' }] }
+  }
 }
 
 const issueA: PlannedIssue = { key: 'issue-001', acceptance: '验收 A' }
@@ -61,6 +71,7 @@ function seedAwaitingHuman(
       summary: `完成 ${issue.key}`,
     })),
     review: { verdict: 'PASS', summary: '通过', reworkKeys: [], at: 5 },
+    baseSha: 'base-1',
     transitions: [
       { seq: 0, from: 'RECEIVED', to: 'RECEIVED', reason: 'created', actor: 'host', idempotencyKey: `create:${id}`, at: 1 },
       { seq: 1, from: 'RECEIVED', to: 'PLANNING', reason: 'planning-started', actor: 'host', idempotencyKey: 'plan:start:abc', at: 2 },
@@ -102,7 +113,31 @@ describe('TaskFlowService.decideHuman', () => {
     const run = repository.getRun('run-0001') as RunAggregate
     expect(run.status).toBe('PLANNING')
     expect(run.executions).toEqual([])
+    expect(run.review).toBeUndefined()
+    expect(run.baseSha).toBeUndefined()
     expect(run.transitions.at(-1)).toMatchObject({ from: 'AWAITING_HUMAN', to: 'PLANNING', reason: 'human-rework' })
+  })
+
+  it('rework invalidates the old plan marker so the same task can be re-planned', async () => {
+    const repository = new MemoryRepository()
+    const planner = new FakePlanner()
+    const service = new TaskFlowService(
+      repository,
+      () => 1000,
+      planner,
+      ['C:/repo'],
+      undefined,
+      undefined,
+      { git: fakeGit },
+    )
+    seedAwaitingHuman(repository, [issueA])
+
+    await service.decideHuman('run-0001', 'rework')
+    const result = await service.plan('run-0001', { wait: true })
+
+    expect(result.ok).toBe(true)
+    expect(planner.calls).toBe(1)
+    expect((repository.getRun('run-0001') as RunAggregate).status).toBe('READY')
   })
 
   it('rejects unknown runs, unsupported decisions, and non-AWAITING_HUMAN runs', async () => {
