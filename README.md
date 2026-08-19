@@ -25,7 +25,7 @@ DSH 全自动任务工作流插件：任务提出后由 Codex CLI 规划拆分�
 - **P8.5**：浏览器运行台与介入窗口——详情抽屉、run-scoped 实时 SSE、按 `allowedActions` 渲染操作按钮、二次确认；`allowedActions` 在 `AWAITING_HUMAN` 下补充 `accept`/`rework` 供浏览器直接完成人工验收。
 - **P8.6**：P8 自动化默认开启——`DEFAULT_AUTOMATION_CONFIG.enabled` 与插件 `Config.automationEnabled` 默认改为 `true`，更新模型通告、契约测试与文档，完成 P8 自动化 feature flag 转正。
 
-当前版本 HEAD：`bf21aa8`，测试套件 211 项（typecheck + vitest + build 通过）。
+P8.6 代码提交：`bf21aa8`；当前 HEAD 为审查修复提交 `b213280`，测试套件 212 项（typecheck + vitest + build 通过）。
 
 后续阶段：P8.7 及以后待定。
 
