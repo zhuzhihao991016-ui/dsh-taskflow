@@ -4,7 +4,7 @@ DSH 全自动任务工作流插件：任务提出后由 Codex CLI 规划拆分�
 
 ## 状态
 
-**P8.4（当前）**：自动执行授权门——`requireExecutionPermission=true` 时，自动规划完成后进入 `WAITING_PERMISSION`，人工通过 `release` 释放后才继续自动执行；同时保留 P8.3 的自动推进协调器、SSE 事件流与 `WAITING_DECISION` 人工介入窗口。
+**P8.5（当前）**：浏览器运行台与介入窗口——点击看板卡片打开运行详情抽屉（`/plugins/taskflow/run`），运行台通过 run-scoped SSE 实时刷新，并按 `allowedActions` 渲染暂停/继续/取消/接管/放行/重试及人工验收按钮，所有操作均带二次确认；同时保留 P8.4 的自动执行授权门。
 
 已完成：
 
@@ -22,10 +22,11 @@ DSH 全自动任务工作流插件：任务提出后由 Codex CLI 规划拆分�
 - **P8.2**：内置 Codex Issue Executor——新增 `src/issue-executor.ts`，以 `gpt-5.6-sol`、`workspace-write`、`--ask-for-approval never` 和严格输出 Schema 驱动 `codex exec` 实现单个 Issue；服务将 attemptId、进度事件与自动化结果接入执行循环。
 - **P8.3**：自动推进协调器——`automationEnabled` 开启时自动规划（`autoPlan`）、自动执行、自动审查（`autoReview`）、SSE 事件流（`/plugins/taskflow/events`）与人工介入窗口（`WAITING_DECISION`/`WAITING_PERMISSION`、`maxReviewCycles`）。
 - **P8.4**：自动执行授权门——新增 `requireExecutionPermission` 配置；开启后自动规划完成进入 `WAITING_PERMISSION`，人工 `release` 后才自动执行，`READY → WAITING_PERMISSION → EXECUTING` 状态迁移落地。
+- **P8.5**：浏览器运行台与介入窗口——详情抽屉、run-scoped 实时 SSE、按 `allowedActions` 渲染操作按钮、二次确认；`allowedActions` 在 `AWAITING_HUMAN` 下补充 `accept`/`rework` 供浏览器直接完成人工验收。
 
-当前版本 HEAD：`f67e0c4`，测试套件 201 项（typecheck + vitest + build 通过）。
+当前版本 HEAD：`f7d66b0`，测试套件 205 项（typecheck + vitest + build 通过）。
 
-后续阶段：P8.5 及以后待定。
+后续阶段：P8.6 及以后待定。
 
 ## HTTP 路由
 
@@ -60,7 +61,7 @@ dsh plugin --profile web add <本仓库路径>
 ## 目录结构
 
 - `src/index.ts` — 宿主入口：服务装配、system prompt 段、HTTP 路由（webServer 存在时经嵌套 inject 注册）
-- `src/service.ts` — TaskFlowService：submit/snapshot/list/command/subscribe/subscribeEvents、plan、startExecution/reportResult、startReview/decideHuman、board、runDetail、recordProgress（P6 看板 / P7 人工验收 / P8.1 控制元数据 / P8.3 自动推进与事件流 / P8.4 自动执行授权门）
+- `src/service.ts` — TaskFlowService：submit/snapshot/list/command/subscribe/subscribeEvents、plan、startExecution/reportResult、startReview/decideHuman、board、runDetail、recordProgress（P6 看板 / P7 人工验收 / P8.1 控制元数据 / P8.3 自动推进与事件流 / P8.4 自动执行授权门 / P8.5 浏览器操作 allowedActions）
 - `src/domain.ts` / `src/repository.ts` — storage-domain 持久化聚合与原子读写
 - `src/state.ts` — Run 状态机与合法迁移表
 - `src/dag.ts` — Issue 计划校验与依赖拓扑排序
@@ -70,7 +71,7 @@ dsh plugin --profile web add <本仓库路径>
 - `src/executor.ts` — 执行器接口（agent 驱动 / 自动化双模式）
 - `src/issue-executor.ts` — P8.2 内置 Codex Issue Executor（workspace-write 单 Issue 实现）
 - `src/contracts.ts` — P8 契约冻结（Executor v2、控制动作、事件/详情/配置）
-- `src/client/` — 浏览器半体：`conversation.input.dock` 状态卡片（只读投影）
+- `src/client/` — 浏览器半体：`conversation.input.dock` 状态卡片 + P6 看板 + P8.5 运行详情抽屉/操作按钮（写入仍走宿主受控路由）
 - `build/` — 自 DSH checkout 拷贝的 client bundle 预设（保持与运行版本同步）
 - `tests/` — 服务、状态机、DAG、规划器、持久化与执行引擎单元测试
 
@@ -78,7 +79,7 @@ dsh plugin --profile web add <本仓库路径>
 
 ### What the model sees
 
-当前注入一段 `plugin:taskflow` 通告（order 200），声明插件存在、能力、HTTP 路由与当前 P8.4 阶段能力，模型可据此配合提交、规划、并行执行、结果上报、触发审查、人工验收、查看看板/运行详情/SSE 事件流；自动化开启时自动推进规划、执行与审查，并可通过 `requireExecutionPermission` 保留执行前人工授权窗口。
+当前注入一段 `plugin:taskflow` 通告（order 200），声明插件存在、能力、HTTP 路由与当前 P8.5 阶段能力，模型可据此配合提交、规划、并行执行、结果上报、触发审查、人工验收、查看看板/运行详情/SSE 事件流，并在浏览器运行台中按 `allowedActions` 执行带二次确认的介入操作；自动化开启时自动推进规划、执行与审查，并可通过 `requireExecutionPermission` 保留执行前人工授权窗口。
 
 ### Token effect
 
@@ -88,8 +89,9 @@ dsh plugin --profile web add <本仓库路径>
 
 - P8 自动化默认关闭（`automationEnabled=false`）；开启后自动推进协调器、SSE 与人工介入窗口已实现。
 - P8.4 自动执行授权门默认关闭（`requireExecutionPermission=false`）；开启后自动执行会停在 `WAITING_PERMISSION`，需要人工 `release` 释放。
+- P8.5 浏览器运行台已实现；所有写入（命令/人工验收）仍走宿主受控路由并带二次确认。
 - P4 审查门默认随 `autoReview=true` 自动触发；显式 `/plugins/taskflow/review` 仍可用。
 - P7 人工验收门仍为显式触发（`/plugins/taskflow/human-decision`），不会在 `AWAITING_HUMAN` 后自动验收。
 - P5 并行执行默认 `maxConcurrent=1`，需通过插件配置调大；worktree 合并采用非快进合并，冲突会导致对应 Issue 失败。
 - 执行方为 DSH 会话或自动化 Executor 驱动；`automationEnabled=true` 时由自动推进协调器串联后台流程。
-- 客户端卡片只读；写入全部走宿主受控路由。
+- 客户端看板卡片可打开运行台；写入全部走宿主受控路由。

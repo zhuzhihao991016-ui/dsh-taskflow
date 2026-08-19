@@ -153,6 +153,7 @@ describe('P8.3 auto coordinator', () => {
     expect(executor.calls.map((call) => call.issue.key)).toEqual(['issue-001', 'issue-002'])
     expect(reviewer.calls).toBe(1)
     expect(service.snapshot(run.id)?.review).toMatchObject({ verdict: 'PASS' })
+    expect(service.runDetail(run.id)?.allowedActions).toEqual(expect.arrayContaining(['accept', 'rework', 'cancel']))
   })
 
   it('moves to WAITING_DECISION when maxReviewCycles is reached and allows resume', async () => {

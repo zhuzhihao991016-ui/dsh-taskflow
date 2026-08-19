@@ -106,7 +106,10 @@ export interface TaskFlowEvent {
   summary?: string
 }
 
-/** P8 run-detail response returned by the future `/run` endpoint. */
+/** P8 run-detail response returned by the `/run` endpoint. `allowedActions`
+ * contains both automation control actions and P7 human decisions
+ * (`accept`/`rework`) so the browser console can render the full
+ * intervention window from one source of truth. */
 export interface RunDetailResponse {
   runId: string
   status: RunStatus

@@ -1680,16 +1680,21 @@ export class TaskFlowService {
     this.notify()
   }
 
-  /** P8.1: allowed automation control actions for the current run state. */
+  /** P8.1/P8.5: allowed actions for the current run state (control actions
+   * plus P7 human decisions when the run is awaiting human acceptance). */
   private allowedActions(run: RunAggregate): string[] {
     if (isTerminal(run.status)) return []
-    const allowed = new Set<AutomationControlAction>()
+    const allowed = new Set<string>()
     switch (run.status) {
       case 'RECEIVED':
       case 'PLANNING':
       case 'READY':
       case 'INTEGRATION_REVIEW':
+        allowed.add('cancel')
+        break
       case 'AWAITING_HUMAN':
+        allowed.add('accept')
+        allowed.add('rework')
         allowed.add('cancel')
         break
       case 'WAITING_DECISION':
@@ -1714,7 +1719,7 @@ export class TaskFlowService {
         allowed.add('cancel')
         break
     }
-    return AUTOMATION_CONTROL_ACTIONS.filter((action) => allowed.has(action))
+    return Array.from(allowed)
   }
 
   private defaultControl(): RunControl {
