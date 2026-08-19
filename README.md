@@ -18,7 +18,7 @@ DSH 全自动任务工作流插件：任务提出后由 Codex CLI 规划拆分�
 - **P6**：Board/迁移——`/plugins/taskflow/board` 只读看板快照、纯函数 `buildBoard`、浏览器看板弹层（点击状态卡片打开，五列卡片随状态自动迁移）。
 - **P7**：人工验收门/收口——`/plugins/taskflow/human-decision` 支持 `accept|rework`；`accept` 进入 `ACCEPTED` 终态，`rework` 回到 `PLANNING` 并清空执行记录；补齐服务、路由与 HTTP 契约测试。
 
-当前版本 HEAD：`c3f5078`，测试套件 146 项（typecheck + vitest + build 通过）。
+当前版本 HEAD：`c3f5078`，测试套件 147 项（typecheck + vitest + build 通过）。
 
 后续阶段：在真实 DSH 环境中做一次端到端收口试运行。
 
