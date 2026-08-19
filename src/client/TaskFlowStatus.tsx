@@ -22,6 +22,9 @@ interface TaskFlowStateResponse {
     id: string
     status: string
     title: string
+    executions?: Array<{
+      status: string
+    }>
   }>
   error?: string
 }
@@ -311,7 +314,11 @@ export function TaskFlowStatus(_props: TaskFlowStatusProps): ReactElement {
     }
   }
 
-  const active = state?.ok === true ? (state.runs ?? []).filter((run) => run.status === 'RECEIVED' || run.status === 'PLANNING' || run.status === 'EXECUTING').length : undefined
+  const active = state?.ok === true ? (state.runs ?? []).filter((run) => {
+    if (run.status === 'PLANNING') return true
+    if (run.status !== 'EXECUTING') return false
+    return (run.executions ?? []).some((execution) => execution.status === 'running')
+  }).length : undefined
   const label = active === undefined
     ? 'taskflow · 不可用'
     : active > 0
@@ -325,6 +332,8 @@ export function TaskFlowStatus(_props: TaskFlowStatusProps): ReactElement {
         type="button"
         className={css.chip}
         data-testid="taskflow-chip"
+        aria-haspopup="dialog"
+        aria-expanded={open}
         title="DSH 任务工作流（P8.5：运行台）"
         onClick={() => setOpen((value) => !value)}
       >
@@ -369,6 +378,7 @@ export function TaskFlowStatus(_props: TaskFlowStatusProps): ReactElement {
                             key={`${card.runId}:${card.issueKey}`}
                             type="button"
                             className={css.card}
+                            data-status={card.status}
                             data-testid={`taskflow-card-${card.runId}:${card.issueKey}`}
                             onClick={() => openRun(card.runId)}
                           >
@@ -481,7 +491,7 @@ export function TaskFlowStatus(_props: TaskFlowStatusProps): ReactElement {
                         ) : (
                           <p className={css.empty}>无可执行操作</p>
                         )}
-                        {actionError !== null && <p className={css.actionError}>{actionError}</p>}
+                        {actionError !== null && <p className={css.actionError} role="alert">{actionError}</p>}
                       </section>
                       <section className={css.detailSection}>
                         <h4>最近事件</h4>

@@ -82,4 +82,85 @@ describe('TaskFlowStatus', () => {
       expect(screen.queryByText('任务流看板')).toBeNull()
     })
   })
+
+  it('does not count a RECEIVED run as running', async () => {
+    const fetchMock = vi.mocked(fetch)
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url === '/plugins/taskflow/state') {
+        return Promise.resolve(jsonResponse({
+          ok: true,
+          runs: [{ id: 'run-0001', status: 'RECEIVED', title: '任务' }],
+        }))
+      }
+      if (url === '/plugins/taskflow/board') {
+        return Promise.resolve(jsonResponse({ ok: true, columns: [] }))
+      }
+      return Promise.reject(new Error(`unexpected fetch ${url}`))
+    })
+
+    render(<TaskFlowStatus {...({} as TaskFlowStatusProps)} />)
+
+    await waitFor(() => {
+      expect(screen.queryByText('taskflow · 1 个运行中')).toBeNull()
+    })
+    expect(screen.getByText('taskflow')).toBeTruthy()
+  })
+
+  it('does not count an EXECUTING run without a running execution as running', async () => {
+    const fetchMock = vi.mocked(fetch)
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url === '/plugins/taskflow/state') {
+        return Promise.resolve(jsonResponse({
+          ok: true,
+          runs: [{
+            id: 'run-0001',
+            status: 'EXECUTING',
+            title: '任务',
+            executions: [{ status: 'done' }],
+          }],
+        }))
+      }
+      if (url === '/plugins/taskflow/board') {
+        return Promise.resolve(jsonResponse({ ok: true, columns: [] }))
+      }
+      return Promise.reject(new Error(`unexpected fetch ${url}`))
+    })
+
+    render(<TaskFlowStatus {...({} as TaskFlowStatusProps)} />)
+
+    await waitFor(() => {
+      expect(screen.queryByText('taskflow · 1 个运行中')).toBeNull()
+    })
+    expect(screen.getByText('taskflow')).toBeTruthy()
+  })
+
+  it('counts an EXECUTING run with a running execution as running', async () => {
+    const fetchMock = vi.mocked(fetch)
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url === '/plugins/taskflow/state') {
+        return Promise.resolve(jsonResponse({
+          ok: true,
+          runs: [{
+            id: 'run-0001',
+            status: 'EXECUTING',
+            title: '任务',
+            executions: [{ status: 'running' }],
+          }],
+        }))
+      }
+      if (url === '/plugins/taskflow/board') {
+        return Promise.resolve(jsonResponse({ ok: true, columns: [] }))
+      }
+      return Promise.reject(new Error(`unexpected fetch ${url}`))
+    })
+
+    render(<TaskFlowStatus {...({} as TaskFlowStatusProps)} />)
+
+    await waitFor(() => {
+      expect(screen.getByText('taskflow · 1 个运行中')).toBeTruthy()
+    })
+  })
 })
