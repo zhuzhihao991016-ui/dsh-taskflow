@@ -43,6 +43,11 @@ describe('P8.0 automation config contract', () => {
       requireExecutionPermission: true,
     })
   })
+
+  it('allows explicit opt-out from default automation', () => {
+    const parsed = Config({ automationEnabled: false })
+    expect(parsed.automationEnabled).toBe(false)
+  })
 })
 
 describe('P8.0 contract vocabulary', () => {
