@@ -13,9 +13,9 @@ import {
 import { Config } from '../src/index.ts'
 
 describe('P8.0 automation config contract', () => {
-  it('keeps automation disabled by default and preserves P7 agent-driven mode', () => {
+  it('enables automation by default and preserves P7 agent-driven fields', () => {
     const parsed = Config({})
-    expect(parsed.automationEnabled).toBe(false)
+    expect(parsed.automationEnabled).toBe(true)
     expect(parsed.autoPlan).toBe(true)
     expect(parsed.autoReview).toBe(true)
     expect(parsed.maxExecutorProcesses).toBe(DEFAULT_AUTOMATION_CONFIG.maxExecutorProcesses)
@@ -67,7 +67,7 @@ describe('P8.0 contract vocabulary', () => {
 
   it('default automation config satisfies the contract type', () => {
     const config: AutomationConfig = DEFAULT_AUTOMATION_CONFIG
-    expect(config.enabled).toBe(false)
+    expect(config.enabled).toBe(true)
     expect(config.maxExecutorProcesses).toBeGreaterThan(0)
     expect(config.maxReviewCycles).toBeGreaterThan(0)
   })

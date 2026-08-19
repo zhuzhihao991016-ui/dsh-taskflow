@@ -4,8 +4,8 @@
  *
  * These are the stable contracts that P8.1+ will implement against. They are
  * intentionally additive: existing P0-P7 manual/agent-driven paths remain
- * unchanged, and automation is disabled by default until the feature flag is
- * turned on.
+ * unchanged, and automation is enabled by default from P8.6; explicit `automationEnabled=false`
+ * restores manual/agent-driven mode.
  */
 
 import type { ExecutionInput, ExecutionResult } from './executor.ts'
@@ -140,9 +140,9 @@ export interface AutomationConfig {
   requireExecutionPermission: boolean
 }
 
-/** P8 default automation configuration (feature-flagged off until P8.6). */
+/** P8 default automation configuration; automation is on from P8.6 onward. */
 export const DEFAULT_AUTOMATION_CONFIG: AutomationConfig = {
-  enabled: false,
+  enabled: true,
   autoPlan: true,
   autoReview: true,
   maxExecutorProcesses: 2,
