@@ -4,7 +4,7 @@ DSH 全自动任务工作流插件：任务提出后由 Codex CLI 规划拆分�
 
 ## 状态
 
-**P8.5（当前）**：浏览器运行台与介入窗口——点击看板卡片打开运行详情抽屉（`/plugins/taskflow/run`），运行台通过 run-scoped SSE 实时刷新，并按 `allowedActions` 渲染暂停/继续/取消/接管/放行/重试及人工验收按钮，所有操作均带二次确认；同时保留 P8.4 的自动执行授权门。
+**P8.6（当前）**：P8 自动化默认开启与最终收尾——`automationEnabled` 默认从 `false` 转为 `true`，插件安装后即按全自动工作流运行；同时保留 P8.4 的自动执行授权门与 P8.5 浏览器运行台介入窗口。
 
 已完成：
 
@@ -17,16 +17,17 @@ DSH 全自动任务工作流插件：任务提出后由 Codex CLI 规划拆分�
 - **P5**：DAG/Worktree——按 DAG 并行执行（`maxConcurrent` 配置，默认 1 保持串行兼容）；每个 Issue 在独立 Git worktree 中执行，成功后自动提交 worktree 内未提交改动、经专用 integration worktree 串行合并到集成分支 `taskflow/integration`，再清理 worktree/分支；执行/快照暴露 `workDir`、`branch` 与 `baseSha`。
 - **P6**：Board/迁移——`/plugins/taskflow/board` 只读看板快照、纯函数 `buildBoard`、浏览器看板弹层（点击状态卡片打开，五列卡片随状态自动迁移）。
 - **P7**：人工验收门/收口——`/plugins/taskflow/human-decision` 支持 `accept|rework`；`accept` 进入 `ACCEPTED` 终态，`rework` 回到 `PLANNING` 并清空执行记录；补齐服务、路由与 HTTP 契约测试。
-- **P8.0**：契约冻结——新增 `src/contracts.ts` 定义 Executor v2、控制动作、事件/详情/配置契约；`Config` 增加自动化配置项并默认关闭；补充契约测试。
+- **P8.0**：契约冻结——新增 `src/contracts.ts` 定义 Executor v2、控制动作、事件/详情/配置契约；`Config` 增加自动化配置项（当时默认关闭，P8.6 起默认开启）；补充契约测试。
 - **P8.1**：持久控制元数据与 Run 级 Git 隔离——`RunAggregate` 增加 `control`/`runGit`/`events` 与 Issue 进度元数据；服务提供 `runDetail`、`recordProgress`、pause/resume/takeover/release/retry；每次执行持久化运行级集成分支 `taskflow/integration/<runId>` 并在 rework 时清理。
 - **P8.2**：内置 Codex Issue Executor——新增 `src/issue-executor.ts`，以 `gpt-5.6-sol`、`workspace-write`、`--ask-for-approval never` 和严格输出 Schema 驱动 `codex exec` 实现单个 Issue；服务将 attemptId、进度事件与自动化结果接入执行循环。
 - **P8.3**：自动推进协调器——`automationEnabled` 开启时自动规划（`autoPlan`）、自动执行、自动审查（`autoReview`）、SSE 事件流（`/plugins/taskflow/events`）与人工介入窗口（`WAITING_DECISION`/`WAITING_PERMISSION`、`maxReviewCycles`）。
 - **P8.4**：自动执行授权门——新增 `requireExecutionPermission` 配置；开启后自动规划完成进入 `WAITING_PERMISSION`，人工 `release` 后才自动执行，`READY → WAITING_PERMISSION → EXECUTING` 状态迁移落地。
 - **P8.5**：浏览器运行台与介入窗口——详情抽屉、run-scoped 实时 SSE、按 `allowedActions` 渲染操作按钮、二次确认；`allowedActions` 在 `AWAITING_HUMAN` 下补充 `accept`/`rework` 供浏览器直接完成人工验收。
+- **P8.6**：P8 自动化默认开启——`DEFAULT_AUTOMATION_CONFIG.enabled` 与插件 `Config.automationEnabled` 默认改为 `true`，更新模型通告、契约测试与文档，完成 P8 自动化 feature flag 转正。
 
-当前版本 HEAD：`97cf8b9`，测试套件 211 项（typecheck + vitest + build 通过）。
+当前版本 HEAD：`bf21aa8`，测试套件 211 项（typecheck + vitest + build 通过）。
 
-后续阶段：P8.6 及以后待定。
+后续阶段：P8.7 及以后待定。
 
 ## HTTP 路由
 
@@ -79,7 +80,7 @@ dsh plugin --profile web add <本仓库路径>
 
 ### What the model sees
 
-当前注入一段 `plugin:taskflow` 通告（order 200），声明插件存在、能力、HTTP 路由与当前 P8.5 阶段能力，模型可据此配合提交、规划、并行执行、结果上报、触发审查、人工验收、查看看板/运行详情/SSE 事件流，并在浏览器运行台中按 `allowedActions` 执行带二次确认的介入操作；自动化开启时自动推进规划、执行与审查，并可通过 `requireExecutionPermission` 保留执行前人工授权窗口。
+当前注入一段 `plugin:taskflow` 通告（order 200），声明插件存在、能力、HTTP 路由与当前 P8.6 阶段能力，模型可据此配合提交、规划、并行执行、结果上报、触发审查、人工验收、查看看板/运行详情/SSE 事件流，并在浏览器运行台中按 `allowedActions` 执行带二次确认的介入操作；P8.6 起自动化默认开启，自动推进规划、执行与审查，并可通过 `requireExecutionPermission` 保留执行前人工授权窗口。
 
 ### Token effect
 
@@ -87,7 +88,7 @@ dsh plugin --profile web add <本仓库路径>
 
 ## Known Limitations and Deferred Work
 
-- P8 自动化默认关闭（`automationEnabled=false`）；开启后自动推进协调器、SSE 与人工介入窗口已实现。
+- P8.6 起自动化默认开启（`automationEnabled=true`）；如需完全手动模式，可在插件配置显式设置 `automationEnabled=false`。开启后自动推进协调器、SSE 与人工介入窗口已实现。
 - P8.4 自动执行授权门默认关闭（`requireExecutionPermission=false`）；开启后自动执行会停在 `WAITING_PERMISSION`，需要人工 `release` 释放。
 - P8.5 浏览器运行台已实现；所有写入（命令/人工验收）仍走宿主受控路由并带二次确认。
 - P4 审查门默认随 `autoReview=true` 自动触发；显式 `/plugins/taskflow/review` 仍可用。
