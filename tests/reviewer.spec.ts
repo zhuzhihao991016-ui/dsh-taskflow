@@ -160,7 +160,13 @@ describe('CodexReviewer', () => {
     executor.results = [{ exitCode: 0, stdout: agentMessageEvent(REVIEW_JSON), stderr: '', timedOut: false }]
     const reviewer = new CodexReviewer(executor, 60_000)
 
-    await reviewer.review({ ...INPUT, baseSha: 'abc123', workDir: join(root, 's') })
+    await reviewer.review({
+      ...INPUT,
+      baseSha: 'abc123',
+      integrationBranch: 'taskflow/integration',
+      integrationHeadSha: 'def456',
+      workDir: join(root, 's'),
+    })
 
     expect(executor.requests).toHaveLength(1)
     const request = executor.requests[0]
@@ -169,6 +175,8 @@ describe('CodexReviewer', () => {
     expect(request.command).toContain('--output-schema')
     expect(request.command).not.toContain('--uncommitted')
     expect(request.stdinText).toContain('abc123')
+    expect(request.stdinText).toContain('def456')
+    expect(request.stdinText).toContain('taskflow/integration')
     expect(request.cwd).toBe(resolve(INPUT.repoRoot))
   })
 

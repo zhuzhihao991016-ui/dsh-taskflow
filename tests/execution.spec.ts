@@ -287,6 +287,27 @@ describe('TaskFlowService.reportResult', () => {
     expect(run.executions.find((e) => e.key === 'issue-001')?.error).toBe('没做出来')
     expect(run.transitions.at(-1)?.reason).toContain('execution-failed: issue-001')
   })
+
+  it('clears the merge-in-progress marker after a successful report', async () => {
+    const { repository, service } = harness()
+    seedReady(repository, [issueA])
+    await service.startExecution('run-0001')
+    const report = await service.reportResult('run-0001', 'issue-001', { ok: true, summary: '完成 A' })
+    expect(report).toEqual({ ok: true })
+    const run = repository.getRun('run-0001') as RunAggregate
+    expect(run.merging).toBe(false)
+    expect(run.status).toBe('INTEGRATION_REVIEW')
+  })
+
+  it('rejects cancel while a merge is in progress', async () => {
+    const { repository, service } = harness()
+    seedReady(repository, [issueA])
+    await service.startExecution('run-0001')
+    await repository.updateRun('run-0001', (current) => ({ ...current, merging: true }))
+    const result = await service.command('run-0001', 'cancel')
+    expect(result).toMatchObject({ ok: false, error: expect.stringContaining('merge is in progress') })
+    expect((repository.getRun('run-0001') as RunAggregate).status).toBe('EXECUTING')
+  })
 })
 
 describe('TaskFlowService.resumeExecution', () => {

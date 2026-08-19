@@ -47,6 +47,8 @@ export interface RunAggregate {
   /** P5: base commit SHA captured when execution starts; used by the reviewer
    * to inspect the integration-branch diff instead of uncommitted changes. */
   baseSha?: string
+  /** P5: true while a success report is committing/merging Git side effects. */
+  merging?: boolean
   /** Append-only; `transitions[transitions.length - 1].to` equals `status`. */
   transitions: RunTransition[]
 }
@@ -128,6 +130,7 @@ const runAggregateSchema = z.object({
   executions: z.array(issueExecutionSchema).default([]),
   review: reviewSchema.optional(),
   baseSha: z.string().optional(),
+  merging: z.boolean().optional(),
   transitions: z.array(transitionSchema),
 }).superRefine((run, ctx) => {
   // Aggregate history consistency: this runs at every domain open (the

@@ -56,6 +56,10 @@ export interface ReviewInput {
    * inspects the integration-branch diff against this SHA instead of
    * uncommitted changes. */
   baseSha?: string
+  /** P5: persistent integration branch that successful issue worktrees merge into. */
+  integrationBranch?: string
+  /** P5: immutable head SHA of the integration branch at review time. */
+  integrationHeadSha?: string
 }
 
 /** Review outcome: PASS (human acceptance) or REVISE (rework selected issues). */
@@ -102,9 +106,11 @@ export function buildReviewPrompt(input: ReviewInput): string {
     executionLines === '' ? '（无）' : executionLines,
     '',
     '## 审查要求',
-    input.baseSha !== undefined
-      ? `- 只读审查当前仓库相对基准 ${input.baseSha} 的改动（含已合并到集成分支的提交），不得修改任何文件`
-      : '- 只读审查当前仓库的未提交改动（uncommitted changes），不得修改任何文件',
+    input.baseSha !== undefined && input.integrationHeadSha !== undefined
+      ? `- 只读审查当前仓库相对基准 ${input.baseSha} 到集成分支 ${input.integrationBranch ?? 'taskflow/integration'} 头 ${input.integrationHeadSha} 的改动（含已合并到集成分支的提交），用 git diff/range 审查该区间，不得修改任何文件`
+      : input.baseSha !== undefined
+        ? `- 只读审查当前仓库相对基准 ${input.baseSha} 的改动（含已合并到集成分支的提交），不得修改任何文件`
+        : '- 只读审查当前仓库的未提交改动（uncommitted changes），不得修改任何文件',
     '- 判断全部 Issue 是否满足验收标准、整体是否可进入人工验收',
     '- 输出必须符合 --output-schema 给定的 JSON Schema，只输出 JSON',
     '- `verdict` 为 PASS 表示通过；REVISE 表示需要打回返工',

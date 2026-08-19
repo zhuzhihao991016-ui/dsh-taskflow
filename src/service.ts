@@ -346,6 +346,9 @@ export class TaskFlowService {
     }
     try {
       await this.repository.updateRun(runId, (current) => {
+        if (current.merging === true) {
+          throw new Error('taskflow: cannot cancel while a merge is in progress')
+        }
         assertTransition(current.status, 'CANCELLED')
         const seq = current.transitions.length
         const transition: RunTransition = {
@@ -739,6 +742,29 @@ export class TaskFlowService {
     const branch = running.branch
     let effectiveResult = result
     if (result.ok && repoRoot !== undefined && workDir !== undefined && branch !== undefined) {
+      // Persist a merge-in-progress marker before touching Git so a concurrent
+      // cancel cannot interleave between the Git side effects and the ledger
+      // update. The marker is cleared in the final report update below.
+      try {
+        await this.repository.updateRun(runId, (current) => {
+          const currentRunning = current.executions?.find((execution) => execution.status === 'running' && execution.key === issueKey)
+          if (current.status !== 'EXECUTING' || currentRunning === undefined) {
+            throw new Error(`taskflow: issue '${issueKey}' is not currently running`)
+          }
+          if (current.merging === true) {
+            throw new Error('taskflow: merge already in progress')
+          }
+          const next: RunAggregate = { ...current, merging: true, updatedAt: this.now() }
+          runAggregateSchema.parse(next)
+          return next
+        })
+      } catch (error) {
+        const message = (error as Error).message
+        if (message.startsWith('taskflow:')) {
+          return { ok: false, error: message }
+        }
+        throw error
+      }
       try {
         // Ensure uncommitted worktree edits are on the issue branch before the
         // integration merge; otherwise merge would be a no-op and cleanup would
@@ -752,6 +778,13 @@ export class TaskFlowService {
         ))
       } catch (error) {
         effectiveResult = { ok: false, error: `worktree merge failed: ${(error as Error).message}` }
+        // Best-effort clear the marker so a transient merge failure can retry.
+        await this.repository.updateRun(runId, (current) => {
+          if (current.merging !== true) return current
+          const next: RunAggregate = { ...current, merging: false, updatedAt: this.now() }
+          runAggregateSchema.parse(next)
+          return next
+        }).catch(() => undefined)
       }
     }
     try {
@@ -789,6 +822,7 @@ export class TaskFlowService {
           assertTransition(current.status, 'FAILED')
           return this.withTransition(current, 'FAILED', `execution-failed: ${issueKey}: ${effectiveResult.error}`, `exec:fail:${runId}`, {
             executions: executionsNext,
+            merging: false,
           })
         }
         const doneKeys = new Set(executionsNext.filter((execution) => execution.status === 'done').map((execution) => execution.key))
@@ -797,10 +831,12 @@ export class TaskFlowService {
           assertTransition(current.status, 'INTEGRATION_REVIEW')
           return this.withTransition(current, 'INTEGRATION_REVIEW', 'execution-completed', `exec:done:${runId}`, {
             executions: executionsNext,
+            merging: false,
           })
         }
         const next: RunAggregate = {
           ...current,
+          merging: false,
           updatedAt: now,
           executions: executionsNext,
         }
@@ -991,9 +1027,10 @@ export class TaskFlowService {
   /** Reset a crash-stuck `running` issue back to pending (host-start resume). */
   private async resetStuckExecutions(runId: string): Promise<void> {
     await this.repository.updateRun(runId, (current) => {
-      if ((current.executions ?? []).every((execution) => execution.status !== 'running')) return current
+      if ((current.executions ?? []).every((execution) => execution.status !== 'running') && current.merging !== true) return current
       const next: RunAggregate = {
         ...current,
+        merging: false,
         updatedAt: this.now(),
         executions: (current.executions ?? []).map((execution) => (
           execution.status === 'running' ? { ...execution, status: 'pending' as const } : execution
@@ -1047,6 +1084,9 @@ export class TaskFlowService {
         await this.transitionTo(runId, 'FAILED', 'review-failed: run has no repoRoot', `review:fail:${runId}`)
         return
       }
+      const integrationHeadSha = run.baseSha === undefined
+        ? undefined
+        : await this.worktrees.getBranchHeadSha(run.repoRoot, this.integrationBranch)
       const raw = await this.reviewer.review({
         runId,
         title: run.title,
@@ -1056,6 +1096,8 @@ export class TaskFlowService {
         executions: run.executions ?? [],
         workDir: join(defaultPlanRoot(), runId),
         baseSha: run.baseSha,
+        integrationBranch: this.integrationBranch,
+        integrationHeadSha,
       })
       const result = this.normalizeReviewResult(run, raw)
       if (result.verdict === 'PASS') {
@@ -1249,7 +1291,7 @@ export class TaskFlowService {
     to: RunStatus,
     reason: string,
     idempotencyKey: string,
-    patch: Partial<Pick<RunAggregate, 'issueCount' | 'issues' | 'executions' | 'review' | 'baseSha'>> = {},
+    patch: Partial<Pick<RunAggregate, 'issueCount' | 'issues' | 'executions' | 'review' | 'baseSha' | 'merging'>> = {},
   ): RunAggregate {
     const seq = current.transitions.length
     const transition: RunTransition = {

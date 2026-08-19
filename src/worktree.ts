@@ -89,10 +89,28 @@ export class WorktreeManager {
     const branch = `taskflow/${runId}/${issueKey}`
     const workDir = join(resolve(repoRoot), this.worktreesRoot, runId, issueKey)
     const add = await this.git.run(['worktree', 'add', '-b', branch, workDir, integrationBranch], repoRoot)
-    if (add.exitCode !== 0) {
-      throw new WorktreeError(`create worktree for ${issueKey} failed: ${add.stderr.trim()}`)
+    if (add.exitCode === 0) return { workDir, branch }
+    // Crash recovery: a previous attempt may have created the branch or the
+    // worktree before the execution record was updated. Reuse a matching
+    // existing worktree instead of failing the run.
+    const attach = await this.git.run(['worktree', 'add', workDir, branch], repoRoot)
+    if (attach.exitCode === 0) return { workDir, branch }
+    const check = await this.git.run(['rev-parse', '--abbrev-ref', 'HEAD'], workDir)
+    if (check.exitCode === 0 && check.stdout.trim() === branch) return { workDir, branch }
+    throw new WorktreeError(`create worktree for ${issueKey} failed: ${add.stderr.trim()}`)
+  }
+
+  /** Resolve a branch's current head SHA (used to pin review to integration). */
+  async getBranchHeadSha(repoRoot: string, branch: string): Promise<string> {
+    const result = await this.git.run(['rev-parse', '--verify', `refs/heads/${branch}`], repoRoot)
+    if (result.exitCode !== 0) {
+      throw new WorktreeError(`resolve branch head '${branch}' failed: ${result.stderr.trim()}`)
     }
-    return { workDir, branch }
+    const sha = result.stdout.trim()
+    if (sha === '') {
+      throw new WorktreeError(`resolve branch head '${branch}' returned an empty SHA`)
+    }
+    return sha
   }
 
   /** Resolve the repository's current HEAD SHA (used as the review base). */

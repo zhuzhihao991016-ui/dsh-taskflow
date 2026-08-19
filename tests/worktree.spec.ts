@@ -65,6 +65,41 @@ describe('WorktreeManager', () => {
     ])
   })
 
+  it('reuses an existing worktree after a crashed create', async () => {
+    const git = new FakeGit()
+    const branch = 'taskflow/run-0001/issue-001'
+    const workDir = join(resolve(REPO), '.taskflow', 'worktrees', 'run-0001', 'issue-001')
+    git.resultFor = (args) => {
+      if (args[0] === 'worktree' && args[1] === 'add' && args.includes('-b')) {
+        return { exitCode: 1, stdout: '', stderr: 'branch already exists' }
+      }
+      if (args[0] === 'worktree' && args[1] === 'add' && !args.includes('-b')) {
+        return { exitCode: 1, stdout: '', stderr: 'worktree already exists' }
+      }
+      if (args[0] === 'rev-parse' && args[1] === '--abbrev-ref') {
+        return { exitCode: 0, stdout: `${branch}\n`, stderr: '' }
+      }
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+    const manager = new WorktreeManager(git, '.taskflow/worktrees')
+
+    const result = await manager.createIssueWorktree(REPO, 'run-0001', 'issue-001', 'taskflow/integration')
+
+    expect(result).toEqual({ workDir, branch })
+    expect(git.calls).toContainEqual(['worktree', 'add', '-b', branch, workDir, 'taskflow/integration'])
+    expect(git.calls).toContainEqual(['worktree', 'add', workDir, branch])
+    expect(git.calls).toContainEqual(['rev-parse', '--abbrev-ref', 'HEAD'])
+  })
+
+  it('resolves a branch head SHA', async () => {
+    const git = new FakeGit()
+    git.resultFor = () => ({ exitCode: 0, stdout: 'abc123\n', stderr: '' })
+    const manager = new WorktreeManager(git, '.taskflow/worktrees')
+
+    await expect(manager.getBranchHeadSha(REPO, 'taskflow/integration')).resolves.toBe('abc123')
+    expect(git.calls).toEqual([['rev-parse', '--verify', 'refs/heads/taskflow/integration']])
+  })
+
   it('merges an issue branch in a dedicated integration worktree', async () => {
     const git = new FakeGit()
     const manager = new WorktreeManager(git, '.taskflow/worktrees')
