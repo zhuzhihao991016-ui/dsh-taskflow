@@ -4,9 +4,11 @@
  * a fake Git runner.
  */
 
-import { describe, expect, it } from 'vitest'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { WorktreeError, WorktreeManager, type GitResult, type GitRunner } from '../src/worktree.ts'
+import { describe, expect, it } from 'vitest'
+import { execGit, WorktreeError, WorktreeManager, type GitResult, type GitRunner } from '../src/worktree.ts'
 
 /** Scriptable fake git runner recording every command. */
 class FakeGit implements GitRunner {
@@ -71,7 +73,7 @@ describe('WorktreeManager', () => {
 
     const integrationWorktree = join(resolve(REPO), '.taskflow', 'worktrees', '_integration', 'taskflow-run-0001-issue-001')
     expect(git.calls).toContainEqual([
-      'worktree', 'add', '--detach', integrationWorktree, 'taskflow/integration',
+      'worktree', 'add', integrationWorktree, 'taskflow/integration',
     ])
     expect(git.calls).toContainEqual([
       'merge', '--no-ff', 'taskflow/run-0001/issue-001', '-m', 'taskflow run-0001 issue-001',
@@ -136,5 +138,43 @@ describe('WorktreeManager', () => {
       ['worktree', 'remove', '--force', 'C:/worktree'],
       ['branch', '-D', 'taskflow/run-0001/issue-001'],
     ])
+  })
+
+  it('real git merge advances the integration branch', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'taskflow-wt-'))
+    try {
+      const git = execGit
+      const setup = [
+        ['init'],
+        ['config', 'user.email', 'test@example.com'],
+        ['config', 'user.name', 'test'],
+      ]
+      for (const args of setup) {
+        const result = await git.run(args, root)
+        expect(result.exitCode).toBe(0)
+      }
+      await writeFile(join(root, 'base.txt'), 'base\n', 'utf8')
+      expect((await git.run(['add', 'base.txt'], root)).exitCode).toBe(0)
+      expect((await git.run(['commit', '-m', 'base'], root)).exitCode).toBe(0)
+
+      const manager = new WorktreeManager(git, '.taskflow/worktrees')
+      await manager.ensureIntegrationBranch(root, 'taskflow/integration')
+      const created = await manager.createIssueWorktree(root, 'run-0001', 'issue-001', 'taskflow/integration')
+      await writeFile(join(created.workDir, 'feature.txt'), 'feature\n', 'utf8')
+      await manager.commitWorktreeEdits(created.workDir, 'taskflow run-0001 issue-001')
+
+      const before = await git.run(['rev-parse', 'taskflow/integration'], root)
+      expect(before.exitCode).toBe(0)
+      await manager.mergeIssueWorktree(root, created.branch, 'taskflow run-0001 issue-001', 'taskflow/integration')
+      const after = await git.run(['rev-parse', 'taskflow/integration'], root)
+      expect(after.exitCode).toBe(0)
+      expect(after.stdout.trim()).not.toBe(before.stdout.trim())
+
+      await manager.removeIssueWorktree(root, created.workDir, created.branch)
+      const log = await git.run(['log', '--oneline', 'taskflow/integration'], root)
+      expect(log.stdout).toContain('taskflow run-0001 issue-001')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 })

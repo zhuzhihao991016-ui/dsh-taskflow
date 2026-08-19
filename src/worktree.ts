@@ -11,6 +11,9 @@ import { join, resolve } from 'node:path'
 
 const execFileAsync = promisify(execFile)
 
+/** Upper bound for a single Git subprocess (worktree/merge/cleanup operations). */
+const GIT_TIMEOUT_MS = 60_000
+
 /** One spawned git process result. */
 export interface GitResult {
   exitCode: number
@@ -32,6 +35,8 @@ export const execGit: GitRunner = {
         encoding: 'utf8',
         maxBuffer: 16 * 1024 * 1024,
         windowsHide: true,
+        timeout: GIT_TIMEOUT_MS,
+        killSignal: 'SIGKILL',
       })
       return { exitCode: 0, stdout, stderr }
     } catch (error) {
@@ -136,11 +141,11 @@ export class WorktreeManager {
       '_integration',
       branch.replace(/[^A-Za-z0-9._-]/g, '-'),
     )
-    const add = await this.git.run(['worktree', 'add', '--detach', integrationWorktree, integrationBranch], repoRoot)
+    const add = await this.git.run(['worktree', 'add', integrationWorktree, integrationBranch], repoRoot)
     if (add.exitCode !== 0) {
       // A previous failed merge may have left the path; force-remove and retry once.
       await this.git.run(['worktree', 'remove', '--force', integrationWorktree], repoRoot).catch(() => undefined)
-      const retry = await this.git.run(['worktree', 'add', '--detach', integrationWorktree, integrationBranch], repoRoot)
+      const retry = await this.git.run(['worktree', 'add', integrationWorktree, integrationBranch], repoRoot)
       if (retry.exitCode !== 0) {
         throw new WorktreeError(`create integration worktree failed: ${retry.stderr.trim()}`)
       }

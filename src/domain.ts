@@ -10,7 +10,7 @@ import { z } from 'zod'
 import { defineDomain, domainTable } from '@deepseek-ai/dsh-storage-domain'
 import { ISSUE_KEY_PATTERN } from './dag.ts'
 import type { PlannedIssue } from './dag.ts'
-import { RUN_STATUSES, type RunStatus } from './state.ts'
+import { RUN_STATUSES, canTransition, type RunStatus } from './state.ts'
 
 /** One recorded transition inside a run aggregate. */
 export interface RunTransition {
@@ -148,6 +148,9 @@ const runAggregateSchema = z.object({
     }
     if (transitions[i].from !== transitions[i - 1].to) {
       ctx.addIssue({ code: 'custom', message: `transition chain must be continuous at index ${i}` })
+    }
+    if (!canTransition(transitions[i].from, transitions[i].to)) {
+      ctx.addIssue({ code: 'custom', message: `illegal transition ${transitions[i].from} → ${transitions[i].to} at index ${i}` })
     }
   }
   const last = transitions[transitions.length - 1]

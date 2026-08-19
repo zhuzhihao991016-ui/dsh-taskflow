@@ -16,6 +16,7 @@ import * as StorageJson from '@deepseek-ai/dsh-storage-json'
 import * as StorageDomain from '@deepseek-ai/dsh-storage-domain'
 import { TASKFLOW_DOMAIN } from '../src/domain.ts'
 import { DomainRepository } from '../src/repository.ts'
+import { TaskFlowService } from '../src/service.ts'
 
 const roots: string[] = []
 
@@ -113,6 +114,21 @@ describe('DomainRepository', () => {
     await unmount(second.ctx, second.domain)
   })
 
+  it('service submit with an explicit key returns the same run after storage restart', async () => {
+    const root = await freshRoot()
+    const first = await mount(root)
+    const firstService = new TaskFlowService(first.repository, () => 1000)
+    await firstService.submit({ title: '重启幂等', idempotencyKey: 'persist-key' })
+    await unmount(first.ctx, first.domain)
+
+    const second = await mount(root)
+    const secondService = new TaskFlowService(second.repository, () => 1000)
+    const retry = await secondService.submit({ title: '重启幂等', idempotencyKey: 'persist-key' })
+    expect(retry.id).toBe('run-0001')
+    expect(second.repository.listRuns()).toHaveLength(1)
+    await unmount(second.ctx, second.domain)
+  })
+
   it('fails closed on a malformed medium file', async () => {
     const root = await freshRoot()
     const first = await mount(root)
@@ -187,6 +203,42 @@ describe('DomainRepository', () => {
         unit: { name: 'taskflow', version: 1 },
         global: null,
         tables: { runs: { 'run-0001': inconsistent } },
+      }),
+      'utf8',
+    )
+    const ctx = new Context()
+    await ctx.plugin(Storage)
+    await ctx.plugin(StorageJson, { root })
+    await ctx.plugin(StorageDomain, { backend: 'json' })
+    await expect(ctx.storageDomain.open(TASKFLOW_DOMAIN)).rejects.toMatchObject({
+      code: 'invalid-record',
+    })
+    await ctx.fiber.dispose()
+  })
+
+  it('fails closed on an illegal but continuous transition chain', async () => {
+    const root = await freshRoot()
+    const illegal = {
+      ...sampleAggregate('run-0001'),
+      status: 'ACCEPTED' as const,
+      transitions: [
+        ...sampleAggregate('run-0001').transitions,
+        {
+          seq: 1, from: 'RECEIVED' as const, to: 'PLANNING' as const,
+          reason: 'planning-started', actor: 'host', idempotencyKey: 'plan:start:abc', at: 2,
+        },
+        {
+          seq: 2, from: 'PLANNING' as const, to: 'ACCEPTED' as const,
+          reason: 'illegal', actor: 'host', idempotencyKey: 'bad:1', at: 3,
+        },
+      ],
+    }
+    await writeFile(
+      join(root, 'taskflow.json'),
+      JSON.stringify({
+        unit: { name: 'taskflow', version: 1 },
+        global: null,
+        tables: { runs: { 'run-0001': illegal } },
       }),
       'utf8',
     )

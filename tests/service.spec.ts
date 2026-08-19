@@ -142,6 +142,27 @@ describe('TaskFlowService', () => {
     expect(service.list()).toHaveLength(4)
   })
 
+  it('does not notify or append a transition when an explicit idempotency key repeats', async () => {
+    const { repository, service } = harness()
+    let notifications = 0
+    service.subscribe(() => { notifications += 1 })
+    const first = await service.submit({ title: '任务', idempotencyKey: 'req-noop' })
+    const second = await service.submit({ title: '任务', idempotencyKey: 'req-noop' })
+    expect(second.id).toBe(first.id)
+    expect(notifications).toBe(1)
+    expect((repository.getRun(first.id) as RunAggregate).transitions).toHaveLength(1)
+  })
+
+  it('serializes concurrent same-key submits to the same run', async () => {
+    const { repository, service } = harness()
+    const results = await Promise.all(
+      Array.from({ length: 5 }, () => service.submit({ title: '同 key', idempotencyKey: 'same-key' })),
+    )
+    expect(new Set(results.map((run) => run.id)).size).toBe(1)
+    expect(service.list()).toHaveLength(1)
+    expect((repository.getRun(results[0]!.id) as RunAggregate).transitions).toHaveLength(1)
+  })
+
   it('rejects a non-string idempotency key before persisting anything', async () => {
     const { service } = harness()
     expect(() => service.submit({ title: '任务', idempotencyKey: 123 as never })).toThrow(
@@ -445,6 +466,33 @@ describe('TaskFlowService.plan', () => {
     expect(results.every((result) => result.ok)).toBe(true)
     expect(planner.calls).toBe(1)
     expect(service.snapshot('run-0001')?.status).toBe('READY')
+  })
+
+  it('does not let a late planner completion rewrite a cancelled run', async () => {
+    const { repository, service, planner } = harness()
+    planner.delayMs = 30
+    planner.result = PLAN
+    const run = await service.submit({ title: '迟到规划', repoRoot: 'C:/repo' })
+    await service.plan(run.id)
+    await service.command(run.id, 'cancel')
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 60))
+    expect(repository.getRun(run.id)?.status).toBe('CANCELLED')
+    expect(planner.calls).toBe(1)
+    expect(repository.getRun(run.id)?.transitions.at(-1)?.to).toBe('CANCELLED')
+  })
+
+  it('runs the planner once when the planner body fails under concurrency', async () => {
+    const { repository, service, planner } = harness()
+    planner.delayMs = 20
+    planner.error = new PlannerError('process-failed', 'boom')
+    const run = await service.submit({ title: '并发失败', repoRoot: 'C:/repo' })
+    const results = await Promise.all([
+      service.plan(run.id, { wait: true }),
+      service.plan(run.id, { wait: true }),
+    ])
+    expect(planner.calls).toBe(1)
+    expect(results.every((result) => result.ok)).toBe(true)
+    expect(repository.getRun(run.id)?.status).toBe('FAILED')
   })
 
   it('propagates a failed PLANNING transition to overlapping plan calls', async () => {
