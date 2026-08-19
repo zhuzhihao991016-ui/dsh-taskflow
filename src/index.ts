@@ -16,7 +16,7 @@ import type {} from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-storage-domain'
 import { TASKFLOW_DOMAIN } from './domain.ts'
-import { AUTOMATION_CONTROL_ACTIONS, DEFAULT_AUTOMATION_CONFIG, EXECUTOR_PHASES } from './contracts.ts'
+import { AUTOMATION_CONTROL_ACTIONS, DEFAULT_AUTOMATION_CONFIG, EXECUTOR_PHASES, type TaskFlowEvent } from './contracts.ts'
 import type { ExecutionResult } from './executor.ts'
 import { CodexIssueExecutor } from './issue-executor.ts'
 import { CodexPlanner } from './planner.ts'
@@ -33,7 +33,7 @@ const SECTION_ORDER = 200
 export const inject = ['systemPrompt', 'storageDomain']
 
 /** Model-facing announcement: plugin presence, capabilities, and limits. */
-export const TASKFLOW_GUIDANCE = '本机已安装 dsh-taskflow 插件（DSH 全自动任务工作流编排）：任务提出后由 Codex CLI 规划拆分为 Issue 并发布看板，DSH 认领执行（串行/并行 + Git worktree 隔离），Codex 只读审查决定打回或通过，按依赖序推进，最终人工验收。当前为 P8.2 阶段：运行台账已持久化，Codex 规划引擎已接入（提交时带 repoRoot 后经 /plugins/taskflow/plan 触发规划，规划通过后运行进入 READY 并携带 Issue 清单）；执行引擎已启用（经 /plugins/taskflow/execute 启动执行，READY → EXECUTING，按 DAG 依赖每次认领最多 maxConcurrent 个可调度 Issue，响应含 currentIssues；每个 Issue 在独立 Git worktree 中执行，workDir/branch 可从 state/execute 响应读取；完成 currentIssue 后经 /plugins/taskflow/exec-result 上报 { runId, issueKey, ok, summary|error }，成功后自动合并到集成分支，全部完成后运行自动进入 INTEGRATION_REVIEW）；P4 审查门已启用（经 /plugins/taskflow/review 触发 Codex 只读审查，PASS 进入 AWAITING_HUMAN 等待人工验收，REVISE 打回 EXECUTING 并重置返工 Issue）；P6 看板已启用（GET /plugins/taskflow/board 返回五列看板快照，浏览器端状态卡片可打开看板）；P7 人工验收门已启用（POST /plugins/taskflow/human-decision 提交 { runId, decision: accept|rework }，accept 进入 ACCEPTED 终态，rework 回到 PLANNING 重新规划）；P8 自动化契约已冻结但默认关闭（automationEnabled=false）；P8.1 已持久化控制元数据、进度事件与运行级 Git 隔离，并提供 GET /plugins/taskflow/run 详情投影与 pause/resume/takeover/release/retry 控制动作；P8.2 已内置 Codex Issue Executor（自动化开启时在独立 worktree 中以 workspace-write 非交互实现 Issue）。用户提到「工作流 / 任务流 / taskflow」时即指本插件，请据此协作。'
+export const TASKFLOW_GUIDANCE = '本机已安装 dsh-taskflow 插件（DSH 全自动任务工作流编排）：任务提出后由 Codex CLI 规划拆分为 Issue 并发布看板，DSH 认领执行（串行/并行 + Git worktree 隔离），Codex 只读审查决定打回或通过，按依赖序推进，最终人工验收。当前为 P8.3 阶段：运行台账已持久化，Codex 规划引擎已接入（提交时带 repoRoot 后经 /plugins/taskflow/plan 触发规划，规划通过后运行进入 READY 并携带 Issue 清单）；执行引擎已启用（经 /plugins/taskflow/execute 启动执行，READY → EXECUTING，按 DAG 依赖每次认领最多 maxConcurrent 个可调度 Issue，响应含 currentIssues；每个 Issue 在独立 Git worktree 中执行，workDir/branch 可从 state/execute 响应读取；完成 currentIssue 后经 /plugins/taskflow/exec-result 上报 { runId, issueKey, ok, summary|error }，成功后自动合并到集成分支，全部完成后运行自动进入 INTEGRATION_REVIEW）；P4 审查门已启用（经 /plugins/taskflow/review 触发 Codex 只读审查，PASS 进入 AWAITING_HUMAN 等待人工验收，REVISE 打回 EXECUTING 并重置返工 Issue）；P6 看板已启用（GET /plugins/taskflow/board 返回五列看板快照，浏览器端状态卡片可打开看板）；P7 人工验收门已启用（POST /plugins/taskflow/human-decision 提交 { runId, decision: accept|rework }，accept 进入 ACCEPTED 终态，rework 回到 PLANNING 重新规划）；P8 自动化契约已冻结但默认关闭（automationEnabled=false）；P8.1 已持久化控制元数据、进度事件与运行级 Git 隔离，并提供 GET /plugins/taskflow/run 详情投影与 pause/resume/takeover/release/retry 控制动作；P8.2 已内置 Codex Issue Executor（自动化开启时在独立 worktree 中以 workspace-write 非交互实现 Issue）；P8.3 已接入自动推进协调器（automationEnabled 开启且 autoPlan/autoReview 为 true 时自动完成规划、执行、审查），新增 GET /plugins/taskflow/events SSE 事件流，审查返工达到 maxReviewCycles 时进入 WAITING_DECISION 人工介入窗口（可用 resume 继续）。用户提到「工作流 / 任务流 / taskflow」时即指本插件，请据此协作。'
 
 /** Plugin config; schema defaults are applied by the loader. */
 export interface Config {
@@ -416,6 +416,47 @@ export function handleBoard(service: TaskFlowService, req: IncomingMessage, res:
   sendJson(res, { ok: true, columns: service.board().columns })
 }
 
+/** Serialize one taskflow event as an SSE data frame. */
+function sseEvent(event: TaskFlowEvent): string {
+  return `event: ${event.kind}
+data: ${JSON.stringify(event)}
+
+`
+}
+
+/** GET /plugins/taskflow/events — P8.3 SSE channel for whitelisted taskflow
+ * events. Optional `?runId=` filters to one run. On connect the most recent
+ * events are replayed, then new durable events are streamed as they occur. */
+export function handleEvents(service: TaskFlowService, req: IncomingMessage, res: ServerResponse): void {
+  if (req.method !== 'GET') {
+    sendJson(res, { ok: false, error: 'taskflow: events requires GET' }, 405, { Allow: 'GET' })
+    return
+  }
+  const url = new URL(req.url ?? '/', 'http://localhost')
+  const runId = url.searchParams.get('runId') ?? undefined
+  const initial = service.list()
+    .filter((run) => runId === undefined || run.id === runId)
+    .flatMap((run) => run.events ?? [])
+    .sort((a, b) => (a.at - b.at) || (a.seq - b.seq))
+    .slice(-100)
+
+  res.writeHead(200, {
+    'content-type': 'text/event-stream',
+    'cache-control': 'no-cache',
+    'connection': 'keep-alive',
+  })
+  res.write(': connected\n\n')
+  for (const event of initial) res.write(sseEvent(event))
+
+  const unsubscribe = service.subscribeEvents((event) => {
+    if (runId === undefined || event.runId === runId) {
+      res.write(sseEvent(event))
+    }
+  })
+  res.on('close', unsubscribe)
+  res.on('error', unsubscribe)
+}
+
 /**
  * Mount the host half: open the durable domain, assemble the service, then
  * register the announcement section and HTTP routes (routes only when the
@@ -451,6 +492,9 @@ export function apply(ctx: Context, config?: Config): Promise<void> {
         worktreesRoot: config?.worktreesRoot ?? '.taskflow/worktrees',
         automationEnabled: config?.automationEnabled ?? DEFAULT_AUTOMATION_CONFIG.enabled,
         maxExecutorProcesses: config?.maxExecutorProcesses ?? DEFAULT_AUTOMATION_CONFIG.maxExecutorProcesses,
+        autoPlan: config?.autoPlan ?? DEFAULT_AUTOMATION_CONFIG.autoPlan,
+        autoReview: config?.autoReview ?? DEFAULT_AUTOMATION_CONFIG.autoReview,
+        maxReviewCycles: config?.maxReviewCycles ?? DEFAULT_AUTOMATION_CONFIG.maxReviewCycles,
       },
     )
 
@@ -491,6 +535,13 @@ export function apply(ctx: Context, config?: Config): Promise<void> {
             path: '/plugins/taskflow/run',
             handler: (req, res) => {
               handleRunDetail(service, req, res)
+            },
+          }),
+          webScope.webServer.register({
+            kind: 'exact',
+            path: '/plugins/taskflow/events',
+            handler: (req, res) => {
+              handleEvents(service, req, res)
             },
           }),
           webScope.webServer.register({

@@ -11,6 +11,7 @@ import { homedir } from 'node:os'
 import { join, resolve, sep } from 'node:path'
 import {
   AUTOMATION_CONTROL_ACTIONS,
+  DEFAULT_AUTOMATION_CONFIG,
   type AutomationControlAction,
   type ExecutorPhase,
   type RunDetailResponse,
@@ -192,6 +193,12 @@ export interface TaskFlowOptions {
   /** P8: global cap on concurrent Codex executor processes (reserved for the
    * automatic coordinator; the built-in executor uses per-run maxConcurrent). */
   maxExecutorProcesses?: number
+  /** P8.3: automatically start planning when automation is enabled. */
+  autoPlan?: boolean
+  /** P8.3: automatically start Codex review when automation is enabled. */
+  autoReview?: boolean
+  /** P8.3: maximum automatic review/rework cycles before asking a human. */
+  maxReviewCycles?: number
 }
 
 /** Validate a submit request; throws a stable `taskflow:` error on violation. */
@@ -230,6 +237,11 @@ function creationTransition(createdAt: number, idempotencyKey: string): RunTrans
  */
 export class TaskFlowService {
   private readonly listeners = new Set<() => void>()
+  /** P8.3: SSE/event subscribers receive each durable whitelisted event. */
+  private readonly eventSubscriptions = new Set<{
+    listener: (event: TaskFlowEvent) => void
+    seen: Map<string, number>
+  }>()
   private readonly planFlows = new Map<string, Promise<void>>()
   /** Runs whose PLANNING transition is in flight: runId → the durable
    * transition promise. Set synchronously at plan() entry (before any await)
@@ -256,6 +268,9 @@ export class TaskFlowService {
   private readonly worktrees: WorktreeManager
   private readonly automationEnabled: boolean
   private readonly automationMode: 'manual' | 'automatic'
+  private readonly autoPlan: boolean
+  private readonly autoReview: boolean
+  private readonly maxReviewCycles: number
 
   constructor(
     private readonly repository: TaskFlowRepository,
@@ -276,6 +291,9 @@ export class TaskFlowService {
     this.worktrees = new WorktreeManager(options.git, options.worktreesRoot ?? '.taskflow/worktrees')
     this.automationEnabled = options.automationEnabled ?? false
     this.automationMode = this.automationEnabled ? 'automatic' : 'manual'
+    this.autoPlan = options.autoPlan ?? DEFAULT_AUTOMATION_CONFIG.autoPlan
+    this.autoReview = options.autoReview ?? DEFAULT_AUTOMATION_CONFIG.autoReview
+    this.maxReviewCycles = Math.max(1, Math.floor(options.maxReviewCycles ?? DEFAULT_AUTOMATION_CONFIG.maxReviewCycles))
   }
 
   /** Submit a new workflow run; returns its RECEIVED snapshot. An explicit
@@ -337,6 +355,9 @@ export class TaskFlowService {
       runAggregateSchema.parse(aggregate)
       await this.repository.insertRun(aggregate)
       this.notify()
+      if (this.automationEnabled && this.autoPlan && normalizedRepoRoot !== undefined) {
+        void this.plan(id).catch(() => undefined)
+      }
       return this.snapshotOf(aggregate)
     }
     const result = this.submitTail.then(job)
@@ -484,7 +505,7 @@ export class TaskFlowService {
       return { ok: false, error: `taskflow: unknown run ${runId}` }
     }
     try {
-      await this.repository.updateRun(runId, (current) => {
+      const updated = await this.repository.updateRun(runId, (current) => {
         if (current.merging === true) {
           throw new Error('taskflow: cannot control while a merge is in progress')
         }
@@ -573,6 +594,9 @@ export class TaskFlowService {
         }
       })
       this.notify()
+      if ((action === 'resume' || action === 'release') && updated.status === 'EXECUTING' && this.automationEnabled && this.executor !== undefined) {
+        void this.startExecution(runId).catch(() => undefined)
+      }
       return { ok: true }
     } catch (error) {
       const message = (error as Error).message
@@ -634,6 +658,9 @@ export class TaskFlowService {
         return next
       })
       this.notify()
+      if (this.automationEnabled && this.autoPlan && decision === 'rework' && updated.status === 'PLANNING') {
+        void this.plan(runId).catch(() => undefined)
+      }
       return { ok: true, runId, status: updated.status }
     } catch (error) {
       const message = (error as Error).message
@@ -650,6 +677,24 @@ export class TaskFlowService {
   subscribe(listener: () => void): () => void {
     this.listeners.add(listener)
     return () => { this.listeners.delete(listener) }
+  }
+
+  /** Subscribe to durable whitelisted taskflow events (P8.3 SSE). The
+   * listener receives only events appended after subscription; callers that
+   * need an initial replay (e.g. the SSE route) read the run snapshots first.
+   * Returns the unsubscribe disposer. */
+  subscribeEvents(listener: (event: TaskFlowEvent) => void): () => void {
+    const subscription = {
+      listener,
+      seen: new Map<string, number>(),
+    }
+    for (const run of this.repository.listRuns()) {
+      const events = run.events ?? []
+      const last = events.at(-1)
+      if (last !== undefined) subscription.seen.set(run.id, last.seq)
+    }
+    this.eventSubscriptions.add(subscription)
+    return () => { this.eventSubscriptions.delete(subscription) }
   }
 
   /**
@@ -1069,6 +1114,9 @@ export class TaskFlowService {
         return next
       })
       this.notify()
+      if (effectiveResult.ok && this.automationEnabled && this.autoReview && this.repository.getRun(runId)?.status === 'INTEGRATION_REVIEW') {
+        void this.startReview(runId).catch(() => undefined)
+      }
       if (effectiveResult.ok && run.repoRoot !== undefined && running.workDir !== undefined && running.branch !== undefined) {
         // Best-effort cleanup after the durable success record; a failure here
         // must not fail an already-merged issue.
@@ -1426,15 +1474,34 @@ export class TaskFlowService {
         return
       }
       const reworkKeys = this.reworkClosure(run, result.reworkKeys)
+      const reviewCycles = (run.control?.reviewCycles ?? 0) + 1
+      const limitReached = reviewCycles >= this.maxReviewCycles
+      if (limitReached) {
+        await this.repository.updateRun(runId, (current) => {
+          assertTransition(current.status, 'WAITING_DECISION')
+          return this.withTransition(current, 'WAITING_DECISION', 'review-cycle-limit', `review:limit:${runId}`, {
+            executions: this.resetReworkExecutions(current.executions ?? [], reworkKeys),
+            review: { verdict: 'REVISE', summary: result.summary, reworkKeys: [...reworkKeys], at: this.now() },
+            control: { ...(current.control ?? this.defaultControl()), reviewCycles },
+            events: this.appendEvent(current.events ?? [], runId, 'review.finished', { summary: 'REVISE' }),
+          })
+        })
+        this.notify()
+        return
+      }
       await this.repository.updateRun(runId, (current) => {
         assertTransition(current.status, 'EXECUTING')
         return this.withTransition(current, 'EXECUTING', 'review-revise', `review:revise:${runId}`, {
           executions: this.resetReworkExecutions(current.executions ?? [], reworkKeys),
           review: { verdict: 'REVISE', summary: result.summary, reworkKeys: [...reworkKeys], at: this.now() },
+          control: { ...(current.control ?? this.defaultControl()), reviewCycles },
           events: this.appendEvent(current.events ?? [], runId, 'review.finished', { summary: 'REVISE' }),
         })
       })
       this.notify()
+      if (this.automationEnabled && this.executor !== undefined && this.repository.getRun(runId)?.status === 'EXECUTING') {
+        void this.startExecution(runId).catch(() => undefined)
+      }
     } catch (error) {
       const message = error instanceof ReviewerError
         ? error.message
@@ -1580,6 +1647,9 @@ export class TaskFlowService {
         })
       })
       this.notify()
+      if (this.automationEnabled && this.executor !== undefined && this.repository.getRun(runId)?.status === 'READY') {
+        void this.startExecution(runId).catch(() => undefined)
+      }
     } catch (error) {
       const message = error instanceof PlannerError
         ? error.message
@@ -1611,7 +1681,10 @@ export class TaskFlowService {
       case 'READY':
       case 'INTEGRATION_REVIEW':
       case 'AWAITING_HUMAN':
+        allowed.add('cancel')
+        break
       case 'WAITING_DECISION':
+        allowed.add('resume')
         allowed.add('cancel')
         break
       case 'EXECUTING':
@@ -1725,6 +1798,19 @@ export class TaskFlowService {
 
   private notify(): void {
     for (const listener of [...this.listeners]) listener()
+    for (const run of this.repository.listRuns()) {
+      for (const event of run.events ?? []) this.emitEvent(event)
+    }
+  }
+
+  private emitEvent(event: TaskFlowEvent): void {
+    for (const subscription of [...this.eventSubscriptions]) {
+      const lastSeq = subscription.seen.get(event.runId) ?? -1
+      if (event.seq > lastSeq) {
+        subscription.seen.set(event.runId, event.seq)
+        subscription.listener(event)
+      }
+    }
   }
 
   private snapshotOf(run: RunAggregate): RunSnapshot {

@@ -69,6 +69,8 @@ export interface RunControl {
   paused: boolean
   takenOver: boolean
   retryCount: number
+  /** P8.3: number of automatic review/rework cycles completed for this run. */
+  reviewCycles?: number
 }
 
 /** P8.1 run-scoped Git isolation metadata. */
@@ -174,6 +176,7 @@ const runControlSchema = z.object({
   paused: z.boolean(),
   takenOver: z.boolean(),
   retryCount: z.number().int().min(0),
+  reviewCycles: z.number().int().min(0).optional(),
 })
 
 const runGitIsolationSchema = z.object({

@@ -7,7 +7,7 @@
  * @module dsh-taskflow/client/TaskFlowStatus
  */
 
-import { useEffect, useRef, useState, type KeyboardEvent } from 'react'
+import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from 'react'
 import type { ReactElement } from 'react'
 import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
@@ -62,6 +62,7 @@ function useJsonPoll<T>(
   path: string,
   enabled: boolean,
   setValue: (value: T | null) => void,
+  refreshKey = 0,
 ): void {
   useEffect(() => {
     if (!enabled) return
@@ -95,7 +96,19 @@ function useJsonPoll<T>(
       window.clearInterval(timer)
       document.removeEventListener('visibilitychange', onVisibility)
     }
-  }, [path, enabled, setValue])
+  }, [path, enabled, setValue, refreshKey])
+}
+
+/** Open the P8.3 SSE channel and bump a refresh key on each event so the
+ * poll hooks re-fetch immediately instead of waiting for the next interval. */
+function useSseRefresh(onEvent: () => void): void {
+  useEffect(() => {
+    if (typeof EventSource === 'undefined') return
+    const source = new EventSource('/plugins/taskflow/events')
+    source.onmessage = () => onEvent()
+    source.onerror = () => { source.close() }
+    return () => { source.close() }
+  }, [onEvent])
 }
 
 /**
@@ -107,12 +120,15 @@ export function TaskFlowStatus(_props: TaskFlowStatusProps): ReactElement {
   const [state, setState] = useState<TaskFlowStateResponse | null>(null)
   const [board, setBoard] = useState<BoardResponse | null>(null)
   const [open, setOpen] = useState(false)
+  const [revision, setRevision] = useState(0)
   const chipRef = useRef<HTMLButtonElement>(null)
   const boardRef = useRef<HTMLDivElement>(null)
   const closeButtonRef = useRef<HTMLButtonElement>(null)
 
-  useJsonPoll<TaskFlowStateResponse>('/plugins/taskflow/state', true, setState)
-  useJsonPoll<BoardResponse>('/plugins/taskflow/board', open, setBoard)
+  const handleSseEvent = useCallback(() => setRevision((value) => value + 1), [])
+  useSseRefresh(handleSseEvent)
+  useJsonPoll<TaskFlowStateResponse>('/plugins/taskflow/state', true, setState, revision)
+  useJsonPoll<BoardResponse>('/plugins/taskflow/board', open, setBoard, revision)
 
   useEffect(() => {
     if (open) closeButtonRef.current?.focus()
