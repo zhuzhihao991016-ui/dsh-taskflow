@@ -24,7 +24,7 @@ DSH 全自动任务工作流插件：任务提出后由 Codex CLI 规划拆分�
 - **P8.4**：自动执行授权门——新增 `requireExecutionPermission` 配置；开启后自动规划完成进入 `WAITING_PERMISSION`，人工 `release` 后才自动执行，`READY → WAITING_PERMISSION → EXECUTING` 状态迁移落地。
 - **P8.5**：浏览器运行台与介入窗口——详情抽屉、run-scoped 实时 SSE、按 `allowedActions` 渲染操作按钮、二次确认；`allowedActions` 在 `AWAITING_HUMAN` 下补充 `accept`/`rework` 供浏览器直接完成人工验收。
 
-当前版本 HEAD：`f7d66b0`，测试套件 205 项（typecheck + vitest + build 通过）。
+当前版本 HEAD：`0c5d377`，测试套件 205 项（typecheck + vitest + build 通过）。
 
 后续阶段：P8.6 及以后待定。
 
