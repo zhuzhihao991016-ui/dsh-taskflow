@@ -31,3 +31,7 @@ export type ExecutionResult =
 export interface Executor {
   execute(input: ExecutionInput): Promise<ExecutionResult>
 }
+
+/** P8.2 built-in Codex Issue Executor (re-exported for source-compatibility). */
+export { CodexIssueExecutor, CodexExecutor, IssueExecutorError, buildIssuePrompt, parseIssueResult, writeIssueExecutionSchema, ISSUE_EXECUTION_OUTPUT_SCHEMA, DEFAULT_ISSUE_EXECUTOR_TIMEOUT_MS, DEFAULT_ISSUE_EXECUTOR_MAX_RETRIES } from './issue-executor.ts'
+export type { IssueExecutorErrorCode } from './issue-executor.ts'

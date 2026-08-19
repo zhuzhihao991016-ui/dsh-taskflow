@@ -12,14 +12,17 @@ import type { ExecutionInput, ExecutionResult } from './executor.ts'
 import type { RunStatus } from './state.ts'
 
 /** Coarse phase of one automated Issue execution. */
-export type ExecutorPhase =
-  | 'preparing'
-  | 'running'
-  | 'merging'
-  | 'reporting'
-  | 'blocked'
-  | 'done'
-  | 'failed'
+export const EXECUTOR_PHASES = [
+  'preparing',
+  'running',
+  'merging',
+  'reporting',
+  'blocked',
+  'done',
+  'failed',
+] as const
+
+export type ExecutorPhase = (typeof EXECUTOR_PHASES)[number]
 
 /** Whitelisted progress event emitted by an automated executor. */
 export interface ExecutorProgressEvent {
@@ -58,7 +61,7 @@ export type AutomatedExecutionResult =
       blocker?: string
     }
 
-/** Automated executor contract; production implementation is added in P8.2. */
+/** Automated executor contract; production implementation is CodexIssueExecutor (P8.2). */
 export interface AutomatedExecutor {
   execute(input: AutomatedExecutionInput): Promise<AutomatedExecutionResult>
 }

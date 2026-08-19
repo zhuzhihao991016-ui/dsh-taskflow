@@ -9,7 +9,16 @@
 import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join, resolve, sep } from 'node:path'
-import { runAggregateSchema, type IssueExecution, type ReviewVerdict, type RunAggregate, type RunTransition } from './domain.ts'
+import {
+  AUTOMATION_CONTROL_ACTIONS,
+  type AutomationControlAction,
+  type ExecutorPhase,
+  type RunDetailResponse,
+  type TaskFlowEvent,
+  type TaskFlowEventKind,
+} from './contracts.ts'
+import type { AutomatedExecutionInput, AutomatedExecutionResult, AutomatedExecutor } from './contracts.ts'
+import { runAggregateSchema, type IssueExecution, type ReviewVerdict, type RunAggregate, type RunControl, type RunGitIsolation, type RunTransition } from './domain.ts'
 import type { PlannedIssue, RiskLevel } from './dag.ts'
 import { validatePlan } from './dag.ts'
 import type { ExecutionResult, Executor } from './executor.ts'
@@ -44,6 +53,12 @@ export interface RunSnapshot {
   }
   /** P5: base commit SHA captured when execution started. */
   baseSha?: string
+  /** P8.1: persistent automation/control metadata. */
+  control?: RunControl
+  /** P8.1: run-scoped Git isolation metadata. */
+  runGit?: RunGitIsolation
+  /** P8.1: bounded whitelisted event log. */
+  events?: TaskFlowEvent[]
 }
 
 /** Projected planned issue (agent needs acceptance/deps to execute). */
@@ -66,6 +81,12 @@ export interface IssueExecutionSnapshot {
   workDir?: string
   /** P5: per-issue branch created for the worktree. */
   branch?: string
+  /** P8.1: automated-executor attempt id (progress metadata). */
+  attemptId?: string
+  /** P8.1: coarse automated-executor phase. */
+  phase?: ExecutorPhase
+  /** P8.1: last progress heartbeat timestamp. */
+  heartbeatAt?: number
 }
 
 /** Board column identifiers; each maps to a kanban lane in the browser UI. */
@@ -139,8 +160,8 @@ export interface Planner {
   plan(input: PlanInput): Promise<unknown>
 }
 
-/** Commands the host accepts on a run (P1: cancel only). */
-export type CommandAction = 'cancel'
+/** Commands the host accepts on a run (P1: cancel; P8.1: automation control actions). */
+export type CommandAction = AutomationControlAction
 
 /** Result of one command; ok:false carries a stable machine-readable error. */
 export interface CommandResult {
@@ -166,6 +187,11 @@ export interface TaskFlowOptions {
   worktreesRoot?: string
   /** Git runner override (tests). */
   git?: GitRunner
+  /** P8.1: master switch for automation (persisted in run control metadata). */
+  automationEnabled?: boolean
+  /** P8: global cap on concurrent Codex executor processes (reserved for the
+   * automatic coordinator; the built-in executor uses per-run maxConcurrent). */
+  maxExecutorProcesses?: number
 }
 
 /** Validate a submit request; throws a stable `taskflow:` error on violation. */
@@ -228,6 +254,8 @@ export class TaskFlowService {
   private readonly maxConcurrent: number
   private readonly integrationBranch: string
   private readonly worktrees: WorktreeManager
+  private readonly automationEnabled: boolean
+  private readonly automationMode: 'manual' | 'automatic'
 
   constructor(
     private readonly repository: TaskFlowRepository,
@@ -237,7 +265,7 @@ export class TaskFlowService {
     private readonly allowedRepoRoots: readonly string[] = [],
     /** Optional automated executor; unset = agent-driven mode (a DSH session
      * claims the current issue and reports via exec-result). */
-    private readonly executor?: Executor,
+    private readonly executor?: Executor | AutomatedExecutor,
     /** Optional Codex reviewer; default is the production CodexReviewer. */
     private readonly reviewer: Reviewer = new CodexReviewer(),
     /** P5 execution/worktree options. */
@@ -246,6 +274,8 @@ export class TaskFlowService {
     this.maxConcurrent = Math.max(1, Math.floor(options.maxConcurrent ?? 1))
     this.integrationBranch = options.integrationBranch ?? 'taskflow/integration'
     this.worktrees = new WorktreeManager(options.git, options.worktreesRoot ?? '.taskflow/worktrees')
+    this.automationEnabled = options.automationEnabled ?? false
+    this.automationMode = this.automationEnabled ? 'automatic' : 'manual'
   }
 
   /** Submit a new workflow run; returns its RECEIVED snapshot. An explicit
@@ -292,6 +322,13 @@ export class TaskFlowService {
         issueCount: 0,
         issues: [],
         executions: [],
+        control: {
+          automation: { enabled: this.automationEnabled, mode: this.automationMode },
+          paused: false,
+          takenOver: false,
+          retryCount: 0,
+        },
+        events: [],
         transitions: [creationTransition(now, explicitKey !== undefined ? `submit:${explicitKey}` : `create:${id}`)],
       }
       // Parse before persist: a malformed aggregate must never reach the
@@ -331,6 +368,108 @@ export class TaskFlowService {
     return buildBoard(this.list())
   }
 
+  /** P8.1 run-detail projection: the durable automation/control metadata,
+   * current running issue progress, allowed control actions, and recent events. */
+  runDetail(runId: string): RunDetailResponse | undefined {
+    const run = this.repository.getRun(runId)
+    if (run === undefined) return undefined
+    const running = (run.executions ?? []).find((execution) => execution.status === 'running')
+    return {
+      runId: run.id,
+      status: run.status,
+      automation: {
+        enabled: run.control?.automation.enabled ?? this.automationEnabled,
+        mode: run.control?.automation.mode ?? this.automationMode,
+      },
+      currentIssue: running === undefined ? undefined : {
+        key: running.key,
+        attemptId: running.attemptId,
+        phase: running.phase,
+        workDir: running.workDir,
+        branch: running.branch,
+        heartbeatAt: running.heartbeatAt,
+      },
+      allowedActions: this.allowedActions(run),
+      recentEvents: (run.events ?? []).slice(-50),
+    }
+  }
+
+  /** P8.1 persist one whitelisted automated-executor progress event and update
+   * the running issue's attempt/phase/heartbeat metadata. */
+  async recordProgress(
+    runId: string,
+    issueKey: string,
+    progress: { attemptId?: string; phase: ExecutorPhase; summary?: string; detail?: string; at?: number },
+  ): Promise<{ ok: true; seq: number } | { ok: false; error: string }> {
+    const run = this.repository.getRun(runId)
+    if (run === undefined) {
+      return { ok: false, error: `taskflow: unknown run ${runId}` }
+    }
+    if (run.status !== 'EXECUTING') {
+      return { ok: false, error: `taskflow: cannot record progress for run ${runId} in status ${run.status}` }
+    }
+    const running = (run.executions ?? []).find((execution) => execution.status === 'running' && execution.key === issueKey)
+    if (running === undefined) {
+      return { ok: false, error: `taskflow: issue '${issueKey}' is not currently running` }
+    }
+    try {
+      const updated = await this.repository.updateRun(runId, (current) => {
+        const currentRunning = (current.executions ?? []).find((execution) => execution.status === 'running' && execution.key === issueKey)
+        if (currentRunning === undefined) {
+          throw new Error(`taskflow: issue '${issueKey}' is not currently running`)
+        }
+        const events = current.events ?? []
+        const nextEvents = this.appendEvent(events, runId, 'issue.progress', {
+          issueKey,
+          attemptId: progress.attemptId ?? currentRunning.attemptId,
+          phase: progress.phase,
+          summary: progress.summary,
+        })
+        const executions = (current.executions ?? []).map((execution) => (
+          execution.key === issueKey
+            ? {
+                ...execution,
+                attemptId: progress.attemptId ?? execution.attemptId,
+                phase: progress.phase,
+                heartbeatAt: progress.at ?? this.now(),
+              }
+            : execution
+        ))
+        const next: RunAggregate = {
+          ...current,
+          executions,
+          events: nextEvents,
+          updatedAt: progress.at ?? this.now(),
+        }
+        runAggregateSchema.parse(next)
+        return next
+      })
+      this.notify()
+      const events = updated.events ?? []
+      return { ok: true, seq: events.length > 0 ? events[events.length - 1]!.seq : 0 }
+    } catch (error) {
+      const message = (error as Error).message
+      if (message.startsWith('taskflow:')) {
+        return { ok: false, error: message }
+      }
+      throw error
+    }
+  }
+
+  /** Alias for {@link runDetail} (P8.1 contract consumers). */
+  getRunDetail(runId: string): RunDetailResponse | undefined {
+    return this.runDetail(runId)
+  }
+
+  /** Alias for {@link recordProgress} (P8.1 automated-executor callbacks). */
+  reportProgress(
+    runId: string,
+    issueKey: string,
+    progress: { attemptId?: string; phase: ExecutorPhase; summary?: string; detail?: string; at?: number },
+  ): Promise<{ ok: true; seq: number } | { ok: false; error: string }> {
+    return this.recordProgress(runId, issueKey, progress)
+  }
+
   /**
    * Apply one command to a run. P1 supports cancel (any non-terminal status →
    * CANCELLED); unknown ids, terminal runs, and unimplemented actions fail
@@ -338,7 +477,7 @@ export class TaskFlowService {
    * atomic update, so a concurrent status change cannot be overwritten.
    */
   async command(runId: string, action: CommandAction, actor = 'host'): Promise<CommandResult> {
-    if (action !== 'cancel') {
+    if (!(AUTOMATION_CONTROL_ACTIONS as readonly string[]).includes(action)) {
       return { ok: false, error: `taskflow: unsupported action '${String(action)}'` }
     }
     if (this.repository.getRun(runId) === undefined) {
@@ -347,27 +486,91 @@ export class TaskFlowService {
     try {
       await this.repository.updateRun(runId, (current) => {
         if (current.merging === true) {
-          throw new Error('taskflow: cannot cancel while a merge is in progress')
+          throw new Error('taskflow: cannot control while a merge is in progress')
         }
-        assertTransition(current.status, 'CANCELLED')
-        const seq = current.transitions.length
-        const transition: RunTransition = {
-          seq,
-          from: current.status,
-          to: 'CANCELLED',
-          reason: 'cancelled',
-          actor,
-          idempotencyKey: `command:cancel:${runId}:${seq}`,
-          at: this.now(),
+        const now = this.now()
+        const control = current.control ?? this.defaultControl()
+        const events = current.events ?? []
+        const append = (kind: TaskFlowEventKind, extra: { summary?: string; issueKey?: string; attemptId?: string; phase?: ExecutorPhase } = {}) =>
+          this.appendEvent(events, runId, kind, extra)
+        const transitionTo = (
+          to: RunStatus,
+          reason: string,
+          idempotencyKey: string,
+          patch: Partial<Pick<RunAggregate, 'control' | 'events' | 'executions' | 'review' | 'baseSha' | 'runGit' | 'merging'>> = {},
+        ): RunAggregate => {
+          const seq = current.transitions.length
+          const transition: RunTransition = {
+            seq,
+            from: current.status,
+            to,
+            reason,
+            actor,
+            idempotencyKey,
+            at: now,
+          }
+          const next: RunAggregate = {
+            ...current,
+            ...patch,
+            status: to,
+            updatedAt: transition.at,
+            transitions: [...current.transitions, transition],
+          }
+          runAggregateSchema.parse(next)
+          return next
         }
-        const next: RunAggregate = {
-          ...current,
-          status: 'CANCELLED',
-          updatedAt: transition.at,
-          transitions: [...current.transitions, transition],
+        switch (action) {
+          case 'cancel':
+            assertTransition(current.status, 'CANCELLED')
+            return transitionTo('CANCELLED', 'cancelled', `command:cancel:${runId}:${current.transitions.length}`, {
+              control: { ...control, paused: false, takenOver: false },
+              events: append('run.updated', { summary: 'cancelled' }),
+            })
+          case 'pause':
+            assertTransition(current.status, 'PAUSED')
+            return transitionTo('PAUSED', 'paused', `command:pause:${runId}:${current.transitions.length}`, {
+              control: { ...control, paused: true },
+              events: append('automation.paused', { summary: 'paused' }),
+            })
+          case 'resume':
+            assertTransition(current.status, 'EXECUTING')
+            return transitionTo('EXECUTING', 'resumed', `command:resume:${runId}:${current.transitions.length}`, {
+              control: { ...control, paused: false },
+              events: append('automation.resumed', { summary: 'resumed' }),
+            })
+          case 'takeover':
+            assertTransition(current.status, 'WAITING_PERMISSION')
+            return transitionTo('WAITING_PERMISSION', 'takeover', `command:takeover:${runId}:${current.transitions.length}`, {
+              control: { ...control, takenOver: true },
+              events: append('run.updated', { summary: 'takeover' }),
+            })
+          case 'release':
+            assertTransition(current.status, 'EXECUTING')
+            return transitionTo('EXECUTING', 'released', `command:release:${runId}:${current.transitions.length}`, {
+              control: { ...control, takenOver: false },
+              events: append('run.updated', { summary: 'release' }),
+            })
+          case 'retry': {
+            if (current.status !== 'EXECUTING') {
+              throw new Error(`taskflow: retry requires EXECUTING, got ${current.status}`)
+            }
+            const hasFailed = (current.executions ?? []).some((execution) => execution.status === 'failed')
+            if (!hasFailed) {
+              throw new Error('taskflow: retry requires at least one failed issue')
+            }
+            const next: RunAggregate = {
+              ...current,
+              control: { ...control, retryCount: control.retryCount + 1 },
+              executions: (current.executions ?? []).map((execution) => (
+                execution.status === 'failed' ? { ...execution, status: 'pending' as const } : execution
+              )),
+              events: append('run.updated', { summary: 'retry' }),
+              updatedAt: now,
+            }
+            runAggregateSchema.parse(next)
+            return next
+          }
         }
-        runAggregateSchema.parse(next)
-        return next
       })
       this.notify()
       return { ok: true }
@@ -413,9 +616,18 @@ export class TaskFlowService {
         }
         const next: RunAggregate = {
           ...current,
-          ...(decision === 'rework' ? { executions: [], review: undefined, baseSha: undefined } : {}),
+          ...(decision === 'rework'
+            ? {
+                executions: [],
+                review: undefined,
+                baseSha: undefined,
+                runGit: undefined,
+                control: this.defaultControl(),
+              }
+            : {}),
           status: to,
           updatedAt: transition.at,
+          events: this.appendEvent(current.events ?? [], runId, 'human.decision', { summary: decision }),
           transitions: [...current.transitions, transition],
         }
         runAggregateSchema.parse(next)
@@ -648,6 +860,7 @@ export class TaskFlowService {
             assertTransition(current.status, 'EXECUTING')
             return this.withTransition(current, 'EXECUTING', 'execution-started', `exec:start:${runId}`, {
               baseSha,
+              runGit: { integrationBranch: this.runIntegrationBranch(runId) },
             })
           })
           this.notify()
@@ -713,6 +926,9 @@ export class TaskFlowService {
         key: execution.key,
         workDir: execution.workDir,
         branch: execution.branch,
+        attemptId: execution.attemptId,
+        phase: execution.phase,
+        heartbeatAt: execution.heartbeatAt,
       })),
     }
   }
@@ -774,7 +990,7 @@ export class TaskFlowService {
           repoRoot,
           branch,
           `taskflow ${runId} ${issueKey}`,
-          this.integrationBranch,
+          run.runGit?.integrationBranch ?? this.integrationBranch,
         ))
       } catch (error) {
         effectiveResult = { ok: false, error: `worktree merge failed: ${(error as Error).message}` }
@@ -804,6 +1020,9 @@ export class TaskFlowService {
               summary: effectiveResult.summary,
               workDir: currentRunning.workDir,
               branch: currentRunning.branch,
+              attemptId: currentRunning.attemptId,
+              phase: 'done',
+              heartbeatAt: currentRunning.heartbeatAt,
             }
           : {
               key: issueKey,
@@ -813,6 +1032,9 @@ export class TaskFlowService {
               error: effectiveResult.error,
               workDir: currentRunning.workDir,
               branch: currentRunning.branch,
+              attemptId: currentRunning.attemptId,
+              phase: 'failed',
+              heartbeatAt: currentRunning.heartbeatAt,
             }
         const executionsNext = [
           ...currentExecutions.filter((execution) => execution.key !== issueKey),
@@ -823,6 +1045,7 @@ export class TaskFlowService {
           return this.withTransition(current, 'FAILED', `execution-failed: ${issueKey}: ${effectiveResult.error}`, `exec:fail:${runId}`, {
             executions: executionsNext,
             merging: false,
+            events: this.appendEvent(current.events ?? [], runId, 'issue.failed', { issueKey, summary: effectiveResult.error }),
           })
         }
         const doneKeys = new Set(executionsNext.filter((execution) => execution.status === 'done').map((execution) => execution.key))
@@ -832,6 +1055,7 @@ export class TaskFlowService {
           return this.withTransition(current, 'INTEGRATION_REVIEW', 'execution-completed', `exec:done:${runId}`, {
             executions: executionsNext,
             merging: false,
+            events: this.appendEvent(current.events ?? [], runId, 'issue.finished', { issueKey, summary: effectiveResult.summary }),
           })
         }
         const next: RunAggregate = {
@@ -839,6 +1063,7 @@ export class TaskFlowService {
           merging: false,
           updatedAt: now,
           executions: executionsNext,
+          events: this.appendEvent(current.events ?? [], runId, 'issue.finished', { issueKey, summary: effectiveResult.summary }),
         }
         runAggregateSchema.parse(next)
         return next
@@ -956,16 +1181,21 @@ export class TaskFlowService {
         const existing = executions.find((execution) => execution.key === candidate.key)
         claimed.push({ key: candidate.key, issue: candidate, existing })
         const running: IssueExecution = existing !== undefined
-          ? { ...existing, status: 'running', startedAt: existing.startedAt ?? this.now() }
-          : { key: candidate.key, status: 'running', startedAt: this.now() }
+          ? { ...existing, status: 'running', startedAt: existing.startedAt ?? this.now(), attemptId: `attempt-${candidate.key}-${this.now()}` }
+          : { key: candidate.key, status: 'running', startedAt: this.now(), attemptId: `attempt-${candidate.key}-${this.now()}` }
         const index = nextExecutions.findIndex((execution) => execution.key === candidate.key)
         if (index >= 0) nextExecutions[index] = running
         else nextExecutions.push(running)
+      }
+      let events = current.events ?? []
+      for (const claim of claimed) {
+        events = this.appendEvent(events, runId, 'issue.started', { issueKey: claim.key })
       }
       const next: RunAggregate = {
         ...current,
         updatedAt: this.now(),
         executions: nextExecutions,
+        events,
       }
       runAggregateSchema.parse(next)
       return next
@@ -984,7 +1214,12 @@ export class TaskFlowService {
         break
       }
       try {
-        const worktree = await this.worktrees.createIssueWorktree(run.repoRoot, runId, claim.key, this.integrationBranch)
+        const worktree = await this.worktrees.createIssueWorktree(
+          run.repoRoot,
+          runId,
+          claim.key,
+          run.runGit?.integrationBranch ?? this.integrationBranch,
+        )
         await this.repository.updateRun(runId, (current) => {
           const executions = current.executions ?? []
           const index = executions.findIndex((execution) => execution.key === claim.key)
@@ -1056,12 +1291,7 @@ export class TaskFlowService {
       const outcomes = await Promise.all(claims.map(async (claim) => {
         let result: ExecutionResult
         try {
-          result = await executor.execute({
-            runId,
-            issue: claim.issue,
-            repoRoot,
-            workDir: claim.workDir ?? join(defaultPlanRoot(), runId, claim.issue.key),
-          })
+          result = await this.executeClaim(runId, claim, repoRoot)
         } catch (error) {
           // An executor infrastructure crash is a run failure, not a client
           // conflict: strip any taskflow: prefix so the record lands as FAILED.
@@ -1074,6 +1304,80 @@ export class TaskFlowService {
     }
   }
 
+  /** Execute one claimed issue through the configured executor. Supports both
+   * the legacy `Executor` (agent/DSH fake) and the P8.2 `AutomatedExecutor`
+   * contract. For automated executors, persists an attempt id, wires progress
+   * callbacks to the run event log, and protects against stale results. */
+  private async executeClaim(
+    runId: string,
+    claim: { key: string; issue: PlannedIssue; workDir?: string; branch?: string },
+    repoRoot: string,
+  ): Promise<ExecutionResult> {
+    const executor = this.executor
+    if (executor === undefined) {
+      return { ok: false, error: 'taskflow: no executor configured' }
+    }
+    const workDir = claim.workDir ?? join(defaultPlanRoot(), runId, claim.issue.key)
+    const persisted = this.repository.getRun(runId)
+      ?.executions?.find((execution) => execution.key === claim.key)
+    const attemptId = persisted?.attemptId ?? `attempt-${claim.key}-${this.now()}`
+    // Persist the attempt id before invoking the executor so runDetail can
+    // expose it to the human intervention window while the issue is running.
+    await this.repository.updateRun(runId, (current) => {
+      const executions = (current.executions ?? []).map((execution) => (
+        execution.key === claim.key ? { ...execution, attemptId } : execution
+      ))
+      const next: RunAggregate = { ...current, updatedAt: this.now(), executions }
+      runAggregateSchema.parse(next)
+      return next
+    }).catch(() => undefined)
+
+    const controller = new AbortController()
+    const input: AutomatedExecutionInput = {
+      runId,
+      issue: claim.issue,
+      repoRoot,
+      workDir,
+      attemptId,
+      signal: controller.signal,
+      onProgress: (event) => {
+        void this.recordProgress(runId, claim.key, {
+          attemptId,
+          phase: event.phase,
+          summary: event.summary,
+          at: event.at,
+        })
+      },
+    }
+    const raw = await executor.execute(input as never)
+    if (this.isAutomatedResult(raw) && raw.attemptId !== attemptId) {
+      return { ok: false, error: `stale executor result for ${claim.key}: expected ${attemptId}, got ${raw.attemptId}` }
+    }
+    return this.normalizeExecutorResult(raw)
+  }
+
+  private isAutomatedResult(result: ExecutionResult | AutomatedExecutionResult): result is AutomatedExecutionResult {
+    return typeof (result as AutomatedExecutionResult).attemptId === 'string'
+  }
+
+  private normalizeExecutorResult(result: ExecutionResult | AutomatedExecutionResult): ExecutionResult {
+    if (typeof result !== 'object' || result === null || typeof (result as { ok?: unknown }).ok !== 'boolean') {
+      return { ok: false, error: 'executor returned an invalid result' }
+    }
+    if (result.ok) {
+      if (this.isAutomatedResult(result)) {
+        return { ok: true, summary: result.summary }
+      }
+      return result
+    }
+    if (this.isAutomatedResult(result)) {
+      const blocker = result.blocker !== undefined && result.blocker !== '' ? `: ${result.blocker}` : ''
+      return { ok: false, error: `${result.error}${blocker}` }
+    }
+    return result
+  }
+
+
   /** Background P4 review body: reviewer → PASS/REVISE transition
    * (single-flight via reviewFlows). */
   private async runReviewBody(runId: string): Promise<void> {
@@ -1084,9 +1388,19 @@ export class TaskFlowService {
         await this.transitionTo(runId, 'FAILED', 'review-failed: run has no repoRoot', `review:fail:${runId}`)
         return
       }
+      await this.repository.updateRun(runId, (current) => {
+        const next: RunAggregate = {
+          ...current,
+          updatedAt: this.now(),
+          events: this.appendEvent(current.events ?? [], runId, 'review.started'),
+        }
+        runAggregateSchema.parse(next)
+        return next
+      })
+      const integrationBranch = run.runGit?.integrationBranch ?? this.integrationBranch
       const integrationHeadSha = run.baseSha === undefined
         ? undefined
-        : await this.worktrees.getBranchHeadSha(run.repoRoot, this.integrationBranch)
+        : await this.worktrees.getBranchHeadSha(run.repoRoot, integrationBranch)
       const raw = await this.reviewer.review({
         runId,
         title: run.title,
@@ -1096,7 +1410,7 @@ export class TaskFlowService {
         executions: run.executions ?? [],
         workDir: join(defaultPlanRoot(), runId),
         baseSha: run.baseSha,
-        integrationBranch: this.integrationBranch,
+        integrationBranch,
         integrationHeadSha,
       })
       const result = this.normalizeReviewResult(run, raw)
@@ -1105,6 +1419,7 @@ export class TaskFlowService {
           assertTransition(current.status, 'AWAITING_HUMAN')
           return this.withTransition(current, 'AWAITING_HUMAN', 'review-passed', `review:pass:${runId}`, {
             review: { verdict: 'PASS', summary: result.summary, reworkKeys: [], at: this.now() },
+            events: this.appendEvent(current.events ?? [], runId, 'review.finished', { summary: 'PASS' }),
           })
         })
         this.notify()
@@ -1116,6 +1431,7 @@ export class TaskFlowService {
         return this.withTransition(current, 'EXECUTING', 'review-revise', `review:revise:${runId}`, {
           executions: this.resetReworkExecutions(current.executions ?? [], reworkKeys),
           review: { verdict: 'REVISE', summary: result.summary, reworkKeys: [...reworkKeys], at: this.now() },
+          events: this.appendEvent(current.events ?? [], runId, 'review.finished', { summary: 'REVISE' }),
         })
       })
       this.notify()
@@ -1285,13 +1601,73 @@ export class TaskFlowService {
     this.notify()
   }
 
+  /** P8.1: allowed automation control actions for the current run state. */
+  private allowedActions(run: RunAggregate): string[] {
+    if (isTerminal(run.status)) return []
+    const allowed = new Set<AutomationControlAction>()
+    switch (run.status) {
+      case 'RECEIVED':
+      case 'PLANNING':
+      case 'READY':
+      case 'INTEGRATION_REVIEW':
+      case 'AWAITING_HUMAN':
+      case 'WAITING_DECISION':
+        allowed.add('cancel')
+        break
+      case 'EXECUTING':
+        allowed.add('pause')
+        allowed.add('cancel')
+        allowed.add('takeover')
+        if ((run.executions ?? []).some((execution) => execution.status === 'failed')) {
+          allowed.add('retry')
+        }
+        break
+      case 'PAUSED':
+        allowed.add('resume')
+        allowed.add('cancel')
+        allowed.add('takeover')
+        break
+      case 'WAITING_PERMISSION':
+        allowed.add('release')
+        allowed.add('cancel')
+        break
+    }
+    return AUTOMATION_CONTROL_ACTIONS.filter((action) => allowed.has(action))
+  }
+
+  private defaultControl(): RunControl {
+    return {
+      automation: { enabled: this.automationEnabled, mode: this.automationMode },
+      paused: false,
+      takenOver: false,
+      retryCount: 0,
+    }
+  }
+
+  /** Append one whitelisted event; the log is bounded to the newest 200 events. */
+  private appendEvent(
+    events: readonly TaskFlowEvent[],
+    runId: string,
+    kind: TaskFlowEventKind,
+    extra: { issueKey?: string; attemptId?: string; phase?: ExecutorPhase; summary?: string } = {},
+  ): TaskFlowEvent[] {
+    const seq = events.reduce((max, event) => Math.max(max, event.seq), -1) + 1
+    const event: TaskFlowEvent = { seq, at: this.now(), runId, kind, ...extra }
+    return [...events, event].slice(-200)
+  }
+
+  /** P8.1: run-scoped integration branch for Git isolation. */
+  private runIntegrationBranch(runId: string): string {
+    return `${this.integrationBranch}/${runId}`
+  }
+
   /** Build the next aggregate: append one transition, stamp updatedAt, parse-before-persist. */
   private withTransition(
     current: RunAggregate,
     to: RunStatus,
     reason: string,
     idempotencyKey: string,
-    patch: Partial<Pick<RunAggregate, 'issueCount' | 'issues' | 'executions' | 'review' | 'baseSha' | 'merging'>> = {},
+    patch: Partial<Pick<RunAggregate, 'issueCount' | 'issues' | 'executions' | 'review' | 'baseSha' | 'merging' | 'control' | 'runGit' | 'events'>> = {},
   ): RunAggregate {
     const seq = current.transitions.length
     const transition: RunTransition = {
@@ -1303,11 +1679,13 @@ export class TaskFlowService {
       idempotencyKey,
       at: this.now(),
     }
+    const baseEvents = patch.events ?? current.events ?? []
     const next: RunAggregate = {
       ...current,
       ...patch,
       status: to,
       updatedAt: transition.at,
+      events: this.appendEvent(baseEvents, current.id, 'run.updated', { summary: reason }),
       transitions: [...current.transitions, transition],
     }
     runAggregateSchema.parse(next)
@@ -1383,6 +1761,9 @@ export class TaskFlowService {
         at: run.review.at,
       },
       baseSha: run.baseSha,
+      control: run.control,
+      runGit: run.runGit,
+      events: run.events ?? [],
     }
   }
 }

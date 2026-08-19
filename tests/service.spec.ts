@@ -220,7 +220,7 @@ describe('TaskFlowService', () => {
   it('unimplemented actions fail with a stable error', async () => {
     const { service } = harness()
     const run = await service.submit({ title: '任务' })
-    const result = await service.command(run.id, 'pause' as never)
+    const result = await service.command(run.id, 'unknown' as never)
     expect(result.ok).toBe(false)
     expect(result.error).toMatch(/unsupported action/)
   })

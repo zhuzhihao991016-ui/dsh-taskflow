@@ -14,7 +14,7 @@ import Storage from '@deepseek-ai/dsh-storage'
 import type { Domain } from '@deepseek-ai/dsh-storage-domain'
 import * as StorageJson from '@deepseek-ai/dsh-storage-json'
 import * as StorageDomain from '@deepseek-ai/dsh-storage-domain'
-import { TASKFLOW_DOMAIN } from '../src/domain.ts'
+import { TASKFLOW_DOMAIN, type RunAggregate } from '../src/domain.ts'
 import { DomainRepository } from '../src/repository.ts'
 import { TaskFlowService } from '../src/service.ts'
 
@@ -344,4 +344,36 @@ describe('DomainRepository', () => {
     })
     await ctx.fiber.dispose()
   })
+  it('persists P8.1 control/runGit/events fields across restart', async () => {
+    const root = await freshRoot()
+    const first = await mount(root)
+    const base = sampleAggregate('run-0001')
+    const p81: RunAggregate = {
+      ...base,
+      status: 'EXECUTING',
+      issueCount: 1,
+      issues: [{ key: 'issue-001', acceptance: '验收 A' }],
+      executions: [{ key: 'issue-001', status: 'running', attemptId: 'attempt-1', phase: 'running', heartbeatAt: 7 }],
+      control: { automation: { enabled: false, mode: 'manual' }, paused: true, takenOver: false, retryCount: 2 },
+      runGit: { integrationBranch: 'taskflow/integration/run-0001' },
+      events: [{ seq: 0, at: 1, runId: 'run-0001', kind: 'run.updated', summary: 'created' }],
+      transitions: [
+        ...base.transitions,
+        { seq: 1, from: 'RECEIVED', to: 'PLANNING', reason: 'planning-started', actor: 'host', idempotencyKey: 'plan:start:abc', at: 2 },
+        { seq: 2, from: 'PLANNING', to: 'READY', reason: 'planning-succeeded', actor: 'host', idempotencyKey: 'plan:done:abc', at: 3 },
+        { seq: 3, from: 'READY', to: 'EXECUTING', reason: 'execution-started', actor: 'host', idempotencyKey: 'exec:start:run-0001', at: 4 },
+      ],
+    }
+    await first.repository.insertRun(p81)
+    await unmount(first.ctx, first.domain)
+
+    const second = await mount(root)
+    const restored = second.repository.getRun('run-0001')
+    expect(restored?.control).toEqual(p81.control)
+    expect(restored?.runGit).toEqual(p81.runGit)
+    expect(restored?.events).toEqual(p81.events)
+    expect(restored?.executions[0]?.attemptId).toBe('attempt-1')
+    await unmount(second.ctx, second.domain)
+  })
+
 })

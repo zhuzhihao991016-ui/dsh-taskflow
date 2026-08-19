@@ -10,6 +10,7 @@ import { z } from 'zod'
 import { defineDomain, domainTable } from '@deepseek-ai/dsh-storage-domain'
 import { ISSUE_KEY_PATTERN } from './dag.ts'
 import type { PlannedIssue } from './dag.ts'
+import { EXECUTOR_PHASES, TASKFLOW_EVENT_KINDS, type ExecutorPhase, type TaskFlowEvent } from './contracts.ts'
 import { RUN_STATUSES, canTransition, type RunStatus } from './state.ts'
 
 /** One recorded transition inside a run aggregate. */
@@ -49,9 +50,37 @@ export interface RunAggregate {
   baseSha?: string
   /** P5: true while a success report is committing/merging Git side effects. */
   merging?: boolean
+  /** P8.1: durable automation/control metadata. */
+  control?: RunControl
+  /** P8.1: run-scoped Git isolation metadata. */
+  runGit?: RunGitIsolation
+  /** P8.1: whitelisted event log (bounded, newest last). */
+  events?: TaskFlowEvent[]
   /** Append-only; `transitions[transitions.length - 1].to` equals `status`. */
   transitions: RunTransition[]
 }
+
+/** P8.1 persistent automation/control state for one run. */
+export interface RunControl {
+  automation: {
+    enabled: boolean
+    mode: 'manual' | 'automatic'
+  }
+  paused: boolean
+  takenOver: boolean
+  retryCount: number
+}
+
+/** P8.1 run-scoped Git isolation metadata. */
+export interface RunGitIsolation {
+  /** Run-specific integration branch; issue worktrees merge here. */
+  integrationBranch: string
+  /** Optional run-level worktree path (reserved for run-level isolation). */
+  workDir?: string
+  /** Optional run-level branch name (reserved for run-level isolation). */
+  branch?: string
+}
+
 
 /** One issue's execution state inside a run. */
 export interface IssueExecution {
@@ -67,6 +96,12 @@ export interface IssueExecution {
   workDir?: string
   /** P5: per-issue branch created for the worktree. */
   branch?: string
+  /** P8.1: monotonic automated-executor attempt id for this issue. */
+  attemptId?: string
+  /** P8.1: coarse automated-executor phase (persisted progress). */
+  phase?: ExecutorPhase
+  /** P8.1: last progress heartbeat timestamp. */
+  heartbeatAt?: number
 }
 
 /** P4 review verdict. */
@@ -108,6 +143,9 @@ const issueExecutionSchema = z.object({
   error: z.string().optional(),
   workDir: z.string().optional(),
   branch: z.string().optional(),
+  attemptId: z.string().optional(),
+  phase: z.enum(EXECUTOR_PHASES).optional(),
+  heartbeatAt: z.number().optional(),
 })
 
 const reviewSchema = z.object({
@@ -115,6 +153,33 @@ const reviewSchema = z.object({
   summary: z.string(),
   reworkKeys: z.array(z.string()).default([]),
   at: z.number(),
+})
+
+const taskFlowEventSchema = z.object({
+  seq: z.number().int().min(0),
+  at: z.number(),
+  runId: z.string(),
+  kind: z.enum(TASKFLOW_EVENT_KINDS),
+  issueKey: z.string().optional(),
+  attemptId: z.string().optional(),
+  phase: z.enum(EXECUTOR_PHASES).optional(),
+  summary: z.string().optional(),
+})
+
+const runControlSchema = z.object({
+  automation: z.object({
+    enabled: z.boolean(),
+    mode: z.enum(['manual', 'automatic']),
+  }),
+  paused: z.boolean(),
+  takenOver: z.boolean(),
+  retryCount: z.number().int().min(0),
+})
+
+const runGitIsolationSchema = z.object({
+  integrationBranch: z.string().min(1),
+  workDir: z.string().optional(),
+  branch: z.string().optional(),
 })
 
 const runAggregateSchema = z.object({
@@ -131,6 +196,9 @@ const runAggregateSchema = z.object({
   review: reviewSchema.optional(),
   baseSha: z.string().optional(),
   merging: z.boolean().optional(),
+  control: runControlSchema.optional(),
+  runGit: runGitIsolationSchema.optional(),
+  events: z.array(taskFlowEventSchema).default([]),
   transitions: z.array(transitionSchema),
 }).superRefine((run, ctx) => {
   // Aggregate history consistency: this runs at every domain open (the

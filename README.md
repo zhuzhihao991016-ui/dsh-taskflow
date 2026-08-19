@@ -4,7 +4,7 @@ DSH 全自动任务工作流插件：任务提出后由 Codex CLI 规划拆分�
 
 ## 状态
 
-**P8.0（当前）**：契约冻结与安全基线——定义自动化 Executor v2、控制动作、事件/详情/配置契约；默认 `automationEnabled=false`，P7 显式驱动模式不变。
+**P8.2（当前）**：内置 Codex Issue Executor——自动化开启时，每个 Issue 在独立 worktree 中由 `codex exec --sandbox workspace-write` 非交互实现，携带 attemptId 与进度回调，并接入服务执行循环。
 
 已完成：
 
@@ -18,10 +18,12 @@ DSH 全自动任务工作流插件：任务提出后由 Codex CLI 规划拆分�
 - **P6**：Board/迁移——`/plugins/taskflow/board` 只读看板快照、纯函数 `buildBoard`、浏览器看板弹层（点击状态卡片打开，五列卡片随状态自动迁移）。
 - **P7**：人工验收门/收口——`/plugins/taskflow/human-decision` 支持 `accept|rework`；`accept` 进入 `ACCEPTED` 终态，`rework` 回到 `PLANNING` 并清空执行记录；补齐服务、路由与 HTTP 契约测试。
 - **P8.0**：契约冻结——新增 `src/contracts.ts` 定义 Executor v2、控制动作、事件/详情/配置契约；`Config` 增加自动化配置项并默认关闭；补充契约测试。
+- **P8.1**：持久控制元数据与 Run 级 Git 隔离——`RunAggregate` 增加 `control`/`runGit`/`events` 与 Issue 进度元数据；服务提供 `runDetail`、`recordProgress`、pause/resume/takeover/release/retry；每次执行持久化运行级集成分支 `taskflow/integration/<runId>` 并在 rework 时清理。
+- **P8.2**：内置 Codex Issue Executor——新增 `src/issue-executor.ts`，以 `gpt-5.6-sol`、`workspace-write`、`--ask-for-approval never` 和严格输出 Schema 驱动 `codex exec` 实现单个 Issue；服务将 attemptId、进度事件与自动化结果接入执行循环。
 
-当前版本 HEAD：`f93ed25`，测试套件 164 项（typecheck + vitest + build 通过）。
+当前版本 HEAD：`bedc853`，测试套件 192 项（typecheck + vitest + build 通过）。
 
-后续阶段：P8.1 持久控制元数据与 Run 级 Git 隔离。
+后续阶段：P8.3 自动推进协调器（autoPlan/autoReview/SSE 与人工介入窗口）。
 
 ## HTTP 路由
 
@@ -29,11 +31,13 @@ DSH 全自动任务工作流插件：任务提出后由 Codex CLI 规划拆分�
 | --- | --- | --- |
 | GET | `/plugins/taskflow/state` | 运行台账快照 |
 | GET | `/plugins/taskflow/board` | P6 看板快照（待办/进行中/待审查/已完成/失败） |
+| GET | `/plugins/taskflow/run` | P8.1 运行详情投影（automation/currentIssue/allowedActions/recentEvents） |
 | POST | `/plugins/taskflow/submit` | 创建任务 Run |
-| POST | `/plugins/taskflow/command` | 执行命令（当前支持 cancel） |
+| POST | `/plugins/taskflow/command` | 控制命令（cancel/pause/resume/takeover/release/retry） |
 | POST | `/plugins/taskflow/plan` | 触发 Codex 规划 |
 | POST | `/plugins/taskflow/execute` | 启动/继续执行，认领可调度 Issues（最多 maxConcurrent） |
 | POST | `/plugins/taskflow/exec-result` | 上报当前 Issue 执行结果 |
+| POST | `/plugins/taskflow/progress` | P8.1 上报自动化执行进度（attempt/phase/heartbeat） |
 | POST | `/plugins/taskflow/review` | 触发 P4 Codex 只读审查（PASS/REVISE） |
 | POST | `/plugins/taskflow/human-decision` | P7 最终人工验收（`accept` 通过 / `rework` 打回重新规划） |
 
@@ -53,7 +57,7 @@ dsh plugin --profile web add <本仓库路径>
 ## 目录结构
 
 - `src/index.ts` — 宿主入口：服务装配、system prompt 段、HTTP 路由（webServer 存在时经嵌套 inject 注册）
-- `src/service.ts` — TaskFlowService：submit/snapshot/list/command/subscribe、plan、startExecution/reportResult、startReview/decideHuman、board（P6 看板投影 / P7 人工验收门）
+- `src/service.ts` — TaskFlowService：submit/snapshot/list/command/subscribe、plan、startExecution/reportResult、startReview/decideHuman、board、runDetail、recordProgress（P6 看板 / P7 人工验收 / P8.1 控制元数据）
 - `src/domain.ts` / `src/repository.ts` — storage-domain 持久化聚合与原子读写
 - `src/state.ts` — Run 状态机与合法迁移表
 - `src/dag.ts` — Issue 计划校验与依赖拓扑排序
@@ -61,6 +65,7 @@ dsh plugin --profile web add <本仓库路径>
 - `src/reviewer.ts` — Codex CLI 只读审查执行器（PASS/REVISE）
 - `src/worktree.ts` — Git worktree 管理（建分支/合并/清理）
 - `src/executor.ts` — 执行器接口（agent 驱动 / 自动化双模式）
+- `src/issue-executor.ts` — P8.2 内置 Codex Issue Executor（workspace-write 单 Issue 实现）
 - `src/contracts.ts` — P8 契约冻结（Executor v2、控制动作、事件/详情/配置）
 - `src/client/` — 浏览器半体：`conversation.input.dock` 状态卡片（只读投影）
 - `build/` — 自 DSH checkout 拷贝的 client bundle 预设（保持与运行版本同步）
@@ -70,7 +75,7 @@ dsh plugin --profile web add <本仓库路径>
 
 ### What the model sees
 
-当前注入一段 `plugin:taskflow` 通告（order 200），声明插件存在、能力、HTTP 路由与当前 P8.0 阶段能力，模型可据此配合提交、规划、并行执行、结果上报、触发审查、人工验收与查看看板；自动化契约已冻结但默认关闭。
+当前注入一段 `plugin:taskflow` 通告（order 200），声明插件存在、能力、HTTP 路由与当前 P8.2 阶段能力，模型可据此配合提交、规划、并行执行、结果上报、触发审查、人工验收、查看看板与运行详情；自动化开启时已内置 Codex Issue Executor。
 
 ### Token effect
 
@@ -78,7 +83,7 @@ dsh plugin --profile web add <本仓库路径>
 
 ## Known Limitations and Deferred Work
 
-- P8 自动化默认关闭（`automationEnabled=false`），尚未实现内置 Codex Issue Executor、自动推进协调器、SSE 与人工介入窗口。
+- P8 自动化默认关闭（`automationEnabled=false`）；已实现内置 Codex Issue Executor，但自动推进协调器、SSE 与人工介入窗口仍待后续阶段。
 - P4 审查门为显式触发（`/plugins/taskflow/review`），不会在进入 `INTEGRATION_REVIEW` 后自动启动。
 - P7 人工验收门为显式触发（`/plugins/taskflow/human-decision`），不会在 `AWAITING_HUMAN` 后自动验收。
 - P5 并行执行默认 `maxConcurrent=1`，需通过插件配置调大；worktree 合并采用非快进合并，冲突会导致对应 Issue 失败。
