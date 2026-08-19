@@ -20,6 +20,7 @@ describe('P8.0 automation config contract', () => {
     expect(parsed.autoReview).toBe(true)
     expect(parsed.maxExecutorProcesses).toBe(DEFAULT_AUTOMATION_CONFIG.maxExecutorProcesses)
     expect(parsed.maxReviewCycles).toBe(DEFAULT_AUTOMATION_CONFIG.maxReviewCycles)
+    expect(parsed.requireExecutionPermission).toBe(DEFAULT_AUTOMATION_CONFIG.requireExecutionPermission)
     // Existing P7 fields remain intact.
     expect(parsed.maxConcurrent).toBe(1)
     expect(parsed.integrationBranch).toBe('taskflow/integration')
@@ -32,12 +33,14 @@ describe('P8.0 automation config contract', () => {
       maxExecutorProcesses: 4,
       maxReviewCycles: 5,
       autoReview: false,
+      requireExecutionPermission: true,
     })
     expect(parsed).toMatchObject({
       automationEnabled: true,
       maxExecutorProcesses: 4,
       maxReviewCycles: 5,
       autoReview: false,
+      requireExecutionPermission: true,
     })
   })
 })

@@ -46,6 +46,7 @@ describe('RUN_TRANSITIONS', () => {
 
   it('allows waiting and pause states only from active states', () => {
     expect(canTransition('EXECUTING', 'WAITING_PERMISSION')).toBe(true)
+    expect(canTransition('READY', 'WAITING_PERMISSION')).toBe(true)
     expect(canTransition('EXECUTING', 'WAITING_DECISION')).toBe(true)
     expect(canTransition('EXECUTING', 'PAUSED')).toBe(true)
     expect(canTransition('WAITING_PERMISSION', 'EXECUTING')).toBe(true)

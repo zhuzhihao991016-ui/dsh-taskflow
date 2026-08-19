@@ -199,6 +199,8 @@ export interface TaskFlowOptions {
   autoReview?: boolean
   /** P8.3: maximum automatic review/rework cycles before asking a human. */
   maxReviewCycles?: number
+  /** P8.4: wait for human release before automatic execution starts. */
+  requireExecutionPermission?: boolean
 }
 
 /** Validate a submit request; throws a stable `taskflow:` error on violation. */
@@ -272,6 +274,8 @@ export class TaskFlowService {
   private readonly autoReview: boolean
   private readonly maxReviewCycles: number
 
+  private readonly requireExecutionPermission: boolean
+
   constructor(
     private readonly repository: TaskFlowRepository,
     private readonly now: () => number = Date.now,
@@ -294,6 +298,7 @@ export class TaskFlowService {
     this.autoPlan = options.autoPlan ?? DEFAULT_AUTOMATION_CONFIG.autoPlan
     this.autoReview = options.autoReview ?? DEFAULT_AUTOMATION_CONFIG.autoReview
     this.maxReviewCycles = Math.max(1, Math.floor(options.maxReviewCycles ?? DEFAULT_AUTOMATION_CONFIG.maxReviewCycles))
+    this.requireExecutionPermission = options.requireExecutionPermission ?? DEFAULT_AUTOMATION_CONFIG.requireExecutionPermission
   }
 
   /** Submit a new workflow run; returns its RECEIVED snapshot. An explicit
@@ -1648,7 +1653,11 @@ export class TaskFlowService {
       })
       this.notify()
       if (this.automationEnabled && this.executor !== undefined && this.repository.getRun(runId)?.status === 'READY') {
-        void this.startExecution(runId).catch(() => undefined)
+        if (this.requireExecutionPermission) {
+          await this.transitionTo(runId, 'WAITING_PERMISSION', 'waiting-permission', `permission:wait:${runId}`)
+        } else {
+          void this.startExecution(runId).catch(() => undefined)
+        }
       }
     } catch (error) {
       const message = error instanceof PlannerError

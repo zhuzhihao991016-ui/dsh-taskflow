@@ -133,6 +133,8 @@ export interface AutomationConfig {
   autoReview: boolean
   maxExecutorProcesses: number
   maxReviewCycles: number
+  /** P8.4: when true, automatic execution waits in WAITING_PERMISSION until a human releases it. */
+  requireExecutionPermission: boolean
 }
 
 /** P8 default automation configuration (feature-flagged off until P8.6). */
@@ -142,6 +144,7 @@ export const DEFAULT_AUTOMATION_CONFIG: AutomationConfig = {
   autoReview: true,
   maxExecutorProcesses: 2,
   maxReviewCycles: 3,
+  requireExecutionPermission: false,
 }
 
 /** Re-export the base executor result for contract consumers. */
