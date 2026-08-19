@@ -16,6 +16,7 @@ import type {} from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-storage-domain'
 import { TASKFLOW_DOMAIN } from './domain.ts'
+import { DEFAULT_AUTOMATION_CONFIG } from './contracts.ts'
 import type { ExecutionResult } from './executor.ts'
 import { CodexPlanner } from './planner.ts'
 import { DomainRepository } from './repository.ts'
@@ -28,7 +29,7 @@ const SECTION_ORDER = 200
 export const inject = ['systemPrompt', 'storageDomain']
 
 /** Model-facing announcement: plugin presence, capabilities, and limits. */
-export const TASKFLOW_GUIDANCE = '本机已安装 dsh-taskflow 插件（DSH 全自动任务工作流编排）：任务提出后由 Codex CLI 规划拆分为 Issue 并发布看板，DSH 认领执行（串行/并行 + Git worktree 隔离），Codex 只读审查决定打回或通过，按依赖序推进，最终人工验收。当前为 P7 阶段：运行台账已持久化，Codex 规划引擎已接入（提交时带 repoRoot 后经 /plugins/taskflow/plan 触发规划，规划通过后运行进入 READY 并携带 Issue 清单）；执行引擎已启用（经 /plugins/taskflow/execute 启动执行，READY → EXECUTING，按 DAG 依赖每次认领最多 maxConcurrent 个可调度 Issue，响应含 currentIssues；每个 Issue 在独立 Git worktree 中执行，workDir/branch 可从 state/execute 响应读取；完成 currentIssue 后经 /plugins/taskflow/exec-result 上报 { runId, issueKey, ok, summary|error }，成功后自动合并到集成分支，全部完成后运行自动进入 INTEGRATION_REVIEW）；P4 审查门已启用（经 /plugins/taskflow/review 触发 Codex 只读审查，PASS 进入 AWAITING_HUMAN 等待人工验收，REVISE 打回 EXECUTING 并重置返工 Issue）；P6 看板已启用（GET /plugins/taskflow/board 返回五列看板快照，浏览器端状态卡片可打开看板）；P7 人工验收门已启用（POST /plugins/taskflow/human-decision 提交 { runId, decision: accept|rework }，accept 进入 ACCEPTED 终态，rework 回到 PLANNING 重新规划）。用户提到「工作流 / 任务流 / taskflow」时即指本插件，请据此协作。'
+export const TASKFLOW_GUIDANCE = '本机已安装 dsh-taskflow 插件（DSH 全自动任务工作流编排）：任务提出后由 Codex CLI 规划拆分为 Issue 并发布看板，DSH 认领执行（串行/并行 + Git worktree 隔离），Codex 只读审查决定打回或通过，按依赖序推进，最终人工验收。当前为 P8.0 阶段：运行台账已持久化，Codex 规划引擎已接入（提交时带 repoRoot 后经 /plugins/taskflow/plan 触发规划，规划通过后运行进入 READY 并携带 Issue 清单）；执行引擎已启用（经 /plugins/taskflow/execute 启动执行，READY → EXECUTING，按 DAG 依赖每次认领最多 maxConcurrent 个可调度 Issue，响应含 currentIssues；每个 Issue 在独立 Git worktree 中执行，workDir/branch 可从 state/execute 响应读取；完成 currentIssue 后经 /plugins/taskflow/exec-result 上报 { runId, issueKey, ok, summary|error }，成功后自动合并到集成分支，全部完成后运行自动进入 INTEGRATION_REVIEW）；P4 审查门已启用（经 /plugins/taskflow/review 触发 Codex 只读审查，PASS 进入 AWAITING_HUMAN 等待人工验收，REVISE 打回 EXECUTING 并重置返工 Issue）；P6 看板已启用（GET /plugins/taskflow/board 返回五列看板快照，浏览器端状态卡片可打开看板）；P7 人工验收门已启用（POST /plugins/taskflow/human-decision 提交 { runId, decision: accept|rework }，accept 进入 ACCEPTED 终态，rework 回到 PLANNING 重新规划）；P8 自动化契约已冻结但默认关闭（automationEnabled=false）。用户提到「工作流 / 任务流 / taskflow」时即指本插件，请据此协作。'
 
 /** Plugin config; schema defaults are applied by the loader. */
 export interface Config {
@@ -46,6 +47,16 @@ export interface Config {
   integrationBranch?: string
   /** P5: directory under the repo root that holds per-issue worktrees. */
   worktreesRoot?: string
+  /** P8: master switch for the automated executor/automation; default off. */
+  automationEnabled?: boolean
+  /** P8: when automation is enabled, automatically start planning. */
+  autoPlan?: boolean
+  /** P8: when automation is enabled, automatically trigger Codex review. */
+  autoReview?: boolean
+  /** P8: global cap on concurrent Codex executor processes. */
+  maxExecutorProcesses?: number
+  /** P8: max review/rework cycles before asking a human. */
+  maxReviewCycles?: number
 }
 
 export const Config: z<Config> = z.object({
@@ -56,6 +67,11 @@ export const Config: z<Config> = z.object({
   maxConcurrent: z.number().step(1).min(1).default(1),
   integrationBranch: z.string().default('taskflow/integration'),
   worktreesRoot: z.string().default('.taskflow/worktrees'),
+  automationEnabled: z.boolean().default(DEFAULT_AUTOMATION_CONFIG.enabled),
+  autoPlan: z.boolean().default(DEFAULT_AUTOMATION_CONFIG.autoPlan),
+  autoReview: z.boolean().default(DEFAULT_AUTOMATION_CONFIG.autoReview),
+  maxExecutorProcesses: z.number().step(1).min(1).default(DEFAULT_AUTOMATION_CONFIG.maxExecutorProcesses),
+  maxReviewCycles: z.number().step(1).min(1).default(DEFAULT_AUTOMATION_CONFIG.maxReviewCycles),
 })
 
 /** JSON response writer (same-origin routes; no secrets ever enter bodies). */
