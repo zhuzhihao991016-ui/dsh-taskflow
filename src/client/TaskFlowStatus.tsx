@@ -104,6 +104,21 @@ const ACTION_LABELS: Record<string, string> = {
   rework: '打回',
 }
 
+/** SSE event names emitted by the host; EventSource dispatches these as
+ * named events rather than firing `onmessage`. */
+const SSE_EVENT_KINDS = [
+  'run.updated',
+  'issue.started',
+  'issue.progress',
+  'issue.finished',
+  'issue.failed',
+  'review.started',
+  'review.finished',
+  'human.decision',
+  'automation.paused',
+  'automation.resumed',
+] as const
+
 /** Poll interval for the host snapshot. */
 const POLL_MS = 30_000
 
@@ -158,7 +173,9 @@ function useSseRefresh(onEvent: () => void): void {
   useEffect(() => {
     if (typeof EventSource === 'undefined') return
     const source = new EventSource('/plugins/taskflow/events')
-    source.onmessage = () => onEvent()
+    const handler = (): void => onEvent()
+    for (const kind of SSE_EVENT_KINDS) source.addEventListener(kind, handler)
+    source.onmessage = handler
     source.onerror = () => { source.close() }
     return () => { source.close() }
   }, [onEvent])
@@ -170,7 +187,9 @@ function useRunSse(runId: string | null, onEvent: () => void): void {
   useEffect(() => {
     if (runId === null || typeof EventSource === 'undefined') return
     const source = new EventSource(`/plugins/taskflow/events?runId=${encodeURIComponent(runId)}`)
-    source.onmessage = () => onEvent()
+    const handler = (): void => onEvent()
+    for (const kind of SSE_EVENT_KINDS) source.addEventListener(kind, handler)
+    source.onmessage = handler
     source.onerror = () => { source.close() }
     return () => { source.close() }
   }, [runId, onEvent])

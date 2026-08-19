@@ -275,6 +275,12 @@ export class TaskFlowService {
   private readonly maxReviewCycles: number
 
   private readonly requireExecutionPermission: boolean
+  private readonly maxExecutorProcesses: number
+  /** Active automated-executor AbortControllers per run (for pause/cancel/takeover). */
+  private readonly activeExecutions = new Map<string, Set<AbortController>>()
+  /** Global automated-executor concurrency semaphore state. */
+  private executorActive = 0
+  private readonly executorWaiters: Array<() => void> = []
 
   constructor(
     private readonly repository: TaskFlowRepository,
@@ -299,6 +305,7 @@ export class TaskFlowService {
     this.autoReview = options.autoReview ?? DEFAULT_AUTOMATION_CONFIG.autoReview
     this.maxReviewCycles = Math.max(1, Math.floor(options.maxReviewCycles ?? DEFAULT_AUTOMATION_CONFIG.maxReviewCycles))
     this.requireExecutionPermission = options.requireExecutionPermission ?? DEFAULT_AUTOMATION_CONFIG.requireExecutionPermission
+    this.maxExecutorProcesses = Math.max(1, Math.floor(options.maxExecutorProcesses ?? DEFAULT_AUTOMATION_CONFIG.maxExecutorProcesses))
   }
 
   /** Submit a new workflow run; returns its RECEIVED snapshot. An explicit
@@ -360,7 +367,7 @@ export class TaskFlowService {
       runAggregateSchema.parse(aggregate)
       await this.repository.insertRun(aggregate)
       this.notify()
-      if (this.automationEnabled && this.autoPlan && normalizedRepoRoot !== undefined) {
+      if (this.automationEnabled && this.autoPlan && this.isRunAutomationEnabled(aggregate) && normalizedRepoRoot !== undefined) {
         void this.plan(id).catch(() => undefined)
       }
       return this.snapshotOf(aggregate)
@@ -510,6 +517,9 @@ export class TaskFlowService {
       return { ok: false, error: `taskflow: unknown run ${runId}` }
     }
     try {
+      if (action === 'cancel' || action === 'pause' || action === 'takeover') {
+        this.abortRunExecutions(runId)
+      }
       const updated = await this.repository.updateRun(runId, (current) => {
         if (current.merging === true) {
           throw new Error('taskflow: cannot control while a merge is in progress')
@@ -556,6 +566,9 @@ export class TaskFlowService {
             assertTransition(current.status, 'PAUSED')
             return transitionTo('PAUSED', 'paused', `command:pause:${runId}:${current.transitions.length}`, {
               control: { ...control, paused: true },
+              executions: (current.executions ?? []).map((execution) => (
+                execution.status === 'running' ? { ...execution, status: 'pending' as const } : execution
+              )),
               events: append('automation.paused', { summary: 'paused' }),
             })
           case 'resume':
@@ -568,6 +581,9 @@ export class TaskFlowService {
             assertTransition(current.status, 'WAITING_PERMISSION')
             return transitionTo('WAITING_PERMISSION', 'takeover', `command:takeover:${runId}:${current.transitions.length}`, {
               control: { ...control, takenOver: true },
+              executions: (current.executions ?? []).map((execution) => (
+                execution.status === 'running' ? { ...execution, status: 'pending' as const } : execution
+              )),
               events: append('run.updated', { summary: 'takeover' }),
             })
           case 'release':
@@ -577,19 +593,28 @@ export class TaskFlowService {
               events: append('run.updated', { summary: 'release' }),
             })
           case 'retry': {
-            if (current.status !== 'EXECUTING') {
-              throw new Error(`taskflow: retry requires EXECUTING, got ${current.status}`)
+            if (current.status !== 'EXECUTING' && current.status !== 'FAILED') {
+              throw new Error(`taskflow: retry requires EXECUTING or FAILED, got ${current.status}`)
             }
             const hasFailed = (current.executions ?? []).some((execution) => execution.status === 'failed')
             if (!hasFailed) {
               throw new Error('taskflow: retry requires at least one failed issue')
             }
+            const executions = (current.executions ?? []).map((execution) => (
+              execution.status === 'failed' ? { ...execution, status: 'pending' as const } : execution
+            ))
+            if (current.status === 'FAILED') {
+              assertTransition(current.status, 'EXECUTING')
+              return transitionTo('EXECUTING', 'retry', `command:retry:${runId}:${current.transitions.length}`, {
+                control: { ...control, retryCount: control.retryCount + 1 },
+                executions,
+                events: append('run.updated', { summary: 'retry' }),
+              })
+            }
             const next: RunAggregate = {
               ...current,
               control: { ...control, retryCount: control.retryCount + 1 },
-              executions: (current.executions ?? []).map((execution) => (
-                execution.status === 'failed' ? { ...execution, status: 'pending' as const } : execution
-              )),
+              executions,
               events: append('run.updated', { summary: 'retry' }),
               updatedAt: now,
             }
@@ -599,7 +624,7 @@ export class TaskFlowService {
         }
       })
       this.notify()
-      if ((action === 'resume' || action === 'release') && updated.status === 'EXECUTING' && this.automationEnabled && this.executor !== undefined) {
+      if ((action === 'resume' || action === 'release') && updated.status === 'EXECUTING' && this.automationEnabled && this.executor !== undefined && this.isRunAutomationEnabled(updated)) {
         void this.startExecution(runId).catch(() => undefined)
       }
       return { ok: true }
@@ -626,7 +651,8 @@ export class TaskFlowService {
     if (decision !== 'accept' && decision !== 'rework') {
       return { ok: false, error: `taskflow: unsupported human decision '${String(decision)}'` }
     }
-    if (this.repository.getRun(runId) === undefined) {
+    const existingRun = this.repository.getRun(runId)
+    if (existingRun === undefined) {
       return { ok: false, error: `taskflow: unknown run ${runId}` }
     }
     try {
@@ -663,7 +689,15 @@ export class TaskFlowService {
         return next
       })
       this.notify()
-      if (this.automationEnabled && this.autoPlan && decision === 'rework' && updated.status === 'PLANNING') {
+      if (decision === 'rework' && existingRun.repoRoot !== undefined && existingRun.runGit?.integrationBranch !== undefined) {
+        // Drop the previous run-scoped integration branch so the next cycle
+        // starts from a clean baseline instead of reusing stale commits.
+        await this.worktrees.removeIntegrationBranch(
+          existingRun.repoRoot,
+          existingRun.runGit.integrationBranch,
+        ).catch(() => undefined)
+      }
+      if (this.automationEnabled && this.autoPlan && decision === 'rework' && updated.status === 'PLANNING' && this.isRunAutomationEnabled(updated)) {
         void this.plan(runId).catch(() => undefined)
       }
       return { ok: true, runId, status: updated.status }
@@ -1041,6 +1075,7 @@ export class TaskFlowService {
           branch,
           `taskflow ${runId} ${issueKey}`,
           run.runGit?.integrationBranch ?? this.integrationBranch,
+          run.baseSha,
         ))
       } catch (error) {
         effectiveResult = { ok: false, error: `worktree merge failed: ${(error as Error).message}` }
@@ -1119,7 +1154,8 @@ export class TaskFlowService {
         return next
       })
       this.notify()
-      if (effectiveResult.ok && this.automationEnabled && this.autoReview && this.repository.getRun(runId)?.status === 'INTEGRATION_REVIEW') {
+      const runAfter = this.repository.getRun(runId)
+      if (effectiveResult.ok && this.automationEnabled && this.autoReview && runAfter?.status === 'INTEGRATION_REVIEW' && this.isRunAutomationEnabled(runAfter)) {
         void this.startReview(runId).catch(() => undefined)
       }
       if (effectiveResult.ok && run.repoRoot !== undefined && running.workDir !== undefined && running.branch !== undefined) {
@@ -1143,10 +1179,32 @@ export class TaskFlowService {
    * issue is claimed (agent-driven mode). */
   resumeExecution(): void {
     for (const run of this.repository.listRuns()) {
-      if (run.status === 'EXECUTING') {
-        void this.resetStuckExecutions(run.id)
-          .then(() => this.startExecution(run.id))
-          .catch(() => undefined)
+      if (run.status !== 'EXECUTING') continue
+      const automatic = this.automationEnabled && this.executor !== undefined && this.isRunAutomationEnabled(run)
+      const manualResume = !this.automationEnabled || this.executor === undefined
+      if (!automatic && !manualResume) continue
+      void this.resetStuckExecutions(run.id)
+        .then(() => {
+          if (automatic || manualResume) return this.startExecution(run.id)
+        })
+        .catch(() => undefined)
+    }
+  }
+
+  /** Resume automatic READY and INTEGRATION_REVIEW flows that were persisted
+   * before a host restart. Only run-level automatic runs are touched, so a
+   * manually created/legacy run is never auto-taken-over during gray rollout. */
+  resumeAutomation(): void {
+    for (const run of this.repository.listRuns()) {
+      if (!this.automationEnabled || this.executor === undefined || !this.isRunAutomationEnabled(run)) continue
+      if (run.status === 'READY') {
+        if (this.requireExecutionPermission) {
+          void this.transitionTo(run.id, 'WAITING_PERMISSION', 'waiting-permission', `permission:resume:${run.id}`).catch(() => undefined)
+        } else {
+          void this.startExecution(run.id).catch(() => undefined)
+        }
+      } else if (run.status === 'INTEGRATION_REVIEW' && this.autoReview) {
+        void this.startReview(run.id).catch(() => undefined)
       }
     }
   }
@@ -1272,6 +1330,7 @@ export class TaskFlowService {
           runId,
           claim.key,
           run.runGit?.integrationBranch ?? this.integrationBranch,
+          run.baseSha,
         )
         await this.repository.updateRun(runId, (current) => {
           const executions = current.executions ?? []
@@ -1386,6 +1445,7 @@ export class TaskFlowService {
     }).catch(() => undefined)
 
     const controller = new AbortController()
+    this.registerActiveExecution(runId, controller)
     const input: AutomatedExecutionInput = {
       runId,
       issue: claim.issue,
@@ -1402,11 +1462,15 @@ export class TaskFlowService {
         })
       },
     }
-    const raw = await executor.execute(input as never)
-    if (this.isAutomatedResult(raw) && raw.attemptId !== attemptId) {
-      return { ok: false, error: `stale executor result for ${claim.key}: expected ${attemptId}, got ${raw.attemptId}` }
+    try {
+      const raw = await this.withExecutorSlot(() => executor.execute(input as never))
+      if (this.isAutomatedResult(raw) && raw.attemptId !== attemptId) {
+        return { ok: false, error: `stale executor result for ${claim.key}: expected ${attemptId}, got ${raw.attemptId}` }
+      }
+      return this.normalizeExecutorResult(raw)
+    } finally {
+      this.unregisterActiveExecution(runId, controller)
     }
-    return this.normalizeExecutorResult(raw)
   }
 
   private isAutomatedResult(result: ExecutionResult | AutomatedExecutionResult): result is AutomatedExecutionResult {
@@ -1504,7 +1568,8 @@ export class TaskFlowService {
         })
       })
       this.notify()
-      if (this.automationEnabled && this.executor !== undefined && this.repository.getRun(runId)?.status === 'EXECUTING') {
+      const runAfterReview = this.repository.getRun(runId)
+      if (this.automationEnabled && this.executor !== undefined && runAfterReview?.status === 'EXECUTING' && this.isRunAutomationEnabled(runAfterReview)) {
         void this.startExecution(runId).catch(() => undefined)
       }
     } catch (error) {
@@ -1652,7 +1717,8 @@ export class TaskFlowService {
         })
       })
       this.notify()
-      if (this.automationEnabled && this.executor !== undefined && this.repository.getRun(runId)?.status === 'READY') {
+      const runAfterPlan = this.repository.getRun(runId)
+      if (this.automationEnabled && this.executor !== undefined && runAfterPlan?.status === 'READY' && this.isRunAutomationEnabled(runAfterPlan)) {
         if (this.requireExecutionPermission) {
           await this.transitionTo(runId, 'WAITING_PERMISSION', 'waiting-permission', `permission:wait:${runId}`)
         } else {
@@ -1718,8 +1784,59 @@ export class TaskFlowService {
         allowed.add('release')
         allowed.add('cancel')
         break
+      case 'FAILED':
+        if ((run.executions ?? []).some((execution) => execution.status === 'failed')) {
+          allowed.add('retry')
+        }
+        break
     }
     return Array.from(allowed)
+  }
+
+  /** P8.5: only run-level automatic runs may be picked up by the global
+   * automated coordinator. Old records missing control metadata fail closed. */
+  private isRunAutomationEnabled(run: RunAggregate): boolean {
+    return run.control?.automation.enabled === true
+  }
+
+  /** Register an in-flight automated executor so control actions can abort it. */
+  private registerActiveExecution(runId: string, controller: AbortController): void {
+    let set = this.activeExecutions.get(runId)
+    if (set === undefined) {
+      set = new Set()
+      this.activeExecutions.set(runId, set)
+    }
+    set.add(controller)
+  }
+
+  private unregisterActiveExecution(runId: string, controller: AbortController): void {
+    const set = this.activeExecutions.get(runId)
+    set?.delete(controller)
+    if (set?.size === 0) this.activeExecutions.delete(runId)
+  }
+
+  /** Abort every in-flight automated executor for one run. */
+  private abortRunExecutions(runId: string): void {
+    const set = this.activeExecutions.get(runId)
+    if (set === undefined) return
+    for (const controller of set) controller.abort()
+  }
+
+  /** Global semaphore enforcing `maxExecutorProcesses` across all runs. */
+  private async withExecutorSlot<T>(fn: () => Promise<T>): Promise<T> {
+    while (this.executorActive >= this.maxExecutorProcesses) {
+      await new Promise<void>((resolvePromise) => {
+        this.executorWaiters.push(resolvePromise)
+      })
+    }
+    this.executorActive += 1
+    try {
+      return await fn()
+    } finally {
+      this.executorActive -= 1
+      const next = this.executorWaiters.shift()
+      next?.()
+    }
   }
 
   private defaultControl(): RunControl {

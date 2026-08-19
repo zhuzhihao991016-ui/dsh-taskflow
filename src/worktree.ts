@@ -68,11 +68,13 @@ export class WorktreeManager {
     private readonly worktreesRoot = '.taskflow/worktrees',
   ) {}
 
-  /** Ensure the integration branch exists; create it from HEAD when missing. */
-  async ensureIntegrationBranch(repoRoot: string, branch: string): Promise<void> {
+  /** Ensure the integration branch exists; create it from baseSha (or HEAD)
+   * when missing so the review range stays pinned to the run's captured base. */
+  async ensureIntegrationBranch(repoRoot: string, branch: string, baseSha?: string): Promise<void> {
     const check = await this.git.run(['rev-parse', '--verify', `refs/heads/${branch}`], repoRoot)
     if (check.exitCode === 0) return
-    const create = await this.git.run(['branch', branch], repoRoot)
+    const args = baseSha === undefined ? ['branch', branch] : ['branch', branch, baseSha]
+    const create = await this.git.run(args, repoRoot)
     if (create.exitCode !== 0) {
       throw new WorktreeError(`ensure integration branch '${branch}' failed: ${create.stderr.trim()}`)
     }
@@ -84,8 +86,9 @@ export class WorktreeManager {
     runId: string,
     issueKey: string,
     integrationBranch: string,
+    baseSha?: string,
   ): Promise<{ workDir: string; branch: string }> {
-    await this.ensureIntegrationBranch(repoRoot, integrationBranch)
+    await this.ensureIntegrationBranch(repoRoot, integrationBranch, baseSha)
     const branch = `taskflow/${runId}/${issueKey}`
     const workDir = join(resolve(repoRoot), this.worktreesRoot, runId, issueKey)
     const add = await this.git.run(['worktree', 'add', '-b', branch, workDir, integrationBranch], repoRoot)
@@ -151,8 +154,9 @@ export class WorktreeManager {
     branch: string,
     message: string,
     integrationBranch: string,
+    baseSha?: string,
   ): Promise<void> {
-    await this.ensureIntegrationBranch(repoRoot, integrationBranch)
+    await this.ensureIntegrationBranch(repoRoot, integrationBranch, baseSha)
     const integrationWorktree = join(
       resolve(repoRoot),
       this.worktreesRoot,
@@ -183,5 +187,12 @@ export class WorktreeManager {
   async removeIssueWorktree(repoRoot: string, workDir: string, branch: string): Promise<void> {
     await this.git.run(['worktree', 'remove', '--force', workDir], repoRoot)
     await this.git.run(['branch', '-D', branch], repoRoot)
+  }
+
+  /** Remove a run-scoped integration branch (used on human rework so the next
+   * cycle starts from a clean baseline). Best-effort: a missing branch is not
+   * an error. */
+  async removeIntegrationBranch(repoRoot: string, branch: string): Promise<void> {
+    await this.git.run(['branch', '-D', branch], repoRoot).catch(() => undefined)
   }
 }

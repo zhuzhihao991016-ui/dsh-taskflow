@@ -7,7 +7,7 @@
  * the planner's Codex process spawner.
  */
 
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import type {
   AutomatedExecutionInput,
@@ -126,11 +126,11 @@ export class CodexIssueExecutor implements AutomatedExecutor {
 
   /** Implement one issue; never escapes the issue worktree (workspace-write sandbox). */
   async execute(input: AutomatedExecutionInput): Promise<AutomatedExecutionResult> {
-    const schemaPath = await writeIssueExecutionSchema(input.workDir)
-    const prompt = buildIssuePrompt(input)
-    // Canonicalize once: cwd and --cd share one absolute path so a relative
-    // workDir can never resolve as repo/repo.
+    // Canonicalize before writing the schema: cwd and --cd must share one
+    // absolute path so a relative workDir never resolves as repo/repo.
     const cwd = resolve(input.workDir)
+    const schemaPath = await writeIssueExecutionSchema(cwd)
+    const prompt = buildIssuePrompt(input)
     const command = [
       this.cliPath,
       'exec',
@@ -160,51 +160,60 @@ export class CodexIssueExecutor implements AutomatedExecutor {
         })
 
     let lastError: IssueExecutorError | undefined
-    for (let attempt = 0; attempt <= this.maxRetries; attempt += 1) {
-      input.onProgress?.({ phase: 'preparing', summary: `开始执行 ${input.issue.key}`, at: Date.now() })
-      input.onProgress?.({ phase: 'running', summary: `正在执行 ${input.issue.key}`, at: Date.now() })
-      const result = abortPromise === undefined
-        ? await this.executor.run({
-            command,
-            cwd,
-            stdinText: prompt,
-            timeoutMs: this.timeoutMs,
-          })
-        : await Promise.race([
-            this.executor.run({
+    try {
+      for (let attempt = 0; attempt <= this.maxRetries; attempt += 1) {
+        input.onProgress?.({ phase: 'preparing', summary: `开始执行 ${input.issue.key}`, at: Date.now() })
+        input.onProgress?.({ phase: 'running', summary: `正在执行 ${input.issue.key}`, at: Date.now() })
+        const result = abortPromise === undefined
+          ? await this.executor.run({
               command,
               cwd,
               stdinText: prompt,
               timeoutMs: this.timeoutMs,
-            }),
-            abortPromise,
-          ])
-      if (result.timedOut) {
-        lastError = new IssueExecutorError('timeout', `codex exec exceeded ${this.timeoutMs}ms`)
-        continue
-      }
-      if (result.exitCode !== 0) {
-        const detail = result.stderr.trim() || result.stdout.trim()
-        throw new IssueExecutorError('process-failed', `codex exec exited ${String(result.exitCode)}`, detail.slice(0, 2000))
-      }
-      const text = lastAssistantText(result.stdout)
-      if (text === undefined) {
-        throw new IssueExecutorError('no-execution-output', 'no assistant message in codex exec event stream')
-      }
-      try {
-        const result = this.normalizeResult(input, parseIssueResult(text))
-        if (result.ok) {
-          input.onProgress?.({ phase: 'done', summary: result.summary, at: Date.now() })
-        } else {
-          input.onProgress?.({ phase: 'failed', summary: result.error, at: Date.now() })
+              signal: input.signal,
+            })
+          : await Promise.race([
+              this.executor.run({
+                command,
+                cwd,
+                stdinText: prompt,
+                timeoutMs: this.timeoutMs,
+                signal: input.signal,
+              }),
+              abortPromise,
+            ])
+        if (result.timedOut) {
+          lastError = new IssueExecutorError('timeout', `codex exec exceeded ${this.timeoutMs}ms`)
+          continue
         }
-        return result
-      } catch (error) {
-        if (error instanceof IssueExecutorError) throw error
-        throw new IssueExecutorError('parse-failed', `executor output is not JSON: ${(error as Error).message}`)
+        if (result.exitCode !== 0) {
+          const detail = result.stderr.trim() || result.stdout.trim()
+          throw new IssueExecutorError('process-failed', `codex exec exited ${String(result.exitCode)}`, detail.slice(0, 2000))
+        }
+        const text = lastAssistantText(result.stdout)
+        if (text === undefined) {
+          throw new IssueExecutorError('no-execution-output', 'no assistant message in codex exec event stream')
+        }
+        try {
+          const result = this.normalizeResult(input, parseIssueResult(text))
+          if (result.ok) {
+            input.onProgress?.({ phase: 'done', summary: result.summary, at: Date.now() })
+          } else {
+            input.onProgress?.({ phase: 'failed', summary: result.error, at: Date.now() })
+          }
+          return result
+        } catch (error) {
+          if (error instanceof IssueExecutorError) throw error
+          throw new IssueExecutorError('parse-failed', `executor output is not JSON: ${(error as Error).message}`)
+        }
       }
+      throw lastError ?? new IssueExecutorError('process-failed', 'issue executor failed')
+    } finally {
+      // Never let the internal schema leak into the issue worktree / product
+      // repository. Removing it before reportResult prevents git add -A from
+      // committing an internal control file.
+      await rm(schemaPath, { force: true }).catch(() => undefined)
     }
-    throw lastError ?? new IssueExecutorError('process-failed', 'issue executor failed')
   }
 
   private normalizeResult(input: AutomatedExecutionInput, raw: unknown): AutomatedExecutionResult {

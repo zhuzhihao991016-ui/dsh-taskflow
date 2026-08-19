@@ -56,16 +56,20 @@ describe('RUN_TRANSITIONS', () => {
   })
 
   it('terminal statuses accept no outgoing transitions', () => {
-    for (const terminal of ['ACCEPTED', 'CANCELLED', 'FAILED'] as const) {
+    for (const terminal of ['ACCEPTED', 'CANCELLED'] as const) {
       expect(RUN_TRANSITIONS[terminal]).toEqual([])
     }
+  })
+
+  it('allows retry from FAILED back to EXECUTING', () => {
+    expect(canTransition('FAILED', 'EXECUTING')).toBe(true)
   })
 })
 
 describe('isTerminal', () => {
-  it('marks ACCEPTED, CANCELLED, FAILED terminal and everything else live', () => {
+  it('marks ACCEPTED and CANCELLED terminal and everything else live', () => {
     for (const status of RUN_STATUSES) {
-      expect(isTerminal(status)).toBe(status === 'ACCEPTED' || status === 'CANCELLED' || status === 'FAILED')
+      expect(isTerminal(status)).toBe(status === 'ACCEPTED' || status === 'CANCELLED')
     }
   })
 })

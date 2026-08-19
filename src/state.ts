@@ -23,7 +23,7 @@ export const RUN_STATUSES = [
 export type RunStatus = (typeof RUN_STATUSES)[number]
 
 /** Terminal statuses: no further transition is legal. */
-const TERMINAL: ReadonlySet<RunStatus> = new Set(['ACCEPTED', 'CANCELLED', 'FAILED'])
+const TERMINAL: ReadonlySet<RunStatus> = new Set(['ACCEPTED', 'CANCELLED'])
 
 /**
  * Legal transitions, one entry per source status. The table is the single
@@ -39,9 +39,9 @@ export const RUN_TRANSITIONS: Readonly<Record<RunStatus, readonly RunStatus[]>> 
   WAITING_DECISION: ['READY', 'EXECUTING', 'INTEGRATION_REVIEW', 'CANCELLED', 'FAILED'],
   PAUSED: ['EXECUTING', 'WAITING_PERMISSION', 'CANCELLED', 'FAILED'],
   AWAITING_HUMAN: ['ACCEPTED', 'PLANNING', 'CANCELLED'],
+  FAILED: ['EXECUTING'],
   ACCEPTED: [],
   CANCELLED: [],
-  FAILED: [],
 }
 
 /** Whether `from → to` is a legal transition. */

@@ -510,9 +510,10 @@ export function apply(ctx: Context, config?: Config): Promise<void> {
       }), 'dsh-taskflow: guidance section')
     }
 
-    // Resume any planning/execution flows persisted across a host restart.
+    // Resume any planning/execution/automation flows persisted across a host restart.
     service.resumePlanning()
     service.resumeExecution()
+    service.resumeAutomation()
 
     // Nested inject: routes only when the web server exists. Deliberately not
     // returned — an async inject callback's resolved value is collected as an

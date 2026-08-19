@@ -47,13 +47,14 @@ export interface ProcessExecutor {
     cwd: string
     stdinText: string
     timeoutMs: number
+    signal?: AbortSignal
   }): Promise<ProcessResult>
 }
 
 /**
  * Production executor: spawns the Codex CLI node entry with the given argv,
  * writes the prompt to stdin, collects stdout/stderr, and kills the process
- * (then waits for exit) on timeout.
+ * (then waits for exit) on timeout or abort signal.
  */
 export const spawnCodexProcess: ProcessExecutor = {
   async run(request) {
@@ -70,14 +71,26 @@ export const spawnCodexProcess: ProcessExecutor = {
         timedOut = true
         child.kill()
       }, request.timeoutMs)
+      const onAbort = (): void => {
+        child.kill()
+      }
+      if (request.signal?.aborted === true) {
+        child.kill()
+      } else {
+        request.signal?.addEventListener('abort', onAbort, { once: true })
+      }
+      const cleanup = (): void => {
+        clearTimeout(timer)
+        request.signal?.removeEventListener('abort', onAbort)
+      }
       child.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf8') })
       child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf8') })
       child.on('error', (error) => {
-        clearTimeout(timer)
+        cleanup()
         resolve({ exitCode: null, stdout, stderr: `${stderr}\n${error.message}`, timedOut })
       })
       child.on('close', (code) => {
-        clearTimeout(timer)
+        cleanup()
         resolve({ exitCode: code, stdout, stderr, timedOut })
       })
       child.stdin.write(request.stdinText)
