@@ -68,6 +68,34 @@ export interface IssueExecutionSnapshot {
   branch?: string
 }
 
+/** Board column identifiers; each maps to a kanban lane in the browser UI. */
+export type BoardColumnId = 'todo' | 'doing' | 'review' | 'done' | 'failed'
+
+/** One card on the taskflow board: a planned issue projected with its run context. */
+export interface BoardCard {
+  runId: string
+  runTitle: string
+  runStatus: RunStatus
+  issueKey: string
+  acceptance: string
+  deps: string[]
+  risk?: RiskLevel | null
+  status: 'pending' | 'running' | 'done' | 'failed'
+  summary?: string
+}
+
+/** One kanban column: a stable id, a user-facing title, and ordered cards. */
+export interface BoardColumn {
+  id: BoardColumnId
+  title: string
+  cards: BoardCard[]
+}
+
+/** Read-only board snapshot derived from the run ledger. */
+export interface BoardSnapshot {
+  columns: BoardColumn[]
+}
+
 /** A user-submitted workflow request. */
 export interface SubmitRequest {
   /** Non-empty workflow title. */
@@ -288,6 +316,11 @@ export class TaskFlowService {
     return this.repository.listRuns()
       .sort((a, b) => a.createdAt - b.createdAt)
       .map((run) => this.snapshotOf(run))
+  }
+
+  /** P6 board projection: the run ledger grouped into kanban columns. */
+  board(): BoardSnapshot {
+    return buildBoard(this.list())
   }
 
   /**
@@ -1239,6 +1272,60 @@ export class TaskFlowService {
       },
       baseSha: run.baseSha,
     }
+  }
+}
+
+/** P6 board column order and user-facing titles. */
+const BOARD_COLUMNS: readonly BoardColumnId[] = ['todo', 'doing', 'review', 'done', 'failed']
+
+const BOARD_COLUMN_TITLES: Record<BoardColumnId, string> = {
+  todo: '待办',
+  doing: '进行中',
+  review: '待审查',
+  done: '已完成',
+  failed: '失败',
+}
+
+/** Map one run/issue pair to its kanban column. */
+function boardColumnFor(run: RunSnapshot, execution: IssueExecutionSnapshot | undefined): BoardColumnId {
+  if (run.status === 'FAILED' || run.status === 'CANCELLED') {
+    return execution?.status === 'done' ? 'done' : 'failed'
+  }
+  if (execution === undefined || execution.status === 'pending') return 'todo'
+  if (execution.status === 'running') return 'doing'
+  if (execution.status === 'failed') return 'failed'
+  if (run.status === 'INTEGRATION_REVIEW' || run.status === 'AWAITING_HUMAN') return 'review'
+  return 'done'
+}
+
+/** Build the P6 board projection from run snapshots (pure, deterministic). */
+export function buildBoard(runs: readonly RunSnapshot[]): BoardSnapshot {
+  const cardsByColumn = new Map<BoardColumnId, BoardCard[]>(BOARD_COLUMNS.map((id) => [id, []]))
+  for (const run of runs) {
+    for (const issue of run.issues) {
+      const execution = run.executions.find((item) => item.key === issue.key)
+      const column = boardColumnFor(run, execution)
+      const cards = cardsByColumn.get(column)
+      if (cards === undefined) continue
+      cards.push({
+        runId: run.id,
+        runTitle: run.title,
+        runStatus: run.status,
+        issueKey: issue.key,
+        acceptance: issue.acceptance,
+        deps: [...issue.deps],
+        risk: issue.risk ?? null,
+        status: execution?.status ?? 'pending',
+        summary: execution?.summary,
+      })
+    }
+  }
+  return {
+    columns: BOARD_COLUMNS.map((id) => ({
+      id,
+      title: BOARD_COLUMN_TITLES[id],
+      cards: cardsByColumn.get(id) ?? [],
+    })),
   }
 }
 

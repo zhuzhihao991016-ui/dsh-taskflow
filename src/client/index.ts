@@ -1,9 +1,9 @@
 /**
  * dsh-taskflow browser half — registers a status chip into the input dock
  * band (`conversation.input.dock`, the same seat dsh-sentinel uses) that
- * polls the host's same-origin `/plugins/taskflow/state` endpoint and shows
- * how many workflow runs are active. P0 read-only projection: all writes go
- * through the host's controlled routes (submit/command).
+ * polls the host's same-origin `/plugins/taskflow/state` endpoint, shows how
+ * many workflow runs are active, and opens the P6 kanban board popover.
+ * Read-only projection: all writes go through the host's controlled routes.
  * @module dsh-taskflow/client
  */
 

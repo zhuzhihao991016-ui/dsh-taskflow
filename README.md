@@ -4,7 +4,7 @@ DSH 全自动任务工作流插件：任务提出后由 Codex CLI 规划拆分�
 
 ## 状态
 
-**P5（当前）**：已打通「提交任务 → Codex 规划拆分 Issue → DSH 按 DAG 并行认领执行（每个 Issue 独立 Git worktree）→ 成功后自动合并集成分支 → 全部完成进入集成审查 → Codex 只读审查（PASS 人工验收 / REVISE 返工）→ 人工验收」的主链路。
+**P6（当前）**：在看板投影与卡片迁移——服务端新增 `/plugins/taskflow/board` 只读看板快照（待办/进行中/待审查/已完成/失败五列），浏览器端把输入 dock 的状态卡片升级为可点击看板弹层，卡片随 Run/Issue 状态自动在列间迁移。
 
 已完成：
 
@@ -15,16 +15,18 @@ DSH 全自动任务工作流插件：任务提出后由 Codex CLI 规划拆分�
 - **P3**：串行执行引擎——`READY → EXECUTING` 确定性认领（依赖拓扑序、一次一个）、`exec-result` 上报、失败即 `FAILED`、全部完成进入 `INTEGRATION_REVIEW`；支持 agent 驱动与自动化 Executor 双模式、重启恢复。
 - **P4**：Reviewer/Rework——`INTEGRATION_REVIEW` 后经 `/plugins/taskflow/review` 触发 Codex 只读审查（无 baseSha 时使用 `codex exec review --uncommitted`，有 baseSha 时使用通用 `codex exec --cd` 审查集成 diff；模型 `gpt-5.6-sol`、推理强度 `high`、只读沙箱）；PASS → `AWAITING_HUMAN`，REVISE → `EXECUTING` 并重置返工 Issue（含下游依赖）供执行器重新认领；审查记录持久化到 Run 聚合。
 - **P5**：DAG/Worktree——按 DAG 并行执行（`maxConcurrent` 配置，默认 1 保持串行兼容）；每个 Issue 在独立 Git worktree 中执行，成功后自动提交 worktree 内未提交改动、经专用 integration worktree 串行合并到集成分支 `taskflow/integration`，再清理 worktree/分支；执行/快照暴露 `workDir`、`branch` 与 `baseSha`。
+- **P6**：Board/迁移——`/plugins/taskflow/board` 只读看板快照、纯函数 `buildBoard`、浏览器看板弹层（点击状态卡片打开，五列卡片随状态自动迁移）。
 
-当前版本 HEAD：`35df023`，测试套件 129 项（typecheck + vitest + build 通过）。
+当前版本 HEAD：P6 提交后更新，测试套件 139 项（typecheck + vitest + build 通过）。
 
-后续阶段：P6 Board/迁移、P7 收口试运行。
+后续阶段：P7 收口试运行。
 
 ## HTTP 路由
 
 | Method | Path | 说明 |
 | --- | --- | --- |
 | GET | `/plugins/taskflow/state` | 运行台账快照 |
+| GET | `/plugins/taskflow/board` | P6 看板快照（待办/进行中/待审查/已完成/失败） |
 | POST | `/plugins/taskflow/submit` | 创建任务 Run |
 | POST | `/plugins/taskflow/command` | 执行命令（当前支持 cancel） |
 | POST | `/plugins/taskflow/plan` | 触发 Codex 规划 |
@@ -48,7 +50,7 @@ dsh plugin --profile web add <本仓库路径>
 ## 目录结构
 
 - `src/index.ts` — 宿主入口：服务装配、system prompt 段、HTTP 路由（webServer 存在时经嵌套 inject 注册）
-- `src/service.ts` — TaskFlowService：submit/snapshot/list/command/subscribe、plan、startExecution/reportResult
+- `src/service.ts` — TaskFlowService：submit/snapshot/list/command/subscribe、plan、startExecution/reportResult、board（P6 看板投影）
 - `src/domain.ts` / `src/repository.ts` — storage-domain 持久化聚合与原子读写
 - `src/state.ts` — Run 状态机与合法迁移表
 - `src/dag.ts` — Issue 计划校验与依赖拓扑排序
@@ -64,7 +66,7 @@ dsh plugin --profile web add <本仓库路径>
 
 ### What the model sees
 
-当前注入一段 `plugin:taskflow` 通告（order 200），声明插件存在、能力、HTTP 路由与当前 P5 阶段能力，模型可据此配合提交、规划、并行执行、结果上报与触发审查。
+当前注入一段 `plugin:taskflow` 通告（order 200），声明插件存在、能力、HTTP 路由与当前 P6 阶段能力，模型可据此配合提交、规划、并行执行、结果上报、触发审查与查看看板。
 
 ### Token effect
 
@@ -72,7 +74,7 @@ dsh plugin --profile web add <本仓库路径>
 
 ## Known Limitations and Deferred Work
 
-- P6–P7 未实现：看板/迁移、最终人工验收门。
+- P7 未实现：最终人工验收门与收口试运行。
 - P4 审查门为显式触发（`/plugins/taskflow/review`），不会在进入 `INTEGRATION_REVIEW` 后自动启动。
 - P5 并行执行默认 `maxConcurrent=1`，需通过插件配置调大；worktree 合并采用非快进合并，冲突会导致对应 Issue 失败。
 - 执行方为 DSH 会话或自动化 Executor 显式驱动；没有后台自动连续执行器。

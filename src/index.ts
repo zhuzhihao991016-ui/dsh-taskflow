@@ -1,10 +1,11 @@
 /**
  * dsh-taskflow host half: opens the taskflow storage domain, mounts the
  * orchestration service over its repository, registers the same-origin JSON
- * routes (/plugins/taskflow/state|submit|command|plan|execute|exec-result|review),
+ * routes (/plugins/taskflow/state|board|submit|command|plan|execute|exec-result|review),
  * and injects a model-facing announcement section. P5 adds DAG parallel
  * execution with Git worktree isolation (maxConcurrent, per-issue worktrees,
- * auto-merge to an integration branch) on top of the P4 Codex review gate.
+ * auto-merge to an integration branch) on top of the P4 Codex review gate;
+ * P6 adds the read-only kanban board projection.
  */
 
 import type { Context } from '@deepseek-ai/cordis'
@@ -26,7 +27,7 @@ const SECTION_ORDER = 200
 export const inject = ['systemPrompt', 'storageDomain']
 
 /** Model-facing announcement: plugin presence, capabilities, and limits. */
-export const TASKFLOW_GUIDANCE = '本机已安装 dsh-taskflow 插件（DSH 全自动任务工作流编排）：任务提出后由 Codex CLI 规划拆分为 Issue 并发布看板，DSH 认领执行（串行/并行 + Git worktree 隔离），Codex 只读审查决定打回或通过，按依赖序推进，最终人工验收。当前为 P5 阶段：运行台账已持久化，Codex 规划引擎已接入（提交时带 repoRoot 后经 /plugins/taskflow/plan 触发规划，规划通过后运行进入 READY 并携带 Issue 清单）；执行引擎已启用（经 /plugins/taskflow/execute 启动执行，READY → EXECUTING，按 DAG 依赖每次认领最多 maxConcurrent 个可调度 Issue，响应含 currentIssues；每个 Issue 在独立 Git worktree 中执行，workDir/branch 可从 state/execute 响应读取；完成 currentIssue 后经 /plugins/taskflow/exec-result 上报 { runId, issueKey, ok, summary|error }，成功后自动合并到集成分支，全部完成后运行自动进入 INTEGRATION_REVIEW）；P4 审查门已启用（经 /plugins/taskflow/review 触发 Codex 只读审查，PASS 进入 AWAITING_HUMAN 等待人工验收，REVISE 打回 EXECUTING 并重置返工 Issue）。用户提到「工作流 / 任务流 / taskflow」时即指本插件，请据此协作。'
+export const TASKFLOW_GUIDANCE = '本机已安装 dsh-taskflow 插件（DSH 全自动任务工作流编排）：任务提出后由 Codex CLI 规划拆分为 Issue 并发布看板，DSH 认领执行（串行/并行 + Git worktree 隔离），Codex 只读审查决定打回或通过，按依赖序推进，最终人工验收。当前为 P6 阶段：运行台账已持久化，Codex 规划引擎已接入（提交时带 repoRoot 后经 /plugins/taskflow/plan 触发规划，规划通过后运行进入 READY 并携带 Issue 清单）；执行引擎已启用（经 /plugins/taskflow/execute 启动执行，READY → EXECUTING，按 DAG 依赖每次认领最多 maxConcurrent 个可调度 Issue，响应含 currentIssues；每个 Issue 在独立 Git worktree 中执行，workDir/branch 可从 state/execute 响应读取；完成 currentIssue 后经 /plugins/taskflow/exec-result 上报 { runId, issueKey, ok, summary|error }，成功后自动合并到集成分支，全部完成后运行自动进入 INTEGRATION_REVIEW）；P4 审查门已启用（经 /plugins/taskflow/review 触发 Codex 只读审查，PASS 进入 AWAITING_HUMAN 等待人工验收，REVISE 打回 EXECUTING 并重置返工 Issue）；P6 看板已启用（GET /plugins/taskflow/board 返回五列看板快照，浏览器端状态卡片可打开看板）。用户提到「工作流 / 任务流 / taskflow」时即指本插件，请据此协作。'
 
 /** Plugin config; schema defaults are applied by the loader. */
 export interface Config {
@@ -57,11 +58,12 @@ export const Config: z<Config> = z.object({
 })
 
 /** JSON response writer (same-origin routes; no secrets ever enter bodies). */
-function sendJson(res: ServerResponse, body: unknown, status = 200): void {
+function sendJson(res: ServerResponse, body: unknown, status = 200, headers: Record<string, string> = {}): void {
   const payload = JSON.stringify(body)
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': Buffer.byteLength(payload),
+    ...headers,
   })
   res.end(payload)
 }
@@ -283,6 +285,15 @@ function handleReview(service: TaskFlowService, req: IncomingMessage, res: Serve
   })
 }
 
+/** GET /plugins/taskflow/board — read-only board snapshot; non-GET rejected. */
+export function handleBoard(service: TaskFlowService, req: IncomingMessage, res: ServerResponse): void {
+  if (req.method !== 'GET') {
+    sendJson(res, { ok: false, error: 'taskflow: board requires GET' }, 405, { Allow: 'GET' })
+    return
+  }
+  sendJson(res, { ok: true, columns: service.board().columns })
+}
+
 /**
  * Mount the host half: open the durable domain, assemble the service, then
  * register the announcement section and HTTP routes (routes only when the
@@ -339,6 +350,13 @@ export function apply(ctx: Context, config?: Config): Promise<void> {
             path: '/plugins/taskflow/state',
             handler: (_req, res) => {
               sendJson(res, { ok: true, runs: service.list() })
+            },
+          }),
+          webScope.webServer.register({
+            kind: 'exact',
+            path: '/plugins/taskflow/board',
+            handler: (req, res) => {
+              handleBoard(service, req, res)
             },
           }),
           webScope.webServer.register({
