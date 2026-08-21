@@ -147,6 +147,23 @@ dsh plugin --profile web add /path/to/dsh-taskflow
 - 镜像任务以 `[taskflow]` 前缀标识，重启后可幂等恢复。
 - 可通过 `teamBoardSync=false` 关闭，或通过 `teamBoardTaskPrefix` / `teamBoardOwner` 调整识别前缀与 owner。
 
+## Agent Skills
+
+仓库内置了一套面向 DSH/Codex Agent 的 skill 指南，帮助模型正确操作 taskflow 插件。目录位于 `.agents/skills/`，与 DeepSeek Harness 的 skill 发现约定保持一致。
+
+| Skill | 用途 |
+| --- | --- |
+| `dsh-taskflow` | 入口/路由，按用户目标选择对应 skill |
+| `dsh-taskflow-submit-plan` | 提交任务、触发规划、处理 `READY` / `FAILED` |
+| `dsh-taskflow-execute-monitor` | 认领 Issue、执行监控、上报结果/进度 |
+| `dsh-taskflow-handle-review` | Codex 只读审查、`PASS` / `REVISE`、返工处理 |
+| `dsh-taskflow-control-run` | 暂停/恢复/取消/接管/放行/重试/人工验收 |
+| `dsh-taskflow-configure-automation` | 自动化/手动模式与并发/权限配置 |
+| `dsh-taskflow-use-console` | 浏览器看板、运行台、SSE 与确认操作 |
+
+如果你的 DSH 环境从本仓库加载 Agent skills，可以直接使用 `.agents/skills/` 目录；也可以将其中任意 skill 复制到目标环境的 `.agents/skills/` 目录。
+
+
 ## 开发
 
 ```sh
@@ -176,6 +193,7 @@ pnpm run check
 - `src/contracts.ts` — 自动化执行器、控制动作、事件与配置契约。
 - `src/team-board-sync.ts` — 可选 team-board 看板同步。
 - `src/client/` — 浏览器端状态卡片、看板与运行台。
+- `.agents/skills/` — 配套 DSH/Codex Agent skills（提交规划、执行监控、审查、控制、自动化配置、浏览器控制台）。
 - `tests/` — 服务、状态机、DAG、规划器、持久化、执行引擎与 UI 测试。
 
 ## License
