@@ -50,6 +50,13 @@ export interface RunSnapshot {
     verdict: ReviewVerdict
     summary: string
     reworkKeys: string[]
+    findings?: Array<{
+      issueKey: string
+      problem: string
+      evidenceNeeded: string[]
+      acceptance: string
+    }>
+    evidenceChecklist?: string[]
     at: number
   }
   /** P5: base commit SHA captured when execution started. */
@@ -65,6 +72,7 @@ export interface RunSnapshot {
 /** Projected planned issue (agent needs acceptance/deps to execute). */
 export interface IssueSnapshot {
   key: string
+  taskId?: string
   acceptance: string
   deps: string[]
   risk?: RiskLevel | null
@@ -638,6 +646,23 @@ export class TaskFlowService {
       throw error
     }
   }
+
+  /** Delete a run from the ledger and board. Only allowed when the run has no
+   * active execution (PLANNING/EXECUTING are rejected to avoid deleting a
+   * running workflow). */
+  async deleteRun(runId: string): Promise<{ ok: true }> {
+    const run = this.repository.getRun(runId)
+    if (run === undefined) {
+      throw new Error(`taskflow: unknown run ${runId}`)
+    }
+    if (run.status === 'PLANNING' || run.status === 'EXECUTING' || run.status === 'INTEGRATION_REVIEW') {
+      throw new Error(`taskflow: cannot delete run ${runId} in status ${run.status}; cancel or wait for it to stop first`)
+    }
+    await this.repository.deleteRun(runId)
+    this.notify()
+    return { ok: true }
+  }
+
 
   /**
    * Apply the final human acceptance decision to an AWAITING_HUMAN run.
@@ -1446,12 +1471,15 @@ export class TaskFlowService {
 
     const controller = new AbortController()
     this.registerActiveExecution(runId, controller)
+    const currentRun = this.repository.getRun(runId)
+    const reviewFindings = currentRun?.review?.findings?.filter((finding) => finding.issueKey === claim.key)
     const input: AutomatedExecutionInput = {
       runId,
       issue: claim.issue,
       repoRoot,
       workDir,
       attemptId,
+      reviewFindings,
       signal: controller.signal,
       onProgress: (event) => {
         void this.recordProgress(runId, claim.key, {
@@ -1535,7 +1563,7 @@ export class TaskFlowService {
         await this.repository.updateRun(runId, (current) => {
           assertTransition(current.status, 'AWAITING_HUMAN')
           return this.withTransition(current, 'AWAITING_HUMAN', 'review-passed', `review:pass:${runId}`, {
-            review: { verdict: 'PASS', summary: result.summary, reworkKeys: [], at: this.now() },
+            review: { verdict: 'PASS', summary: result.summary, reworkKeys: [], findings: result.findings === undefined ? undefined : result.findings.map((finding) => ({ ...finding, evidenceNeeded: [...finding.evidenceNeeded] })), evidenceChecklist: result.evidenceChecklist === undefined ? undefined : [...result.evidenceChecklist], at: this.now() },
             events: this.appendEvent(current.events ?? [], runId, 'review.finished', { summary: 'PASS' }),
           })
         })
@@ -1550,7 +1578,7 @@ export class TaskFlowService {
           assertTransition(current.status, 'WAITING_DECISION')
           return this.withTransition(current, 'WAITING_DECISION', 'review-cycle-limit', `review:limit:${runId}`, {
             executions: this.resetReworkExecutions(current.executions ?? [], reworkKeys),
-            review: { verdict: 'REVISE', summary: result.summary, reworkKeys: [...reworkKeys], at: this.now() },
+            review: { verdict: 'REVISE', summary: result.summary, reworkKeys: [...reworkKeys], findings: result.findings === undefined ? undefined : result.findings.map((finding) => ({ ...finding, evidenceNeeded: [...finding.evidenceNeeded] })), evidenceChecklist: result.evidenceChecklist === undefined ? undefined : [...result.evidenceChecklist], at: this.now() },
             control: { ...(current.control ?? this.defaultControl()), reviewCycles },
             events: this.appendEvent(current.events ?? [], runId, 'review.finished', { summary: 'REVISE' }),
           })
@@ -1562,7 +1590,7 @@ export class TaskFlowService {
         assertTransition(current.status, 'EXECUTING')
         return this.withTransition(current, 'EXECUTING', 'review-revise', `review:revise:${runId}`, {
           executions: this.resetReworkExecutions(current.executions ?? [], reworkKeys),
-          review: { verdict: 'REVISE', summary: result.summary, reworkKeys: [...reworkKeys], at: this.now() },
+          review: { verdict: 'REVISE', summary: result.summary, reworkKeys: [...reworkKeys], findings: result.findings === undefined ? undefined : result.findings.map((finding) => ({ ...finding, evidenceNeeded: [...finding.evidenceNeeded] })), evidenceChecklist: result.evidenceChecklist === undefined ? undefined : [...result.evidenceChecklist], at: this.now() },
           control: { ...(current.control ?? this.defaultControl()), reviewCycles },
           events: this.appendEvent(current.events ?? [], runId, 'review.finished', { summary: 'REVISE' }),
         })
@@ -1588,7 +1616,13 @@ export class TaskFlowService {
    * rework keys are ignored; an empty (or fully filtered) list means all
    * issues are reworked. */
   private normalizeReviewResult(run: RunAggregate, raw: unknown): ReviewResult {
-    const object = (raw ?? {}) as { verdict?: unknown; summary?: unknown; reworkKeys?: unknown }
+    const object = (raw ?? {}) as {
+      verdict?: unknown
+      summary?: unknown
+      reworkKeys?: unknown
+      findings?: unknown
+      evidenceChecklist?: unknown
+    }
     if (object.verdict !== 'PASS' && object.verdict !== 'REVISE') {
       throw new ReviewerError('parse-failed', 'reviewer output has invalid verdict')
     }
@@ -1599,7 +1633,27 @@ export class TaskFlowService {
     const reworkKeys = Array.isArray(object.reworkKeys)
       ? object.reworkKeys.filter((key): key is string => typeof key === 'string' && knownKeys.has(key))
       : []
-    return { verdict: object.verdict, summary: object.summary, reworkKeys }
+    const findings = Array.isArray(object.findings)
+      ? object.findings
+          .filter((item): item is { issueKey: string; problem: string; evidenceNeeded: string[]; acceptance: string } =>
+            typeof item === 'object' && item !== null
+            && typeof (item as { issueKey?: unknown }).issueKey === 'string'
+            && typeof (item as { problem?: unknown }).problem === 'string'
+            && Array.isArray((item as { evidenceNeeded?: unknown }).evidenceNeeded)
+            && typeof (item as { acceptance?: unknown }).acceptance === 'string')
+          .map((item) => ({
+            issueKey: item.issueKey,
+            problem: item.problem,
+            evidenceNeeded: item.evidenceNeeded.filter((value): value is string => typeof value === 'string'),
+            acceptance: item.acceptance,
+          }))
+      : undefined
+    const evidenceChecklist = Array.isArray(object.evidenceChecklist)
+      ? object.evidenceChecklist.filter((item): item is string => typeof item === 'string')
+      : findings !== undefined
+        ? [...new Set(findings.flatMap((finding) => finding.evidenceNeeded))]
+        : undefined
+    return { verdict: object.verdict, summary: object.summary, reworkKeys, findings, evidenceChecklist }
   }
 
   /** Compute the transitive rework closure: selected keys plus every issue that
@@ -1709,11 +1763,12 @@ export class TaskFlowService {
         await this.transitionTo(runId, 'FAILED', `planning-rejected: ${verdict.error}`, `plan:reject:${inputHash}`)
         return
       }
+      const normalizedIssues = this.normalizePlannedIssues(verdict.issues)
       await this.repository.updateRun(runId, (current) => {
         assertTransition(current.status, 'READY')
         return this.withTransition(current, 'READY', 'planning-succeeded', `plan:done:${inputHash}`, {
-          issueCount: verdict.issues.length,
-          issues: [...verdict.issues],
+          issueCount: normalizedIssues.length,
+          issues: normalizedIssues,
         })
       })
       this.notify()
@@ -1916,6 +1971,42 @@ export class TaskFlowService {
     })
   }
 
+  /** Normalize planner-issued keys into globally unique, monotonically
+   * increasing Issue keys (`issue-NNN`). The original planner key is kept as
+   * `taskId` when it looks like a project-local task ID, so task IDs can reset
+   * per project while Issue keys stay unique across the whole ledger. */
+  private normalizePlannedIssues(issues: readonly PlannedIssue[]): PlannedIssue[] {
+    let max = 0
+    for (const run of this.repository.listRuns()) {
+      for (const issue of run.issues) {
+        const match = /^issue-(\d+)$/.exec(issue.key)
+        if (match !== null) {
+          max = Math.max(max, Number(match[1]))
+        }
+      }
+    }
+    const oldToNew = new Map<string, string>()
+    const normalized: PlannedIssue[] = []
+    for (const issue of issues) {
+      max += 1
+      const newKey = `issue-${String(max).padStart(3, '0')}`
+      oldToNew.set(issue.key, newKey)
+      const taskId = issue.taskId !== undefined && issue.taskId !== ''
+        ? issue.taskId
+        : /^issue-\d+$/.test(issue.key)
+          ? undefined
+          : issue.key
+      normalized.push({
+        key: newKey,
+        ...(taskId !== undefined ? { taskId } : {}),
+        acceptance: issue.acceptance,
+        deps: (issue.deps ?? []).map((dep) => oldToNew.get(dep) ?? dep),
+        risk: issue.risk ?? null,
+      })
+    }
+    return normalized
+  }
+
   private nextRunId(): string {
     let max = 0
     for (const run of this.repository.listRuns()) {
@@ -1957,6 +2048,7 @@ export class TaskFlowService {
       transitionCount: run.transitions.length,
       issues: run.issues.map((issue) => ({
         key: issue.key,
+        ...(issue.taskId !== undefined ? { taskId: issue.taskId } : {}),
         acceptance: issue.acceptance,
         deps: [...(issue.deps ?? [])],
         risk: issue.risk ?? null,
@@ -1975,6 +2067,8 @@ export class TaskFlowService {
         verdict: run.review.verdict,
         summary: run.review.summary,
         reworkKeys: [...run.review.reworkKeys],
+        findings: run.review.findings === undefined ? undefined : run.review.findings.map((finding) => ({ ...finding, evidenceNeeded: [...finding.evidenceNeeded] })),
+        evidenceChecklist: run.review.evidenceChecklist === undefined ? undefined : [...run.review.evidenceChecklist],
         at: run.review.at,
       },
       baseSha: run.baseSha,

@@ -22,6 +22,7 @@ import { CodexIssueExecutor } from './issue-executor.ts'
 import { CodexPlanner } from './planner.ts'
 import { DomainRepository } from './repository.ts'
 import { TaskFlowService, type CommandAction, type HumanDecision, type SubmitRequest } from './service.ts'
+import { createTeamBoardSync, type TeamBoardService } from './team-board-sync.ts'
 
 /** P8.2 public adapter exports. */
 export { CodexIssueExecutor, CodexExecutor } from './issue-executor.ts'
@@ -33,7 +34,7 @@ const SECTION_ORDER = 200
 export const inject = ['systemPrompt', 'storageDomain']
 
 /** Model-facing announcement: plugin presence, capabilities, and limits. */
-export const TASKFLOW_GUIDANCE = '本机已安装 dsh-taskflow 插件（DSH 全自动任务工作流编排）：任务提出后由 Codex CLI 规划拆分为 Issue 并发布看板，DSH 认领执行（串行/并行 + Git worktree 隔离），Codex 只读审查决定打回或通过，按依赖序推进，最终人工验收。当前为 P8.6 阶段：运行台账已持久化，Codex 规划引擎已接入（提交时带 repoRoot 后经 /plugins/taskflow/plan 触发规划，规划通过后运行进入 READY 并携带 Issue 清单）；执行引擎已启用（经 /plugins/taskflow/execute 启动执行，READY → EXECUTING，按 DAG 依赖每次认领最多 maxConcurrent 个可调度 Issue，响应含 currentIssues；每个 Issue 在独立 Git worktree 中执行，workDir/branch 可从 state/execute 响应读取；完成 currentIssue 后经 /plugins/taskflow/exec-result 上报 { runId, issueKey, ok, summary|error }，成功后自动合并到集成分支，全部完成后运行自动进入 INTEGRATION_REVIEW）；P4 审查门已启用（经 /plugins/taskflow/review 触发 Codex 只读审查，PASS 进入 AWAITING_HUMAN 等待人工验收，REVISE 打回 EXECUTING 并重置返工 Issue）；P6 看板已启用（GET /plugins/taskflow/board 返回五列看板快照，浏览器端状态卡片可打开看板）；P7 人工验收门已启用（POST /plugins/taskflow/human-decision 提交 { runId, decision: accept|rework }，accept 进入 ACCEPTED 终态，rework 回到 PLANNING 重新规划）；P8 自动化契约已冻结且默认开启（automationEnabled=true）；P8.1 已持久化控制元数据、进度事件与运行级 Git 隔离，并提供 GET /plugins/taskflow/run 详情投影与 pause/resume/takeover/release/retry 控制动作；P8.2 已内置 Codex Issue Executor（自动化开启时在独立 worktree 中以 workspace-write 非交互实现 Issue）；P8.3 已接入自动推进协调器（automationEnabled 开启且 autoPlan/autoReview 为 true 时自动完成规划、执行、审查），新增 GET /plugins/taskflow/events SSE 事件流，审查返工达到 maxReviewCycles 时进入 WAITING_DECISION 人工介入窗口（可用 resume 继续）；P8.4 已接入自动执行授权门（requireExecutionPermission=true 时，规划完成后进入 WAITING_PERMISSION，人工 release 后自动继续执行）；P8.5 已接入浏览器运行台与介入窗口（看板卡片打开运行详情抽屉，经 /plugins/taskflow/run 与 run-scoped SSE 实时刷新，按 allowedActions 渲染操作按钮并二次确认后调用 /plugins/taskflow/command 或 /plugins/taskflow/human-decision）。用户提到「工作流 / 任务流 / taskflow」时即指本插件，请据此协作。'
+export const TASKFLOW_GUIDANCE = '本机已安装 dsh-taskflow 插件（DSH 全自动任务工作流编排）：任务提出后由 Codex CLI 规划拆分为 Issue 并发布看板，DSH 认领执行（串行/并行 + Git worktree 隔离），Codex 只读审查决定打回或通过，按依赖序推进，最终人工验收。当前为 P8.6 阶段：运行台账已持久化，Codex 规划引擎已接入（提交时带 repoRoot 后经 /plugins/taskflow/plan 触发规划，规划通过后运行进入 READY 并携带 Issue 清单）；执行引擎已启用（经 /plugins/taskflow/execute 启动执行，READY → EXECUTING，按 DAG 依赖每次认领最多 maxConcurrent 个可调度 Issue，响应含 currentIssues；每个 Issue 在独立 Git worktree 中执行，workDir/branch 可从 state/execute 响应读取；完成 currentIssue 后经 /plugins/taskflow/exec-result 上报 { runId, issueKey, ok, summary|error }，成功后自动合并到集成分支，全部完成后运行自动进入 INTEGRATION_REVIEW）；P4 审查门已启用（经 /plugins/taskflow/review 触发 Codex 只读审查，PASS 进入 AWAITING_HUMAN 等待人工验收，REVISE 打回 EXECUTING 并重置返工 Issue）；P6 看板已启用（GET /plugins/taskflow/board 返回五列看板快照，浏览器端状态卡片可打开看板）；P7 人工验收门已启用（POST /plugins/taskflow/human-decision 提交 { runId, decision: accept|rework }，accept 进入 ACCEPTED 终态，rework 回到 PLANNING 重新规划）；P8 自动化契约已冻结且默认开启（automationEnabled=true）；P8.1 已持久化控制元数据、进度事件与运行级 Git 隔离，并提供 GET /plugins/taskflow/run 详情投影与 pause/resume/takeover/release/retry 控制动作；P8.2 已内置 Codex Issue Executor（自动化开启时在独立 worktree 中以 workspace-write 非交互实现 Issue）；P8.3 已接入自动推进协调器（automationEnabled 开启且 autoPlan/autoReview 为 true 时自动完成规划、执行、审查），新增 GET /plugins/taskflow/events SSE 事件流，审查返工达到 maxReviewCycles 时进入 WAITING_DECISION 人工介入窗口（可用 resume 继续）；P8.4 已接入自动执行授权门（requireExecutionPermission=true 时，规划完成后进入 WAITING_PERMISSION，人工 release 后自动继续执行）；P8.5 已接入浏览器运行台与介入窗口（看板卡片打开运行详情抽屉，经 /plugins/taskflow/run 与 run-scoped SSE 实时刷新，按 allowedActions 渲染操作按钮并二次确认后调用 /plugins/taskflow/command 或 /plugins/taskflow/human-decision）。若同 profile 安装了 team-board 插件，taskflow 看板会自动镜像到 ctx.teamBoard（teamBoardSync=false 可关闭）。用户提到「工作流 / 任务流 / taskflow」时即指本插件，请据此协作。'
 
 /** Plugin config; schema defaults are applied by the loader. */
 export interface Config {
@@ -63,6 +64,12 @@ export interface Config {
   maxReviewCycles?: number
   /** P8.4: wait for human release before automatic execution starts. */
   requireExecutionPermission?: boolean
+  /** Optional integration: mirror taskflow board cards to `ctx.teamBoard` when that service is present. */
+  teamBoardSync?: boolean
+  /** Subject marker used to recognize taskflow-created team-board tasks. */
+  teamBoardTaskPrefix?: string
+  /** Owner assigned to mirrored team-board tasks (default: none). */
+  teamBoardOwner?: string
 }
 
 export const Config: z<Config> = z.object({
@@ -79,6 +86,9 @@ export const Config: z<Config> = z.object({
   maxExecutorProcesses: z.number().step(1).min(1).default(DEFAULT_AUTOMATION_CONFIG.maxExecutorProcesses),
   maxReviewCycles: z.number().step(1).min(1).default(DEFAULT_AUTOMATION_CONFIG.maxReviewCycles),
   requireExecutionPermission: z.boolean().default(DEFAULT_AUTOMATION_CONFIG.requireExecutionPermission),
+  teamBoardSync: z.boolean().default(true),
+  teamBoardTaskPrefix: z.string().default('[taskflow]'),
+  teamBoardOwner: z.string().default(''),
 })
 
 /** JSON response writer (same-origin routes; no secrets ever enter bodies). */
@@ -224,6 +234,53 @@ function handleCommand(service: TaskFlowService, req: IncomingMessage, res: Serv
     sendJson(res, { ok: false, error: (error as Error).message }, 400)
   })
 }
+
+/** POST /plugins/taskflow/delete — remove a finished/stale run from the ledger and board. */
+function handleDelete(service: TaskFlowService, req: IncomingMessage, res: ServerResponse): void {
+  const guardError = guardMutation(req)
+  if (guardError !== undefined) {
+    sendJson(res, { ok: false, error: guardError }, 403)
+    return
+  }
+  void readJsonBody(req, 64 * 1024).then((body) => {
+    const { runId } = (body ?? {}) as { runId?: string }
+    if (typeof runId !== 'string' || runId === '') {
+      sendJson(res, { ok: false, error: 'taskflow: delete requires runId' }, 400)
+      return
+    }
+    void service.deleteRun(runId).then(() => {
+      sendJson(res, { ok: true })
+    }, (error) => {
+      sendJson(res, { ok: false, error: (error as Error).message }, errorStatus(error))
+    })
+  }, (error) => {
+    sendJson(res, { ok: false, error: (error as Error).message }, 400)
+  })
+}
+
+/** GET /plugins/taskflow/status — unified process/config/automation status entry. */
+function handleStatus(config: Config | undefined, _req: IncomingMessage, res: ServerResponse): void {
+  sendJson(res, {
+    ok: true,
+    status: {
+      pid: process.pid,
+      plugin: 'dsh-taskflow',
+      version: '0.1.0',
+      hotReload: 'config-patch-live',
+      automation: {
+        enabled: config?.automationEnabled ?? DEFAULT_AUTOMATION_CONFIG.enabled,
+        autoPlan: config?.autoPlan ?? DEFAULT_AUTOMATION_CONFIG.autoPlan,
+        autoReview: config?.autoReview ?? DEFAULT_AUTOMATION_CONFIG.autoReview,
+        requireExecutionPermission: config?.requireExecutionPermission ?? DEFAULT_AUTOMATION_CONFIG.requireExecutionPermission,
+        maxConcurrent: config?.maxConcurrent ?? 1,
+        maxExecutorProcesses: config?.maxExecutorProcesses ?? DEFAULT_AUTOMATION_CONFIG.maxExecutorProcesses,
+        maxReviewCycles: config?.maxReviewCycles ?? DEFAULT_AUTOMATION_CONFIG.maxReviewCycles,
+      },
+      allowedRepoRoots: config?.allowedRepoRoots ?? [],
+    },
+  })
+}
+
 
 /** POST /plugins/taskflow/execute — start the serial execution of { runId }. */
 function handleExecute(service: TaskFlowService, req: IncomingMessage, res: ServerResponse): void {
@@ -502,6 +559,23 @@ export function apply(ctx: Context, config?: Config): Promise<void> {
       },
     )
 
+    // Optional integration: mirror taskflow's board into the non-taskflow
+    // team-board service. The nested inject starts and stops with the
+    // team-board provider, so load order and provider reloads are handled by
+    // Cordis instead of a one-time ctx.get() lookup.
+    if ((config?.teamBoardSync ?? true) === true) {
+      scope.inject(['teamBoard'], (teamScope: Context) => {
+        const teamBoard = teamScope.get('teamBoard') as TeamBoardService
+        const teamBoardPrefix = config?.teamBoardTaskPrefix?.trim() || undefined
+        const teamBoardOwner = config?.teamBoardOwner?.trim() || undefined
+        const disposeTeamBoardSync = createTeamBoardSync(service, teamBoard, {
+          prefix: teamBoardPrefix,
+          owner: teamBoardOwner,
+        })
+        teamScope.effect(() => disposeTeamBoardSync, 'dsh-taskflow: team-board sync')
+      })
+    }
+
     if ((config?.announceToAgent ?? true) === true) {
       scope.effect(() => scope.systemPrompt.section({
         name: 'plugin:taskflow',
@@ -528,6 +602,13 @@ export function apply(ctx: Context, config?: Config): Promise<void> {
               sendJson(res, { ok: true, runs: service.list() })
             },
           }),
+            webScope.webServer.register({
+              kind: 'exact',
+              path: '/plugins/taskflow/status',
+              handler: (req, res) => {
+                handleStatus(config, req, res)
+              },
+            }),
           webScope.webServer.register({
             kind: 'exact',
             path: '/plugins/taskflow/board',
@@ -561,6 +642,13 @@ export function apply(ctx: Context, config?: Config): Promise<void> {
             path: '/plugins/taskflow/command',
             handler: (req, res) => {
               handleCommand(service, req, res)
+            },
+          }),
+          webScope.webServer.register({
+            kind: 'exact',
+            path: '/plugins/taskflow/delete',
+            handler: (req, res) => {
+              handleDelete(service, req, res)
             },
           }),
           webScope.webServer.register({

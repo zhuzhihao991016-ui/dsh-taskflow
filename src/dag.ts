@@ -11,6 +11,8 @@ export type RiskLevel = 'L1' | 'L2' | 'L3'
 export interface PlannedIssue {
   /** Stable unique key, e.g. `issue-001`. */
   key: string
+  /** Optional project-local task ID (e.g. `TF-000`) supplied by the planner. */
+  taskId?: string
   /** Non-empty acceptance criteria text. */
   acceptance: string
   /** Dependency keys; each must reference an existing issue. */

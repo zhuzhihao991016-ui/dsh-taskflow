@@ -1,8 +1,8 @@
 {
   "name": "dsh-taskflow",
-  "description": "DSH 全自动任务工作流：Codex 规划拆分 Issue → 看板 → DSH 认领执行 → Codex 审查打回/通过 → 人工验收（Host 持久编排 + 浏览器看板投影）",
+  "description": "DSH 全自动任务工作流插件：Codex 规划拆分 Issue，看板编排，DAG 并行执行，自动审查与人工验收。",
   "version": "0.1.0",
-  "private": true,
+  "private": false,
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",

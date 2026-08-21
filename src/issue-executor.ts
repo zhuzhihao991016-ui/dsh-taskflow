@@ -57,6 +57,17 @@ export function buildIssuePrompt(input: AutomatedExecutionInput): string {
     '',
     '## 当前 Issue 与验收标准',
     `- ${input.issue.key}：${input.issue.acceptance}${deps}${risk}`,
+    ...(input.reviewFindings !== undefined && input.reviewFindings.length > 0
+      ? [
+          '',
+          '## 审查返工清单（必须逐项闭环）',
+          ...input.reviewFindings.flatMap((finding, index) => [
+            `${index + 1}. 问题：${finding.problem}`,
+            `   待补证据：${finding.evidenceNeeded.join('；') || '（无）'}`,
+            `   对应验收：${finding.acceptance}`,
+          ]),
+        ]
+      : []),
     '',
     '## 执行要求',
     '- 当前 Codex 以 workspace-write 沙箱运行，可以修改工作目录内的文件',
@@ -138,7 +149,7 @@ export class CodexIssueExecutor implements AutomatedExecutor {
       '--config', 'model_reasoning_effort="high"',
       '--strict-config',
       '--sandbox', 'workspace-write',
-      '--ask-for-approval', 'never',
+      '--full-auto',
       '--ephemeral',
       '--color', 'never',
       '--cd', cwd,

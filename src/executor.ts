@@ -20,6 +20,13 @@ export interface ExecutionInput {
   repoRoot: string
   /** Spool directory for this issue's artifacts. */
   workDir: string
+  /** Structured review findings passed into a rework execution. */
+  reviewFindings?: ReadonlyArray<{
+    issueKey: string
+    problem: string
+    evidenceNeeded: readonly string[]
+    acceptance: string
+  }>
 }
 
 /** One issue execution outcome, as reported back to the runner. */

@@ -1,98 +1,183 @@
 # dsh-taskflow
 
-DSH 全自动任务工作流插件：任务提出后由 Codex CLI 规划拆分为 Issue（带验收标准与依赖 DAG）→ 发布看板 → DSH 认领执行（串行/并行）→ Codex 只读审查决定打回/通过 → 按依赖序推进 → 最终人工验收。人工只在"提出任务"与"最终验收"介入。
+> DSH 全自动任务工作流插件：从提交任务到最终人工验收，全程可编排、可观察、可介入。
 
-## 状态
+`dsh-taskflow` 是 DeepSeek Harness（DSH）生态中的一个插件。它将一个任务目标自动拆解为带验收标准与依赖关系的 Issue 列表，通过看板编排执行，并使用 Codex CLI 完成规划、实现与只读审查。人工只需要在关键节点（执行授权、最终验收）介入。
 
-**P8.6（当前）**：P8 自动化默认开启与最终收尾——`automationEnabled` 默认从 `false` 转为 `true`，插件安装后即按全自动工作流运行；同时保留 P8.4 的自动执行授权门与 P8.5 浏览器运行台介入窗口。
+## 核心流程
 
-已完成：
+```mermaid
+flowchart LR
+    A[提交任务] --> B[Codex 规划]
+    B --> C[看板发布]
+    C --> D[DSH / Codex 执行]
+    D --> E[Git worktree 隔离]
+    E --> F[合并到集成分支]
+    F --> G[Codex 只读审查]
+    G -->|REVISE| D
+    G -->|PASS| H[人工验收]
+    H -->|accept| I[完成]
+    H -->|rework| B
+```
 
-- **P0**：双端插件骨架——宿主服务（持久化运行台账）、同源 JSON 路由、输入 dock 状态卡片、模型通告段。
-- **P1**：持久内核——Run 聚合、状态机、DAG 校验、幂等迁移、重启恢复。
-- **P2**：Codex Planner——进程执行器、真实 JSONL 事件解析、严格输出 Schema、超时重试、规划状态流、repoRoot 白名单/规范化。
-- **P2.5**：规划并发与幂等收敛——显式幂等键、planning 单飞、持久化 PLANNING 转换后才应答、重启续跑。
-- **P3**：串行执行引擎——`READY → EXECUTING` 确定性认领（依赖拓扑序、一次一个）、`exec-result` 上报、失败即 `FAILED`、全部完成进入 `INTEGRATION_REVIEW`；支持 agent 驱动与自动化 Executor 双模式、重启恢复。
-- **P4**：Reviewer/Rework——`INTEGRATION_REVIEW` 后经 `/plugins/taskflow/review` 触发 Codex 只读审查（无 baseSha 时使用 `codex exec review --uncommitted`，有 baseSha 时使用通用 `codex exec --cd` 审查集成 diff；模型 `gpt-5.6-sol`、推理强度 `high`、只读沙箱）；PASS → `AWAITING_HUMAN`，REVISE → `EXECUTING` 并重置返工 Issue（含下游依赖）供执行器重新认领；审查记录持久化到 Run 聚合。
-- **P5**：DAG/Worktree——按 DAG 并行执行（`maxConcurrent` 配置，默认 1 保持串行兼容）；每个 Issue 在独立 Git worktree 中执行，成功后自动提交 worktree 内未提交改动、经专用 integration worktree 串行合并到集成分支 `taskflow/integration`，再清理 worktree/分支；执行/快照暴露 `workDir`、`branch` 与 `baseSha`。
-- **P6**：Board/迁移——`/plugins/taskflow/board` 只读看板快照、纯函数 `buildBoard`、浏览器看板弹层（点击状态卡片打开，五列卡片随状态自动迁移）。
-- **P7**：人工验收门/收口——`/plugins/taskflow/human-decision` 支持 `accept|rework`；`accept` 进入 `ACCEPTED` 终态，`rework` 回到 `PLANNING` 并清空执行记录；补齐服务、路由与 HTTP 契约测试。
-- **P8.0**：契约冻结——新增 `src/contracts.ts` 定义 Executor v2、控制动作、事件/详情/配置契约；`Config` 增加自动化配置项（当时默认关闭，P8.6 起默认开启）；补充契约测试。
-- **P8.1**：持久控制元数据与 Run 级 Git 隔离——`RunAggregate` 增加 `control`/`runGit`/`events` 与 Issue 进度元数据；服务提供 `runDetail`、`recordProgress`、pause/resume/takeover/release/retry；每次执行持久化运行级集成分支 `taskflow/integration/<runId>` 并在 rework 时清理。
-- **P8.2**：内置 Codex Issue Executor——新增 `src/issue-executor.ts`，以 `gpt-5.6-sol`、`workspace-write`、`--ask-for-approval never` 和严格输出 Schema 驱动 `codex exec` 实现单个 Issue；服务将 attemptId、进度事件与自动化结果接入执行循环。
-- **P8.3**：自动推进协调器——`automationEnabled` 开启时自动规划（`autoPlan`）、自动执行、自动审查（`autoReview`）、SSE 事件流（`/plugins/taskflow/events`）与人工介入窗口（`WAITING_DECISION`/`WAITING_PERMISSION`、`maxReviewCycles`）。
-- **P8.4**：自动执行授权门——新增 `requireExecutionPermission` 配置；开启后自动规划完成进入 `WAITING_PERMISSION`，人工 `release` 后才自动执行，`READY → WAITING_PERMISSION → EXECUTING` 状态迁移落地。
-- **P8.5**：浏览器运行台与介入窗口——详情抽屉、run-scoped 实时 SSE、按 `allowedActions` 渲染操作按钮、二次确认；`allowedActions` 在 `AWAITING_HUMAN` 下补充 `accept`/`rework` 供浏览器直接完成人工验收。
-- **P8.6**：P8 自动化默认开启——`DEFAULT_AUTOMATION_CONFIG.enabled` 与插件 `Config.automationEnabled` 默认改为 `true`，更新模型通告、契约测试与文档，完成 P8 自动化 feature flag 转正。
+1. **提交任务**：通过 `POST /plugins/taskflow/submit` 提交标题、描述和仓库路径。
+2. **Codex 规划**：`CodexPlanner` 以只读、临时会话方式将任务拆分为多个 Issue；每个 Issue 包含验收标准（`acceptance`）、依赖（`deps`）和风险等级（`risk`）。
+3. **看板发布**：通过 DAG 校验后的 Issue 进入五列看板：待办、进行中、待审查、已完成、失败。
+4. **执行**：DSH 会话或内置 `CodexIssueExecutor` 认领 Issue；每个 Issue 在独立 Git worktree 中执行，成功后自动提交并合并到运行级集成分支。
+5. **Codex 审查**：`CodexReviewer` 以只读方式审查集成 diff；`PASS` 进入人工验收，`REVISE` 携带结构化 findings 打回返工。
+6. **人工验收**：通过 `POST /plugins/taskflow/human-decision` 选择 `accept` 通过，或 `rework` 回到规划阶段重新开始。
 
-P8.6 代码提交：`bf21aa8`；当前 HEAD 为审查修复提交 `b213280`，测试套件 212 项（typecheck + vitest + build 通过）。
+## 特性
 
-后续阶段：P8.7 及以后待定。
+- **全自动编排**：默认开启自动化，自动规划、自动执行、自动审查；也可切换为手动/半自动模式。
+- **任务规划**：基于 Codex CLI 的结构化输出，生成带验收标准、依赖 DAG 和风险等级的 Issue 清单。
+- **DAG 调度**：校验依赖关系、检测环，按拓扑序执行；支持 `maxConcurrent` 并行执行。
+- **Git worktree 隔离**：每个 Issue 在独立 worktree 中实现，避免互相污染；成功改动统一合并到集成分支。
+- **自动审查门禁**：Codex 只读审查集成 diff，通过后进入人工验收，不通过则带证据清单返工。
+- **人工介入窗口**：支持执行前授权（`requireExecutionPermission`）、暂停/恢复/接管/重试/取消，以及最终人工验收。
+- **持久化运行台账**：基于 storage-domain 持久化 Run 聚合、状态机、事件流，支持重启恢复。
+- **浏览器运行台**：状态卡片、看板弹层、运行详情抽屉、SSE 实时事件和带二次确认的操作按钮。
+- **team-board 联动**：可选将 taskflow 看板单向镜像到 team-board。
 
-## HTTP 路由
+## 状态机
 
-| Method | Path | 说明 |
-| --- | --- | --- |
-| GET | `/plugins/taskflow/state` | 运行台账快照 |
-| GET | `/plugins/taskflow/board` | P6 看板快照（待办/进行中/待审查/已完成/失败） |
-| GET | `/plugins/taskflow/run` | P8.1 运行详情投影（automation/currentIssue/allowedActions/recentEvents） |
-| GET | `/plugins/taskflow/events` | P8.3 SSE 事件流（可选 `?runId=` 过滤，实时推送白名单事件） |
-| POST | `/plugins/taskflow/submit` | 创建任务 Run |
-| POST | `/plugins/taskflow/command` | 控制命令（cancel/pause/resume/takeover/release/retry） |
-| POST | `/plugins/taskflow/plan` | 触发 Codex 规划 |
-| POST | `/plugins/taskflow/execute` | 启动/继续执行，认领可调度 Issues（最多 maxConcurrent） |
-| POST | `/plugins/taskflow/exec-result` | 上报当前 Issue 执行结果 |
-| POST | `/plugins/taskflow/progress` | P8.1 上报自动化执行进度（attempt/phase/heartbeat） |
-| POST | `/plugins/taskflow/review` | 触发 P4 Codex 只读审查（PASS/REVISE） |
-| POST | `/plugins/taskflow/human-decision` | P7 最终人工验收（`accept` 通过 / `rework` 打回重新规划） |
+一个 Run 的典型生命周期：
 
-## 开发
+```text
+RECEIVED → PLANNING → READY → EXECUTING → INTEGRATION_REVIEW → AWAITING_HUMAN → ACCEPTED
+```
+
+同时支持以下分支状态：
+
+- `WAITING_PERMISSION`：自动执行前等待人工放行。
+- `WAITING_DECISION`：自动审查返工达到上限后等待人工决策。
+- `PAUSED`：暂停执行。
+- `FAILED`：执行失败，可重试。
+- `CANCELLED`：取消。
+
+## 环境要求
+
+- 可运行的 DSH 环境（包含 web server 与 storage-domain）。
+- Codex CLI 已安装并可通过 PATH 或 `CODEX_CLI_PATH` 访问。
+- 当前内置规划器/执行器/审查器使用 `gpt-5.6-sol` 模型，需要对应的模型访问权限。
+- Git（用于 worktree 隔离与集成分支合并）。
+- Node.js 与 pnpm（开发/构建）。
+
+
+## 安装
 
 ```sh
 pnpm install
 pnpm run check   # typecheck + test + build
 ```
 
-`lib/` 为构建产物；安装到 profile 后重启 dsh web 生效：
+在 DSH profile 中安装本地插件：
 
 ```sh
-dsh plugin --profile web add <本仓库路径>
+dsh plugin --profile web add /path/to/dsh-taskflow
+```
+
+## 配置
+
+插件通过 DSH 的 Cordis 配置注入。常用配置项如下：
+
+| 配置项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `enabled` | `true` | 插件总开关 |
+| `announceToAgent` | `true` | 是否向模型通告插件能力 |
+| `allowedRepoRoots` | `[]` | 允许规划/执行的仓库根目录白名单；为空时禁用规划 |
+| `codexCliPath` | `''` | Codex CLI 路径；为空时使用 `CODEX_CLI_PATH` 或系统 PATH |
+| `maxConcurrent` | `1` | 最多同时执行的 Issue 数量 |
+| `integrationBranch` | `taskflow/integration` | 集成分支名 |
+| `worktreesRoot` | `.taskflow/worktrees` | worktree 根目录（相对仓库根） |
+| `automationEnabled` | `true` | 是否启用自动化编排 |
+| `autoPlan` | `true` | 自动化开启后是否自动规划 |
+| `autoReview` | `true` | 自动化开启后是否自动触发 Codex 审查 |
+| `maxExecutorProcesses` | `2` | 全局最大 Codex 执行进程数 |
+| `maxReviewCycles` | `3` | 自动审查返工的最大轮数，超过后进入人工决策 |
+| `requireExecutionPermission` | `false` | 自动执行前是否需要人工 `release` 放行 |
+| `teamBoardSync` | `true` | 是否将看板镜像到 team-board |
+| `teamBoardTaskPrefix` | `[taskflow]` | team-board 镜像任务的前缀 |
+| `teamBoardOwner` | `''` | team-board 镜像任务的 owner |
+
+如需完全手动模式，可设置：
+
+```json
+{
+  "automationEnabled": false,
+  "autoPlan": false,
+  "autoReview": false
+}
+```
+
+如需在自动规划后保留执行前人工授权：
+
+```json
+{
+  "requireExecutionPermission": true
+}
+```
+
+## HTTP API
+
+所有写接口均要求同源 `application/json` POST，跨域写请求会被拒绝。
+
+| Method | Path | 说明 |
+| --- | --- | --- |
+| GET | `/plugins/taskflow/state` | 运行台账快照 |
+| GET | `/plugins/taskflow/status` | 插件与自动化状态 |
+| GET | `/plugins/taskflow/board` | 五列看板快照 |
+| GET | `/plugins/taskflow/run?runId=` | 运行详情投影（当前 Issue、允许动作、最近事件） |
+| GET | `/plugins/taskflow/events?runId=` | SSE 实时事件流 |
+| POST | `/plugins/taskflow/submit` | 创建任务 Run |
+| POST | `/plugins/taskflow/command` | 控制动作：`cancel` / `pause` / `resume` / `takeover` / `release` / `retry` |
+| POST | `/plugins/taskflow/delete` | 删除已结束/停滞的 Run |
+| POST | `/plugins/taskflow/plan` | 触发 Codex 规划 |
+| POST | `/plugins/taskflow/execute` | 启动/继续执行，认领可调度 Issue |
+| POST | `/plugins/taskflow/exec-result` | 上报 Issue 执行结果 |
+| POST | `/plugins/taskflow/progress` | 上报自动化执行进度 |
+| POST | `/plugins/taskflow/review` | 触发 Codex 只读审查 |
+| POST | `/plugins/taskflow/human-decision` | 人工验收：`accept` / `rework` |
+
+## 与 team-board 联动
+
+当同一 profile 安装了提供 `ctx.teamBoard` 服务的 team-board 插件时，taskflow 默认会将看板单向镜像到 team-board：
+
+- taskflow 的待办/进行中/待审查/已完成/失败映射为 team-board 的 `todo` / `doing` / `doing` / `done` / `todo`。
+- 镜像任务以 `[taskflow]` 前缀标识，重启后可幂等恢复。
+- 可通过 `teamBoardSync=false` 关闭，或通过 `teamBoardTaskPrefix` / `teamBoardOwner` 调整识别前缀与 owner。
+
+## 开发
+
+```sh
+pnpm install
+pnpm run typecheck
+pnpm run test
+pnpm run build
+```
+
+也可以一键执行全部检查：
+
+```sh
+pnpm run check
 ```
 
 ## 目录结构
 
-- `src/index.ts` — 宿主入口：服务装配、system prompt 段、HTTP 路由（webServer 存在时经嵌套 inject 注册）
-- `src/service.ts` — TaskFlowService：submit/snapshot/list/command/subscribe/subscribeEvents、plan、startExecution/reportResult、startReview/decideHuman、board、runDetail、recordProgress（P6 看板 / P7 人工验收 / P8.1 控制元数据 / P8.3 自动推进与事件流 / P8.4 自动执行授权门 / P8.5 浏览器操作 allowedActions）
-- `src/domain.ts` / `src/repository.ts` — storage-domain 持久化聚合与原子读写
-- `src/state.ts` — Run 状态机与合法迁移表
-- `src/dag.ts` — Issue 计划校验与依赖拓扑排序
-- `src/planner.ts` — Codex CLI 规划执行器
-- `src/reviewer.ts` — Codex CLI 只读审查执行器（PASS/REVISE）
-- `src/worktree.ts` — Git worktree 管理（建分支/合并/清理）
-- `src/executor.ts` — 执行器接口（agent 驱动 / 自动化双模式）
-- `src/issue-executor.ts` — P8.2 内置 Codex Issue Executor（workspace-write 单 Issue 实现）
-- `src/contracts.ts` — P8 契约冻结（Executor v2、控制动作、事件/详情/配置）
-- `src/client/` — 浏览器半体：`conversation.input.dock` 状态卡片 + P6 看板 + P8.5 运行详情抽屉/操作按钮（写入仍走宿主受控路由）
-- `build/` — 自 DSH checkout 拷贝的 client bundle 预设（保持与运行版本同步）
-- `tests/` — 服务、状态机、DAG、规划器、持久化与执行引擎单元测试
+- `src/index.ts` — 宿主入口：服务装配、系统提示词通告、HTTP 路由注册。
+- `src/service.ts` — 核心编排服务：提交、规划、执行、审查、人工验收、控制命令、看板、事件流。
+- `src/domain.ts` / `src/repository.ts` — Run 聚合持久化与原子读写。
+- `src/state.ts` — Run 状态机与合法迁移表。
+- `src/dag.ts` — Issue 计划校验与依赖拓扑排序。
+- `src/planner.ts` — Codex CLI 规划执行器。
+- `src/reviewer.ts` — Codex CLI 只读审查执行器。
+- `src/executor.ts` / `src/issue-executor.ts` — 执行器接口与内置 Codex Issue Executor。
+- `src/worktree.ts` — Git worktree 管理（建分支、合并、清理）。
+- `src/contracts.ts` — 自动化执行器、控制动作、事件与配置契约。
+- `src/team-board-sync.ts` — 可选 team-board 看板同步。
+- `src/client/` — 浏览器端状态卡片、看板与运行台。
+- `tests/` — 服务、状态机、DAG、规划器、持久化、执行引擎与 UI 测试。
 
-## Model Experience
+## License
 
-### What the model sees
-
-当前注入一段 `plugin:taskflow` 通告（order 200），声明插件存在、能力、HTTP 路由与当前 P8.6 阶段能力，模型可据此配合提交、规划、并行执行、结果上报、触发审查、人工验收、查看看板/运行详情/SSE 事件流，并在浏览器运行台中按 `allowedActions` 执行带二次确认的介入操作；P8.6 起自动化默认开启，自动推进规划、执行与审查，并可通过 `requireExecutionPermission` 保留执行前人工授权窗口。
-
-### Token effect
-
-固定一段通告文本；无每轮动态内容。
-
-## Known Limitations and Deferred Work
-
-- P8.6 起自动化默认开启（`automationEnabled=true`）；如需完全手动模式，可在插件配置显式设置 `automationEnabled=false`。开启后自动推进协调器、SSE 与人工介入窗口已实现。
-- P8.4 自动执行授权门默认关闭（`requireExecutionPermission=false`）；开启后自动执行会停在 `WAITING_PERMISSION`，需要人工 `release` 释放。
-- P8.5 浏览器运行台已实现；所有写入（命令/人工验收）仍走宿主受控路由并带二次确认。
-- P4 审查门默认随 `autoReview=true` 自动触发；显式 `/plugins/taskflow/review` 仍可用。
-- P7 人工验收门仍为显式触发（`/plugins/taskflow/human-decision`），不会在 `AWAITING_HUMAN` 后自动验收。
-- P5 并行执行默认 `maxConcurrent=1`，需通过插件配置调大；worktree 合并采用非快进合并，冲突会导致对应 Issue 失败。
-- 执行方为 DSH 会话或自动化 Executor 驱动；`automationEnabled=true` 时由自动推进协调器串联后台流程。
-- 客户端看板卡片可打开运行台；写入全部走宿主受控路由。
+MIT

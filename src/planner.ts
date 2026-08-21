@@ -122,7 +122,7 @@ export function buildPlanPrompt(input: PlanInput): string {
     input.description !== '' ? input.description : '（无附加描述）',
     '',
     '## 输出要求',
-    '- `issues` 数组，每项含：`key`（唯一，如 issue-001）、`acceptance`（非空验收标准）、`deps`（依赖的 issue key 数组，可省略）、`risk`（L1/L2/L3，可省略）',
+    '- `issues` 数组，每项含：`key`（唯一，如 issue-001）、`taskId`（可选，项目内原始任务 ID，如 TF-000）、`acceptance`（非空验收标准）、`deps`（依赖的 issue key 数组，可省略）、`risk`（L1/L2/L3，可省略）',
     '- Issue 粒度：每个 Issue 应可独立执行与验收；按依赖关系组织（无环）',
     '- 只输出 JSON，不要输出其他说明文字',
   ].join('\n')
@@ -146,6 +146,7 @@ export const PLAN_OUTPUT_SCHEMA: Record<string, unknown> = {
         required: ['key', 'acceptance', 'deps', 'risk'],
         properties: {
           key: { type: 'string', minLength: 1 },
+          taskId: { type: 'string' },
           acceptance: { type: 'string', minLength: 1 },
           deps: { type: 'array', items: { type: 'string' } },
           risk: { type: ['string', 'null'], enum: ['L1', 'L2', 'L3', null] },

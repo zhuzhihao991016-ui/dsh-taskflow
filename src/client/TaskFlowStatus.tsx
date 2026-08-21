@@ -214,6 +214,9 @@ export function TaskFlowStatus(_props: TaskFlowStatusProps): ReactElement {
   const [pendingAction, setPendingAction] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
   const [sendingAction, setSendingAction] = useState(false)
+  const [deleteArmed, setDeleteArmed] = useState(false)
+  const [deleteError, setDeleteError] = useState<string | null>(null)
+  const [deleting, setDeleting] = useState(false)
   const chipRef = useRef<HTMLButtonElement>(null)
   const boardRef = useRef<HTMLDivElement>(null)
   const closeButtonRef = useRef<HTMLButtonElement>(null)
@@ -242,6 +245,9 @@ export function TaskFlowStatus(_props: TaskFlowStatusProps): ReactElement {
     setPendingAction(null)
     setActionError(null)
     setSendingAction(false)
+    setDeleteArmed(false)
+    setDeleteError(null)
+    setDeleting(false)
   }, [])
 
   const close = useCallback((): void => {
@@ -257,6 +263,9 @@ export function TaskFlowStatus(_props: TaskFlowStatusProps): ReactElement {
     setPendingAction(null)
     setActionError(null)
     setSendingAction(false)
+    setDeleteArmed(false)
+    setDeleteError(null)
+    setDeleting(false)
   }, [])
 
   const confirmAction = useCallback(async (action: string): Promise<void> => {
@@ -287,6 +296,30 @@ export function TaskFlowStatus(_props: TaskFlowStatusProps): ReactElement {
     }
   }, [selectedRunId])
 
+  const confirmDelete = useCallback(async (): Promise<void> => {
+    if (selectedRunId === null) return
+    setDeleting(true)
+    setDeleteError(null)
+    try {
+      const response = await fetch('/plugins/taskflow/delete', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ runId: selectedRunId }),
+      })
+      const body = await response.json() as { ok: boolean; error?: string }
+      if (!body.ok) {
+        setDeleteError(body.error ?? 'taskflow: 删除失败')
+        return
+      }
+      setRevision((value) => value + 1)
+      closeRun()
+    } catch {
+      setDeleteError('taskflow: 删除请求失败')
+    } finally {
+      setDeleting(false)
+    }
+  }, [selectedRunId, closeRun])
+
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
     if (event.key === 'Escape') {
       if (selectedRunId !== null) {
@@ -314,16 +347,24 @@ export function TaskFlowStatus(_props: TaskFlowStatusProps): ReactElement {
     }
   }
 
-  const active = state?.ok === true ? (state.runs ?? []).filter((run) => {
-    if (run.status === 'PLANNING') return true
-    if (run.status !== 'EXECUTING') return false
-    return (run.executions ?? []).some((execution) => execution.status === 'running')
-  }).length : undefined
+  const planningCount = state?.ok === true
+    ? (state.runs ?? []).filter((run) => run.status === 'PLANNING').length
+    : undefined
+  const runningCount = state?.ok === true
+    ? (state.runs ?? []).filter((run) => run.status === 'EXECUTING' && (run.executions ?? []).some((execution) => execution.status === 'running')).length
+    : undefined
+  const active = planningCount !== undefined && runningCount !== undefined
+    ? planningCount + runningCount
+    : undefined
   const label = active === undefined
     ? 'taskflow · 不可用'
-    : active > 0
-      ? `taskflow · ${active} 个运行中`
-      : 'taskflow'
+    : planningCount !== undefined && planningCount > 0
+      ? planningCount > 1
+        ? `taskflow · 正在规划 ${planningCount} 个 Issue`
+        : 'taskflow · 正在规划 Issue'
+      : runningCount !== undefined && runningCount > 0
+        ? `taskflow · ${runningCount} 个运行中`
+        : 'taskflow'
 
   return (
     <>
@@ -492,6 +533,39 @@ export function TaskFlowStatus(_props: TaskFlowStatusProps): ReactElement {
                           <p className={css.empty}>无可执行操作</p>
                         )}
                         {actionError !== null && <p className={css.actionError} role="alert">{actionError}</p>}
+                      </section>
+                      <section className={css.detailSection}>
+                        <h4>清理</h4>
+                        {deleteArmed ? (
+                          <div className={css.confirm}>
+                            <span className={css.confirmText}>确认删除该 Run 及其看板卡片？</span>
+                            <button
+                              type="button"
+                              className={css.confirmButton}
+                              disabled={deleting}
+                              onClick={() => void confirmDelete()}
+                            >
+                              确认删除
+                            </button>
+                            <button
+                              type="button"
+                              className={css.cancelButton}
+                              disabled={deleting}
+                              onClick={() => setDeleteArmed(false)}
+                            >
+                              返回
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            type="button"
+                            className={css.actionButton}
+                            onClick={() => setDeleteArmed(true)}
+                          >
+                            删除 Run
+                          </button>
+                        )}
+                        {deleteError !== null && <p className={css.actionError} role="alert">{deleteError}</p>}
                       </section>
                       <section className={css.detailSection}>
                         <h4>最近事件</h4>

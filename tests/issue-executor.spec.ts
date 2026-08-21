@@ -116,7 +116,7 @@ describe('CodexIssueExecutor', () => {
       '--config', 'model_reasoning_effort="high"',
       '--strict-config',
       '--sandbox', 'workspace-write',
-      '--ask-for-approval', 'never',
+      '--full-auto',
       '--ephemeral',
       '--color', 'never',
       '--cd', cwd,

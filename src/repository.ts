@@ -16,6 +16,8 @@ export interface TaskFlowRepository {
   insertRun(record: RunAggregate): Promise<void>
   /** Atomic read-modify-write; rejects `missing-key` when the run is absent. */
   updateRun(id: string, fn: (current: RunAggregate) => RunAggregate): Promise<RunAggregate>
+  /** Delete a run aggregate. Used by the manual cleanup entry; no-op when missing. */
+  deleteRun(id: string): Promise<void>
 }
 
 /** Repository over an opened taskflow storage domain. */
@@ -40,6 +42,10 @@ export class DomainRepository implements TaskFlowRepository {
 
   updateRun(id: string, fn: (current: RunAggregate) => RunAggregate): Promise<RunAggregate> {
     return this.runs.update(id, fn)
+  }
+
+  deleteRun(id: string): Promise<void> {
+    return this.runs.delete(id).then(() => undefined)
   }
 }
 
@@ -69,4 +75,9 @@ export class MemoryRepository implements TaskFlowRepository {
     this.runs.set(id, next)
     return Promise.resolve(next)
   }
+
+    deleteRun(id: string): Promise<void> {
+      this.runs.delete(id)
+      return Promise.resolve()
+    }
 }

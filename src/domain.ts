@@ -109,12 +109,25 @@ export interface IssueExecution {
 /** P4 review verdict. */
 export type ReviewVerdict = 'PASS' | 'REVISE'
 
+/** One structured review finding: maps a problem to the evidence needed and
+ * the acceptance criterion it belongs to. */
+export interface ReviewFinding {
+  issueKey: string
+  problem: string
+  evidenceNeeded: string[]
+  acceptance: string
+}
+
 /** The latest Codex review record persisted on a run. */
 export interface RunReview {
   verdict: ReviewVerdict
   summary: string
   /** Issue keys selected for rework; empty means all issues. */
   reworkKeys: string[]
+  /** Structured findings for the review-to-rework loop. */
+  findings?: ReviewFinding[]
+  /** Flat evidence checklist derived from findings, kept for board/UI display. */
+  evidenceChecklist?: string[]
   at: number
 }
 
@@ -130,6 +143,7 @@ const transitionSchema = z.object({
 
 const plannedIssueSchema = z.object({
   key: z.string().min(1).regex(ISSUE_KEY_PATTERN, 'unsafe issue key'),
+  taskId: z.string().optional(),
   acceptance: z.string().min(1),
   deps: z.array(z.string()).default([]),
   // The planner schema models optional risk as nullable (strict outputs).
@@ -154,6 +168,13 @@ const reviewSchema = z.object({
   verdict: z.enum(['PASS', 'REVISE']),
   summary: z.string(),
   reworkKeys: z.array(z.string()).default([]),
+  findings: z.array(z.object({
+    issueKey: z.string(),
+    problem: z.string(),
+    evidenceNeeded: z.array(z.string()).default([]),
+    acceptance: z.string(),
+  })).optional(),
+  evidenceChecklist: z.array(z.string()).optional(),
   at: z.number(),
 })
 
