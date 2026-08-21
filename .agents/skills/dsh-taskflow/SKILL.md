@@ -17,7 +17,7 @@ Run this skill only when the user explicitly invokes `dsh-taskflow` by name. It 
 |---|---|
 | Submit a task or plan Issues | `dsh-taskflow-submit-plan` |
 | Execute or monitor a run | `dsh-taskflow-execute-monitor` |
-| Handle review or rework | `dsh-taskflow-handle-review` |
+| Handle checkpoint/final review or remediation | `dsh-taskflow-handle-review` |
 | Pause, resume, cancel, accept, or rework | `dsh-taskflow-control-run` |
 | Configure automation or manual mode | `dsh-taskflow-configure-automation` |
 | Use the browser board or run console | `dsh-taskflow-use-console` |

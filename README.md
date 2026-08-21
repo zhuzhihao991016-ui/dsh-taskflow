@@ -12,28 +12,34 @@ flowchart LR
     B --> C[看板发布]
     C --> D[DSH / Codex 执行]
     D --> E[Git worktree 隔离]
-    E --> F[合并到集成分支]
-    F --> G[Codex 只读审查]
-    G -->|REVISE| D
-    G -->|PASS| H[人工验收]
-    H -->|accept| I[完成]
-    H -->|rework| B
+    E --> F[Codex CHECKPOINT<br/>gpt-5.6-sol medium]
+    F -->|FIX| D
+    F -->|REPLAN| B
+    F -->|PASS| G[合并到集成分支]
+    G -->|仍有步骤| D
+    G -->|全部完成| H[Codex FINAL<br/>gpt-5.6-sol max]
+    H -->|FIX| D
+    H -->|REPLAN| B
+    H -->|PASS| I[人工验收]
+    I -->|accept| J[完成]
+    I -->|rework| B
 ```
 
 1. **提交任务**：通过 `POST /plugins/taskflow/submit` 提交标题、描述和仓库路径。
 2. **Codex 规划**：`CodexPlanner` 以只读、临时会话方式将任务拆分为多个 Issue；每个 Issue 包含验收标准（`acceptance`）、依赖（`deps`）和风险等级（`risk`）。
 3. **看板发布**：通过 DAG 校验后的 Issue 进入五列看板：待办、进行中、待审查、已完成、失败。
-4. **执行**：DSH 会话或内置 `CodexIssueExecutor` 认领 Issue；每个 Issue 在独立 Git worktree 中执行，成功后自动提交并合并到运行级集成分支。
-5. **Codex 审查**：`CodexReviewer` 以只读方式审查集成 diff；`PASS` 进入人工验收，`REVISE` 携带结构化 findings 打回返工。
-6. **人工验收**：通过 `POST /plugins/taskflow/human-decision` 选择 `accept` 通过，或 `rework` 回到规划阶段重新开始。
+4. **执行**：DSH 会话或内置 `CodexIssueExecutor` 认领 Issue；每个 Issue 在独立 Git worktree 中执行。
+5. **逐步方向审查**：每个 Issue 完成后、合并前，`CodexReviewer` 使用 `gpt-5.6-sol` 的 `medium` 推理强度执行只读 `CHECKPOINT`。`PASS` 才允许合并；`FIX` 保留当前 worktree 原地修复；`REPLAN` 中止当前执行周期并把 findings 带回规划器。
+6. **最终审查**：全部 Issue 合并后，`CodexReviewer` 使用 `gpt-5.6-sol` 的 `max` 推理强度执行只读 `FINAL`。`PASS` 进入人工验收，`FIX` 打回相关 Issue，`REPLAN` 返回规划阶段。
+7. **人工验收**：通过 `POST /plugins/taskflow/human-decision` 选择 `accept` 通过，或 `rework` 回到规划阶段重新开始。
 
 ## 特性
 
 - **自动编排**：默认自动规划与自动审查，并在执行前等待人工 `release`；可显式关闭授权门进入全自动模式，也可切换为手动模式。
 - **任务规划**：基于 Codex CLI 的结构化输出，生成带验收标准、依赖 DAG 和风险等级的 Issue 清单。
 - **DAG 调度**：校验依赖关系、检测环，按拓扑序执行；支持 `maxConcurrent` 并行执行。
-- **Git worktree 隔离**：每个 Issue 在独立 worktree 中实现，避免互相污染；成功改动统一合并到集成分支。
-- **自动审查门禁**：Codex 只读审查集成 diff，通过后进入人工验收，不通过则带证据清单返工。
+- **Git worktree 隔离**：每个 Issue 在独立 worktree 中实现，先通过方向审查，再合并到集成分支。
+- **双阶段自动审查门禁**：每步 `CHECKPOINT / medium` 防止方向走偏；全部完成后 `FINAL / max` 做完整终审，并用 `FIX` / `REPLAN` 区分局部修复与重新规划。
 - **人工介入窗口**：支持执行前授权（`requireExecutionPermission`）、暂停/恢复/接管/重试/取消，以及最终人工验收。
 - **持久化运行台账**：基于 storage-domain 持久化 Run 聚合、状态机、事件流，支持重启恢复。
 - **浏览器运行台**：状态卡片、看板弹层、运行详情抽屉、SSE 实时事件和带二次确认的操作按钮。
@@ -55,11 +61,13 @@ RECEIVED → PLANNING → READY → EXECUTING → INTEGRATION_REVIEW → AWAITIN
 - `FAILED`：规划、执行或审查失败，可按失败前阶段重试。
 - `CANCELLED`：取消。
 
+Codex 返回 `REPLAN` 时，`EXECUTING` 或 `INTEGRATION_REVIEW` 会直接回到 `PLANNING`；旧 worktree/集成分支清理完成后，新规划会携带上一次审查反馈。
+
 ## 环境要求
 
 - 可运行的 DSH 环境（包含 web server 与 storage-domain）。
 - Codex CLI 已安装并可通过 PATH 或 `CODEX_CLI_PATH` 访问；显式路径请指向 `.js` 或 `.exe` 入口，不支持 `.cmd` / `.bat` 包装器。
-- 当前内置规划器/执行器/审查器使用 `gpt-5.6-sol` 模型，需要对应的模型访问权限。
+- 当前内置规划器、执行器和审查器使用 `gpt-5.6-sol`；逐步审查固定为 `medium`，最终审查固定为 `max`，需要对应的模型访问权限。
 - Git（用于 worktree 隔离与集成分支合并）。
 - Node.js 20.19+ 与 pnpm 11.21（开发/构建）。
 
@@ -92,9 +100,9 @@ dsh plugin --profile web add /path/to/dsh-taskflow
 | `worktreesRoot` | `''` | worktree 根目录；为空时使用仓库外的稳定同级目录，绝对路径按原值使用，相对路径兼容旧版并相对仓库解析 |
 | `automationEnabled` | `true` | 是否启用自动化编排 |
 | `autoPlan` | `true` | 自动化开启后是否自动规划 |
-| `autoReview` | `true` | 自动化开启后是否自动触发 Codex 审查 |
+| `autoReview` | `true` | 自动化开启后是否启用每步 `CHECKPOINT` 与全部完成后的 `FINAL` Codex 审查 |
 | `maxExecutorProcesses` | `2` | 全局最大 Codex 执行进程数 |
-| `maxReviewCycles` | `3` | 自动审查返工的最大轮数，超过后进入人工决策 |
+| `maxReviewCycles` | `3` | 两阶段自动 `FIX` / `REPLAN` 的最大次数，达到后进入人工决策 |
 | `requireExecutionPermission` | `true` | 自动执行前是否需要人工 `release` 放行 |
 | `teamBoardSync` | `true` | 是否将看板镜像到 team-board |
 | `teamBoardTaskPrefix` | `[taskflow]` | team-board 镜像任务的前缀 |
@@ -138,7 +146,7 @@ dsh plugin --profile web add /path/to/dsh-taskflow
 | POST | `/plugins/taskflow/execute` | 启动/继续执行，认领可调度 Issue |
 | POST | `/plugins/taskflow/exec-result` | 上报 Issue 执行结果 |
 | POST | `/plugins/taskflow/progress` | 上报自动化执行进度 |
-| POST | `/plugins/taskflow/review` | 触发 Codex 只读审查 |
+| POST | `/plugins/taskflow/review` | 在 `INTEGRATION_REVIEW` 手动触发 Codex `FINAL` 只读审查 |
 | POST | `/plugins/taskflow/human-decision` | 人工验收：`accept` / `rework` |
 
 ## 与 team-board 联动
@@ -158,7 +166,7 @@ dsh plugin --profile web add /path/to/dsh-taskflow
 | `dsh-taskflow` | 入口/路由，按用户目标选择对应 skill |
 | `dsh-taskflow-submit-plan` | 提交任务、触发规划、处理 `READY` / `FAILED` |
 | `dsh-taskflow-execute-monitor` | 认领 Issue、执行监控、上报结果/进度 |
-| `dsh-taskflow-handle-review` | Codex 只读审查、`PASS` / `REVISE`、返工处理 |
+| `dsh-taskflow-handle-review` | Codex `CHECKPOINT` / `FINAL` 只读审查及 `CONTINUE` / `FIX` / `REPLAN` 路由 |
 | `dsh-taskflow-control-run` | 暂停/恢复/取消/接管/放行/重试/人工验收 |
 | `dsh-taskflow-configure-automation` | 自动化/手动模式与并发/权限配置 |
 | `dsh-taskflow-use-console` | 浏览器看板、运行台、SSE 与确认操作 |
@@ -191,7 +199,7 @@ pnpm run check
 - `src/state.ts` — Run 状态机与合法迁移表。
 - `src/dag.ts` — Issue 计划校验与依赖拓扑排序。
 - `src/planner.ts` — Codex CLI 规划执行器。
-- `src/reviewer.ts` — Codex CLI 只读审查执行器。
+- `src/reviewer.ts` — Codex CLI 双阶段只读审查执行器（CHECKPOINT / FINAL）。
 - `src/executor.ts` / `src/issue-executor.ts` — 执行器接口与内置 Codex Issue Executor。
 - `src/worktree.ts` — Git worktree 管理（建分支、合并、清理）。
 - `src/contracts.ts` — 自动化执行器、控制动作、事件与配置契约。

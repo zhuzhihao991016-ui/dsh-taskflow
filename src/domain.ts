@@ -69,7 +69,7 @@ export interface RunControl {
   paused: boolean
   takenOver: boolean
   retryCount: number
-  /** P8.3: number of automatic review/rework cycles completed for this run. */
+  /** Number of automatic FIX/REPLAN decisions applied across both review stages. */
   reviewCycles?: number
 }
 
@@ -98,6 +98,8 @@ export interface IssueExecution {
   workDir?: string
   /** P5: per-issue branch created for the worktree. */
   branch?: string
+  /** Immutable integration-branch head this issue branch started from. */
+  branchBaseSha?: string
   /** P8.1: monotonic automated-executor attempt id for this issue. */
   attemptId?: string
   /** P8.1: coarse automated-executor phase (persisted progress). */
@@ -108,6 +110,10 @@ export interface IssueExecution {
 
 /** P4 review verdict. */
 export type ReviewVerdict = 'PASS' | 'REVISE'
+
+/** Codex review stage and the follow-up action selected by that review. */
+export type ReviewStage = 'CHECKPOINT' | 'FINAL'
+export type ReviewNextAction = 'CONTINUE' | 'FIX' | 'REPLAN'
 
 /** One structured review finding: maps a problem to the evidence needed and
  * the acceptance criterion it belongs to. */
@@ -121,6 +127,12 @@ export interface ReviewFinding {
 /** The latest Codex review record persisted on a run. */
 export interface RunReview {
   verdict: ReviewVerdict
+  /** CHECKPOINT reviews gate one Issue before merge; FINAL reviews gate acceptance. */
+  stage?: ReviewStage
+  /** Focus issue for a CHECKPOINT review. */
+  issueKey?: string
+  /** CONTINUE for PASS, otherwise direct FIX or full REPLAN. */
+  nextAction?: ReviewNextAction
   summary: string
   /** Issue keys selected for rework; empty means all issues. */
   reworkKeys: string[]
@@ -159,6 +171,7 @@ const issueExecutionSchema = z.object({
   error: z.string().optional(),
   workDir: z.string().optional(),
   branch: z.string().optional(),
+  branchBaseSha: z.string().optional(),
   attemptId: z.string().optional(),
   phase: z.enum(EXECUTOR_PHASES).optional(),
   heartbeatAt: z.number().optional(),
@@ -173,6 +186,9 @@ const reviewFindingSchema = z.object({
 
 const reviewSchema = z.object({
   verdict: z.enum(['PASS', 'REVISE']),
+  stage: z.enum(['CHECKPOINT', 'FINAL']).optional(),
+  issueKey: z.string().regex(ISSUE_KEY_PATTERN, 'unsafe issue key').optional(),
+  nextAction: z.enum(['CONTINUE', 'FIX', 'REPLAN']).optional(),
   summary: z.string(),
   reworkKeys: z.array(z.string().regex(ISSUE_KEY_PATTERN, 'unsafe issue key')).default([]),
   findings: z.array(reviewFindingSchema).optional(),
@@ -273,6 +289,22 @@ const runAggregateSchema = z.object({
   // planned set also covers the pattern; standalone malformed strings are
   // rejected earlier with a `review.*` Zod path.
   if (run.review !== undefined) {
+    if (run.review.verdict === 'PASS' && run.review.nextAction !== undefined && run.review.nextAction !== 'CONTINUE') {
+      ctx.addIssue({ code: 'custom', path: ['review', 'nextAction'], message: 'PASS review must use CONTINUE' })
+    }
+    if (run.review.verdict === 'REVISE' && run.review.nextAction === 'CONTINUE') {
+      ctx.addIssue({ code: 'custom', path: ['review', 'nextAction'], message: 'REVISE review must use FIX or REPLAN' })
+    }
+    if (run.review.stage === 'CHECKPOINT' && run.review.issueKey === undefined) {
+      ctx.addIssue({ code: 'custom', path: ['review', 'issueKey'], message: 'CHECKPOINT review requires an issue key' })
+    }
+    if (run.review.issueKey !== undefined && !issueKeys.has(run.review.issueKey)) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['review', 'issueKey'],
+        message: `review issue key '${run.review.issueKey}' does not reference a planned issue`,
+      })
+    }
     for (const [index, key] of run.review.reworkKeys.entries()) {
       if (!issueKeys.has(key)) {
         ctx.addIssue({

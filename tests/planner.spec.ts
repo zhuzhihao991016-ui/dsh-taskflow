@@ -331,6 +331,20 @@ describe('buildPlanPrompt', () => {
     expect(prompt).toContain('T')
     expect(prompt).toContain('D')
     expect(prompt).toContain('--output-schema')
+    expect(prompt).not.toContain('重新规划反馈')
+  })
+
+  it('includes review feedback when a run is replanned', () => {
+    const prompt = buildPlanPrompt({
+      title: 'T',
+      description: 'D',
+      replanFeedback: '技术路线偏离目标，需要重新划分依赖。',
+      repoRoot: 'R',
+      workDir: '',
+    })
+    expect(prompt).toContain('重新规划反馈')
+    expect(prompt).toContain('技术路线偏离目标')
+    expect(prompt).toContain('不要机械复刻旧计划')
   })
 })
 

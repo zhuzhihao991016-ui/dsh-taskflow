@@ -267,6 +267,8 @@ export const spawnCodexProcess: ProcessExecutor = {
 export interface PlanInput {
   title: string
   description: string
+  /** Review feedback that triggered a fresh plan; absent on initial planning. */
+  replanFeedback?: string
   /** Repo root the Codex run works in (read-only). */
   repoRoot: string
   /** Spool/work directory for the schema file and artifacts. */
@@ -286,6 +288,14 @@ export function buildPlanPrompt(input: PlanInput): string {
     '## 任务目标',
     input.title,
     input.description !== '' ? input.description : '（无附加描述）',
+    ...(input.replanFeedback?.trim() !== '' && input.replanFeedback !== undefined
+      ? [
+          '',
+          '## 重新规划反馈',
+          input.replanFeedback.trim(),
+          '请根据以上反馈重新判断 Issue 边界、依赖、技术路线和验收标准，不要机械复刻旧计划。',
+        ]
+      : []),
     '',
     '## 输出要求',
     '- `issues` 数组，每项含：`key`（唯一，如 issue-001）、`taskId`（可选，项目内原始任务 ID，如 TF-000）、`acceptance`（非空验收标准）、`deps`（依赖的 issue key 数组，可省略）、`risk`（L1/L2/L3，可省略）',

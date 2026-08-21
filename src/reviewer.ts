@@ -6,10 +6,10 @@
  * fakes; the production executor reuses the planner's Codex process spawner.
  */
 
-import { mkdir, writeFile } from 'node:fs/promises'
-import { join, resolve } from 'node:path'
-import type { PlannedIssue } from './dag.ts'
-import type { IssueExecution } from './domain.ts'
+import { mkdir, writeFile } from 'node:fs/promises'
+import { join, resolve } from 'node:path'
+import type { PlannedIssue } from './dag.ts'
+import type { IssueExecution, ReviewNextAction, ReviewStage } from './domain.ts'
 import {
   lastAssistantText,
   resolveCodexCli,
@@ -37,9 +37,13 @@ export class ReviewerError extends Error {
 }
 
 /** Everything a reviewer needs to audit one completed run. */
-export interface ReviewInput {
-  /** Owning run id, e.g. `run-0001`. */
-  runId: string
+export interface ReviewInput {
+  /** Review kind; omitted by legacy callers and treated as FINAL. */
+  stage?: ReviewStage
+  /** Issue under review during a CHECKPOINT review. */
+  issueKey?: string
+  /** Owning run id, e.g. `run-0001`. */
+  runId: string
   /** Run title (the original task goal). */
   title: string
   /** Run description when present. */
@@ -50,10 +54,16 @@ export interface ReviewInput {
   issues: readonly PlannedIssue[]
   /** Per-issue execution outcomes (summaries/errors) to review. */
   executions: readonly IssueExecution[]
-  /** Spool directory for this run's review artifacts. */
-  workDir: string
+  /** Spool directory for this run's review artifacts. */
+  workDir: string
+  /** Optional worktree in which Codex should inspect the comparison. */
+  reviewRoot?: string
   /** Optional cancellation signal forwarded to the process executor. */
   signal?: AbortSignal
+  /** Neutral comparison range used by CHECKPOINT reviews. */
+  reviewBaseSha?: string
+  reviewTargetBranch?: string
+  reviewTargetHeadSha?: string
   /** P5: base commit SHA the execution started from; when present the review
    * inspects the integration-branch diff against this SHA instead of
    * uncommitted changes. */
@@ -72,10 +82,12 @@ export interface ReviewFinding {
   acceptance: string
 }
 
-/** Review outcome: PASS (human acceptance) or REVISE (rework selected issues). */
-export type ReviewResult =
-  | { verdict: 'PASS'; summary: string; reworkKeys: readonly string[]; findings?: readonly ReviewFinding[]; evidenceChecklist?: readonly string[] }
-  | { verdict: 'REVISE'; summary: string; reworkKeys: readonly string[]; findings?: readonly ReviewFinding[]; evidenceChecklist?: readonly string[] }
+/** Review outcome plus the orchestration action selected by Codex. */
+export type ReviewResult =
+  | { verdict: 'PASS'; nextAction: Extract<ReviewNextAction, 'CONTINUE'>; summary: string; reworkKeys: readonly string[]; findings?: readonly ReviewFinding[]; evidenceChecklist?: readonly string[] }
+  | { verdict: 'REVISE'; nextAction: Extract<ReviewNextAction, 'FIX' | 'REPLAN'>; summary: string; reworkKeys: readonly string[]; findings?: readonly ReviewFinding[]; evidenceChecklist?: readonly string[] }
+
+export type { ReviewNextAction, ReviewStage } from './domain.ts'
 
 /** Reviewer contract; production uses CodexReviewer, tests use fakes. The
  * adapter returns the raw parsed object; service-level validation converts it
@@ -85,8 +97,12 @@ export interface Reviewer {
 }
 
 /** The review prompt template (Chinese, task-pack style). */
-export function buildReviewPrompt(input: ReviewInput): string {
-  const issueLines = input.issues.map((issue) => {
+export function buildReviewPrompt(input: ReviewInput): string {
+  const stage = input.stage ?? 'FINAL'
+  const reviewBaseSha = input.reviewBaseSha ?? input.baseSha
+  const reviewTargetBranch = input.reviewTargetBranch ?? input.integrationBranch
+  const reviewTargetHeadSha = input.reviewTargetHeadSha ?? input.integrationHeadSha
+  const issueLines = input.issues.map((issue) => {
     const deps = (issue.deps ?? []).length > 0 ? `，依赖 ${(issue.deps ?? []).join(', ')}` : ''
     const risk = issue.risk != null ? `，风险 ${issue.risk}` : ''
     return `- ${issue.key}：${issue.acceptance}${deps}${risk}`
@@ -98,33 +114,44 @@ export function buildReviewPrompt(input: ReviewInput): string {
         ? `失败：${execution.error ?? ''}`
         : execution.status
     return `- ${execution.key}：${outcome}`
-  }).join('\n')
-  return [
-    '你是只读代码审查员。请对下面任务在指定仓库中的全部已执行 Issue 进行集成审查，并给出最终结论。',
-    '',
-    '## 任务',
+  }).join('\n')
+  return [
+    stage === 'CHECKPOINT'
+      ? '你是只读方向审查员。请审查刚完成的单个 Issue，确认实现方向、范围和架构没有偏离任务与计划。'
+      : '你是只读终审员。请对全部已执行 Issue 及其集成结果进行完整终审，并给出最终结论。',
+    '',
+    '## 审查阶段',
+    stage === 'CHECKPOINT'
+      ? `CHECKPOINT（聚焦 ${input.issueKey ?? '当前 Issue'}，仅做合并前方向检查）`
+      : 'FINAL（全部步骤完成后的最终审查）',
+    '',
+    '## 任务',
     input.title,
     input.description !== '' ? input.description : '（无附加描述）',
-    '',
-    '## 仓库根',
-    input.repoRoot,
+    '',
+    '## 仓库根',
+    input.repoRoot,
+    input.reviewRoot !== undefined ? `审查工作树：${input.reviewRoot}` : '',
     '',
     '## Issue 与验收标准',
     issueLines,
     '',
     '## 执行结果',
     executionLines === '' ? '（无）' : executionLines,
-    '',
-    '## 审查要求',
-    input.baseSha !== undefined && input.integrationHeadSha !== undefined
-      ? `- 只读审查当前仓库相对基准 ${input.baseSha} 到集成分支 ${input.integrationBranch ?? 'taskflow/integration'} 头 ${input.integrationHeadSha} 的改动（含已合并到集成分支的提交），用 git diff/range 审查该区间，不得修改任何文件`
-      : input.baseSha !== undefined
-        ? `- 只读审查当前仓库相对基准 ${input.baseSha} 的改动（含已合并到集成分支的提交），不得修改任何文件`
-        : '- 只读审查当前仓库的未提交改动（uncommitted changes），不得修改任何文件',
-    '- 判断全部 Issue 是否满足验收标准、整体是否可进入人工验收',
-    '- 输出必须符合 --output-schema 给定的 JSON Schema，只输出 JSON',
-    '- `verdict` 为 PASS 表示通过；REVISE 表示需要打回返工',
-    '- `reworkKeys` 为需要返工的 Issue key 数组；PASS 时必须为空数组，REVISE 时列出需要返工的 key（空数组表示全部返工）',
+    '',
+    '## 审查要求',
+    reviewBaseSha !== undefined && reviewTargetHeadSha !== undefined
+      ? `- 只读审查基准 ${reviewBaseSha} 到目标分支 ${reviewTargetBranch ?? '当前目标分支'} 头 ${reviewTargetHeadSha} 的改动，用 git diff/range 审查该区间，不得修改任何文件`
+      : reviewBaseSha !== undefined
+        ? `- 只读审查当前仓库相对基准 ${reviewBaseSha} 的改动，不得修改任何文件`
+        : '- 只读审查当前仓库的未提交改动（uncommitted changes），不得修改任何文件',
+    stage === 'CHECKPOINT'
+      ? '- 重点判断当前 Issue 是否沿着正确方向推进：是否偏离目标、越界扩张、采用错误架构、破坏既定依赖或使后续步骤建立在错误前提上；不要把非必要润色当成阻断项'
+      : '- 完整判断全部 Issue 是否满足验收标准、集成行为是否正确、整体是否可进入人工验收',
+    '- 输出必须符合 --output-schema 给定的 JSON Schema，只输出 JSON',
+    '- `verdict` 为 PASS 表示通过；REVISE 表示需要打回返工',
+    '- `nextAction`：PASS 时必须为 CONTINUE；REVISE 且问题可在当前计划内局部修复时为 FIX；若任务拆分、技术路线、核心假设或跨 Issue 方向错误时为 REPLAN',
+    '- `reworkKeys` 为需要返工的 Issue key 数组；PASS 时必须为空数组，REVISE 时列出需要返工的 key（空数组表示全部返工）',
     '- 当 REVISE 时，`findings` 必须给出结构化问题清单：每项含 `issueKey`、`problem`、`evidenceNeeded`（待补证据清单）、`acceptance`（对应验收标准）',
     '- `evidenceChecklist` 为所有 findings 的 evidenceNeeded 汇总清单，便于后续执行/验收映射',
   ].join('\n')
@@ -137,10 +164,11 @@ export const REVIEW_OUTPUT_SCHEMA: Record<string, unknown> = {
   $schema: 'http://json-schema.org/draft-07/schema#',
   type: 'object',
   additionalProperties: false,
-  required: ['verdict', 'summary', 'reworkKeys'],
-  properties: {
-    verdict: { type: 'string', enum: ['PASS', 'REVISE'] },
-    summary: { type: 'string' },
+  required: ['verdict', 'nextAction', 'summary', 'reworkKeys'],
+  properties: {
+    verdict: { type: 'string', enum: ['PASS', 'REVISE'] },
+    nextAction: { type: 'string', enum: ['CONTINUE', 'FIX', 'REPLAN'] },
+    summary: { type: 'string' },
     reworkKeys: { type: 'array', items: { type: 'string' } },
       findings: {
         type: 'array',
@@ -201,21 +229,25 @@ export class CodexReviewer {
 
   /** Produce a review object for one completed run; never mutates the repo
    * (read-only + ephemeral). */
-  async review(input: ReviewInput): Promise<unknown> {
-    const schemaPath = await writeReviewSchema(input.workDir)
-    const prompt = buildReviewPrompt(input)
-    // Canonicalize once: cwd is the repo root the review runs against.
-    const repoRoot = resolve(input.repoRoot)
+  async review(input: ReviewInput): Promise<unknown> {
+    const schemaPath = await writeReviewSchema(input.workDir)
+    const prompt = buildReviewPrompt(input)
+    const stage = input.stage ?? 'FINAL'
+    const reasoningEffort = stage === 'CHECKPOINT' ? 'medium' : 'max'
+    const comparisonBaseSha = input.reviewBaseSha ?? input.baseSha
+    // Canonicalize once: checkpoint reviews run inside the issue worktree;
+    // final reviews run against the owning repository root.
+    const repoRoot = resolve(input.reviewRoot ?? input.repoRoot)
     // With a base SHA (P5 integration-branch review) the `codex exec review
     // --base` form cannot carry a custom prompt in Codex 0.146.0, so use the
     // generic `codex exec` read-only form with --cd and include the base in
     // the prompt. Without a base SHA keep the P4 `review --uncommitted` form.
-    const command = input.baseSha !== undefined
-      ? [
-          this.cliPath,
-          'exec',
-          '--model', 'gpt-5.6-sol',
-          '--config', 'model_reasoning_effort="high"',
+    const command = comparisonBaseSha !== undefined
+      ? [
+          this.cliPath,
+          'exec',
+          '--model', 'gpt-5.6-sol',
+          '--config', `model_reasoning_effort="${reasoningEffort}"`,
           '--config', 'sandbox_mode="read-only"',
           '--strict-config',
           '--ephemeral',
@@ -227,10 +259,10 @@ export class CodexReviewer {
         ]
       : [
           this.cliPath,
-          'exec',
-          'review',
-          '--model', 'gpt-5.6-sol',
-          '--config', 'model_reasoning_effort="high"',
+          'exec',
+          'review',
+          '--model', 'gpt-5.6-sol',
+          '--config', `model_reasoning_effort="${reasoningEffort}"`,
           '--config', 'sandbox_mode="read-only"',
           '--strict-config',
           '--ephemeral',

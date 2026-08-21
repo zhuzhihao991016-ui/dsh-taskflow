@@ -133,8 +133,10 @@ export interface RunDetailResponse {
 export interface AutomationConfig {
   enabled: boolean
   autoPlan: boolean
+  /** Enables per-Issue CHECKPOINT review and the all-Issue FINAL review. */
   autoReview: boolean
   maxExecutorProcesses: number
+  /** Maximum automated FIX/REPLAN decisions across both review stages. */
   maxReviewCycles: number
   /** P8.4: when true, automatic execution waits in WAITING_PERMISSION until a human releases it. */
   requireExecutionPermission: boolean

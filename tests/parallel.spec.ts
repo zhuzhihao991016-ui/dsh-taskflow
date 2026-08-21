@@ -9,6 +9,7 @@ import type { PlannedIssue } from '../src/dag.ts'
 import type { RunAggregate } from '../src/domain.ts'
 import type { ExecutionInput, ExecutionResult, Executor } from '../src/executor.ts'
 import { MemoryRepository } from '../src/repository.ts'
+import type { ReviewInput, Reviewer } from '../src/reviewer.ts'
 import { TaskFlowService } from '../src/service.ts'
 import type { GitResult, GitRunner } from '../src/worktree.ts'
 
@@ -62,6 +63,15 @@ class DelayedFailExecutor implements Executor {
       return { ok: false, error: 'A 失败' }
     }
     return { ok: true, summary: `完成 ${input.issue.key}` }
+  }
+}
+
+class RecordingPassReviewer implements Reviewer {
+  readonly inputs: ReviewInput[] = []
+
+  async review(input: ReviewInput): Promise<unknown> {
+    this.inputs.push(input)
+    return { verdict: 'PASS', nextAction: 'CONTINUE', summary: '通过', reworkKeys: [] }
   }
 }
 
@@ -218,6 +228,59 @@ describe('P5 parallel execution', () => {
       && args[1] === 'remove'
       && args[args.length - 1]?.replaceAll('\\', '/').endsWith('/run-0001/issue-002')
     ))).toBe(true)
+  })
+
+  it('defers a successful sibling until CHECKPOINT when its wave has failed', async () => {
+    const repository = new MemoryRepository()
+    const git = new FakeGit()
+    const executor = new DelayedFailExecutor()
+    const reviewer = new RecordingPassReviewer()
+    const service = new TaskFlowService(
+      repository,
+      () => 1000,
+      undefined,
+      ['C:/repo'],
+      executor,
+      reviewer,
+      { git, automationEnabled: true, autoReview: true, maxConcurrent: 2 },
+    )
+    seedReady(repository, [issueA, issueB])
+    await repository.updateRun('run-0001', (current) => ({
+      ...current,
+      control: {
+        automation: { enabled: true, mode: 'automatic' },
+        paused: false,
+        takenOver: false,
+        retryCount: 0,
+      },
+    }))
+
+    await service.startExecution('run-0001', { wait: true })
+
+    let run = repository.getRun('run-0001') as RunAggregate
+    expect(run.status).toBe('FAILED')
+    expect(run.executions.find((execution) => execution.key === 'issue-001')?.status).toBe('failed')
+    expect(run.executions.find((execution) => execution.key === 'issue-002')?.status).toBe('pending')
+    expect(reviewer.inputs).toHaveLength(0)
+    expect(git.calls.some((args) => args[0] === 'merge' && args.includes('taskflow/run-0001/issue-002'))).toBe(false)
+    expect(git.calls.some((args) => (
+      args[0] === 'worktree'
+      && args[1] === 'remove'
+      && args[args.length - 1]?.replaceAll('\\', '/').endsWith('/run-0001/issue-002')
+    ))).toBe(false)
+
+    executor.failIssue001 = false
+    const retried = await service.command('run-0001', 'retry')
+    expect(retried.ok).toBe(true)
+    await waitFor(() => service.snapshot('run-0001')?.status === 'AWAITING_HUMAN')
+
+    run = repository.getRun('run-0001') as RunAggregate
+    expect(run.executions.every((execution) => execution.status === 'done')).toBe(true)
+    expect(reviewer.inputs.map((input) => [input.stage, input.issueKey])).toEqual([
+      ['CHECKPOINT', 'issue-001'],
+      ['CHECKPOINT', 'issue-002'],
+      ['FINAL', undefined],
+    ])
   })
 
   it('retry after a wave failure restarts only the failed issue with a fresh attempt', async () => {

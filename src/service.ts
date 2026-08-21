@@ -19,7 +19,7 @@ import {
   type TaskFlowEventKind,
 } from './contracts.ts'
 import type { AutomatedExecutionInput, AutomatedExecutionResult, AutomatedExecutor } from './contracts.ts'
-import { runAggregateSchema, type IssueExecution, type ReviewVerdict, type RunAggregate, type RunControl, type RunGitIsolation, type RunTransition } from './domain.ts'
+import { runAggregateSchema, type IssueExecution, type ReviewNextAction, type ReviewStage, type ReviewVerdict, type RunAggregate, type RunControl, type RunGitIsolation, type RunReview, type RunTransition } from './domain.ts'
 import type { PlannedIssue, RiskLevel } from './dag.ts'
 import { validatePlan } from './dag.ts'
 import type { ExecutionResult, Executor } from './executor.ts'
@@ -48,6 +48,9 @@ export interface RunSnapshot {
   /** Latest Codex review result (P4); absent until a review completes. */
   review?: {
     verdict: ReviewVerdict
+    stage?: ReviewStage
+    issueKey?: string
+    nextAction?: ReviewNextAction
     summary: string
     reworkKeys: string[]
     findings?: Array<{
@@ -159,6 +162,8 @@ export type ExecutionStartResult =
 /** Result of reporting one issue outcome. */
 export type ExecutionReport = { ok: true } | { ok: false; error: string }
 
+type CheckpointReviewOutcome = 'continue' | 'handled' | { error: string }
+
 /** Result of starting the P4 review gate. */
 export type ReviewStartResult =
   | { ok: true; runId: string; status: RunStatus; alreadyReviewing: boolean; verdict?: ReviewVerdict }
@@ -203,9 +208,9 @@ export interface TaskFlowOptions {
   maxExecutorProcesses?: number
   /** P8.3: automatically start planning when automation is enabled. */
   autoPlan?: boolean
-  /** P8.3: automatically start Codex review when automation is enabled. */
+  /** Automatically run per-Issue CHECKPOINT and all-Issue FINAL reviews. */
   autoReview?: boolean
-  /** P8.3: maximum automatic review/rework cycles before asking a human. */
+  /** Maximum automatic FIX/REPLAN decisions before asking a human. */
   maxReviewCycles?: number
   /** P8.4: wait for human release before automatic execution starts. */
   requireExecutionPermission?: boolean
@@ -267,6 +272,8 @@ export class TaskFlowService {
   private readonly startingExecutions = new Map<string, Promise<void>>()
   /** Runs whose P4 review flow is in flight (single-flight gate). */
   private readonly reviewFlows = new Map<string, Promise<void>>()
+  /** Runs cleaning an abandoned plan before a new planning flow may start. */
+  private readonly replanFlows = new Map<string, Promise<void>>()
   /** Per-repository merge serialization: repoRoot → tail promise. */
   private readonly mergeTails = new Map<string, Promise<void>>()
   /** Serializes submits: idempotency check, id allocation, and insertion run
@@ -295,6 +302,8 @@ export class TaskFlowService {
   private readonly executorWaiters: Array<() => void> = []
   /** Per-run outcome tails: parallel reports/merges settle in claim order. */
   private readonly outcomeLocks = new Map<string, Promise<void>>()
+  /** Per-run checkpoint tails: every successful Issue is reviewed before merge. */
+  private readonly checkpointTails = new Map<string, Promise<void>>()
 
   constructor(
     private readonly repository: TaskFlowRepository,
@@ -587,12 +596,16 @@ export class TaskFlowService {
               )),
               events: append('automation.paused', { summary: 'paused' }),
             })
-          case 'resume':
-            assertTransition(current.status, 'EXECUTING')
-            return transitionTo('EXECUTING', 'resumed', `command:resume:${runId}:${current.transitions.length}`, {
+          case 'resume': {
+            const resumeTarget = current.status === 'WAITING_DECISION' && current.review?.nextAction === 'REPLAN'
+              ? 'PLANNING'
+              : 'EXECUTING'
+            assertTransition(current.status, resumeTarget)
+            return transitionTo(resumeTarget, resumeTarget === 'PLANNING' ? 'resumed-replan' : 'resumed', `command:resume:${runId}:${current.transitions.length}`, {
               control: { ...control, paused: false },
-              events: append('automation.resumed', { summary: 'resumed' }),
+              events: append('automation.resumed', { summary: resumeTarget === 'PLANNING' ? 'resumed-replan' : 'resumed' }),
             })
+          }
           case 'takeover':
             assertTransition(current.status, 'WAITING_PERMISSION')
             return transitionTo('WAITING_PERMISSION', 'takeover', `command:takeover:${runId}:${current.transitions.length}`, {
@@ -671,13 +684,16 @@ export class TaskFlowService {
       // merging=true) never aborts active work.
       if (action === 'cancel' || action === 'pause' || action === 'takeover') {
         this.abortRunExecutions(runId)
+        this.abortRunReview(runId)
         if (action === 'cancel') {
           this.abortRunPlanning(runId)
-          this.abortRunReview(runId)
         }
       }
       if ((action === 'resume' || action === 'release' || action === 'retry') && updated.status === 'EXECUTING' && this.automationEnabled && this.executor !== undefined && this.isRunAutomationEnabled(updated)) {
         void this.ensureExecutionFlow(runId).catch(() => undefined)
+      }
+      if (action === 'resume' && updated.status === 'PLANNING' && updated.review?.nextAction === 'REPLAN') {
+        this.scheduleReplan(updated)
       }
       if (action === 'retry' && updated.status === 'PLANNING' && this.automationEnabled && this.autoPlan && this.isRunAutomationEnabled(updated)) {
         void this.plan(runId).catch(() => undefined)
@@ -825,6 +841,10 @@ export class TaskFlowService {
    * returning right after the PLANNING transition.
    */
   async plan(runId: string, options: { wait?: boolean } = {}): Promise<PlanStartResult> {
+    const replanFlow = this.replanFlows.get(runId)
+    if (replanFlow !== undefined) {
+      await replanFlow.catch(() => undefined)
+    }
     const run = this.repository.getRun(runId)
     if (run === undefined) {
       return { ok: false, error: `taskflow: unknown run ${runId}` }
@@ -841,7 +861,7 @@ export class TaskFlowService {
     // title/description must be allowed to invoke the planner again instead of
     // being treated as already-planned.
     const lastReworkSeq = run.transitions
-      .filter((t) => t.reason === 'human-rework')
+      .filter((t) => t.reason === 'human-rework' || t.reason === 'review-replan')
       .reduce((max, t) => Math.max(max, t.seq), -1)
     const hasPlanDone = run.transitions.some((t) =>
       t.idempotencyKey === `plan:done:${inputHash}` && t.seq > lastReworkSeq
@@ -936,7 +956,11 @@ export class TaskFlowService {
   resumePlanning(): void {
     for (const run of this.repository.listRuns()) {
       if (run.status === 'PLANNING') {
-        void this.plan(run.id).catch(() => undefined)
+        if (run.transitions.at(-1)?.reason === 'review-replan') {
+          this.scheduleReplan(run, true)
+        } else {
+          void this.plan(run.id).catch(() => undefined)
+        }
       }
     }
   }
@@ -1100,13 +1124,16 @@ export class TaskFlowService {
 
   /**
    * Report one issue's outcome to the runner. The issue must be one of the
-   * currently `running` issues. A success is first merged from its worktree
-   * branch into the integration branch, then recorded as `done`; the last
-   * success moves the run to INTEGRATION_REVIEW. A failure is recorded as
-   * `failed` and moves the run to FAILED. All checks re-run inside the
-   * repository's atomic RMW.
+   * currently `running` issues. Reports are serialized per run so a successful
+   * Issue can pass its CHECKPOINT review before any branch merge occurs.
    */
   async reportResult(runId: string, issueKey: string, result: ExecutionResult): Promise<ExecutionReport> {
+    return this.withCheckpointLock(runId, () => this.reportResultBody(runId, issueKey, result))
+  }
+
+  /** CHECKPOINT-gated report body. A PASS may merge and finish the Issue;
+   * FIX/REPLAN is handled before the integration branch is touched. */
+  private async reportResultBody(runId: string, issueKey: string, result: ExecutionResult): Promise<ExecutionReport> {
     const run = this.repository.getRun(runId)
     if (run === undefined) {
       return { ok: false, error: `taskflow: unknown run ${runId}` }
@@ -1117,6 +1144,11 @@ export class TaskFlowService {
     const running = (run.executions ?? []).find((execution) => execution.status === 'running' && execution.key === issueKey)
     if (running === undefined) {
       return { ok: false, error: `taskflow: issue '${issueKey}' is not currently running` }
+    }
+    if (result.ok) {
+      const checkpoint = await this.runCheckpointReview(run, running, result)
+      if (checkpoint === 'handled') return { ok: true }
+      if (checkpoint !== 'continue') return { ok: false, error: checkpoint.error }
     }
     let effectiveResult: ExecutionResult
     try {
@@ -1145,6 +1177,7 @@ export class TaskFlowService {
               summary: effectiveResult.summary,
               workDir: currentRunning.workDir,
               branch: currentRunning.branch,
+              branchBaseSha: currentRunning.branchBaseSha,
               attemptId: currentRunning.attemptId,
               phase: 'done',
               heartbeatAt: currentRunning.heartbeatAt,
@@ -1157,6 +1190,7 @@ export class TaskFlowService {
               error: effectiveResult.error,
               workDir: currentRunning.workDir,
               branch: currentRunning.branch,
+              branchBaseSha: currentRunning.branchBaseSha,
               attemptId: currentRunning.attemptId,
               phase: 'failed',
               heartbeatAt: currentRunning.heartbeatAt,
@@ -1211,6 +1245,189 @@ export class TaskFlowService {
       }
       throw error
     }
+  }
+
+  /** Run the medium-effort merge checkpoint for one successful Issue. */
+  private async runCheckpointReview(
+    run: RunAggregate,
+    running: IssueExecution,
+    result: Extract<ExecutionResult, { ok: true }>,
+  ): Promise<CheckpointReviewOutcome> {
+    if (!this.automationEnabled || !this.autoReview || !this.isRunAutomationEnabled(run)) {
+      return 'continue'
+    }
+    if (run.repoRoot === undefined || running.workDir === undefined || running.branch === undefined) {
+      return this.failCheckpointReview(run.id, running.key, 'checkpoint review requires repoRoot, workDir, and branch')
+    }
+    const controller = new AbortController()
+    this.activeReviews.set(run.id, controller)
+    try {
+      await this.repository.updateRun(run.id, (current) => {
+        const currentExecution = current.executions.find((execution) => execution.key === running.key)
+        if (current.status !== 'EXECUTING' || currentExecution?.status !== 'running') return current
+        const next: RunAggregate = {
+          ...current,
+          updatedAt: this.now(),
+          events: this.appendEvent(current.events ?? [], run.id, 'review.started', {
+            issueKey: running.key,
+            summary: 'CHECKPOINT',
+          }),
+        }
+        runAggregateSchema.parse(next)
+        return next
+      })
+      if (controller.signal.aborted) return 'handled'
+
+      await this.worktrees.commitWorktreeEdits(running.workDir, `taskflow ${run.id} ${running.key}`)
+      const targetHeadSha = await this.worktrees.getBranchHeadSha(run.repoRoot, running.branch)
+      if (controller.signal.aborted) return 'handled'
+      const executions = (run.executions ?? []).map((execution) => (
+        execution.key === running.key
+          ? { ...execution, status: 'done' as const, summary: result.summary, finishedAt: this.now() }
+          : execution
+      ))
+      const raw = await this.reviewer.review({
+        stage: 'CHECKPOINT',
+        issueKey: running.key,
+        runId: run.id,
+        title: run.title,
+        description: run.description,
+        repoRoot: run.repoRoot,
+        reviewRoot: running.workDir,
+        issues: run.issues,
+        executions,
+        workDir: join(defaultPlanRoot(), run.id, 'reviews', running.key),
+        reviewBaseSha: running.branchBaseSha ?? run.baseSha,
+        reviewTargetBranch: running.branch,
+        reviewTargetHeadSha: targetHeadSha,
+        signal: controller.signal,
+      })
+      if (controller.signal.aborted) return 'handled'
+      const live = this.repository.getRun(run.id)
+      const liveExecution = live?.executions.find((execution) => execution.key === running.key)
+      if (live === undefined || live.status !== 'EXECUTING' || liveExecution?.status !== 'running') {
+        return 'handled'
+      }
+      const review = this.normalizeReviewResult(live, raw, 'CHECKPOINT', running.key)
+      if (review.verdict === 'PASS') {
+        await this.repository.updateRun(run.id, (current) => {
+          const currentExecution = current.executions.find((execution) => execution.key === running.key)
+          if (current.status !== 'EXECUTING' || currentExecution?.status !== 'running') return current
+          const next: RunAggregate = {
+            ...current,
+            review: this.reviewRecord(review, 'CHECKPOINT', running.key),
+            updatedAt: this.now(),
+            events: this.appendEvent(current.events ?? [], run.id, 'review.finished', {
+              issueKey: running.key,
+              summary: 'CHECKPOINT PASS',
+            }),
+          }
+          runAggregateSchema.parse(next)
+          return next
+        })
+        this.notify()
+        return 'continue'
+      }
+      return this.applyCheckpointRevision(live, running.key, review)
+    } catch (error) {
+      if (controller.signal.aborted) return 'handled'
+      const message = error instanceof ReviewerError ? error.message : (error as Error).message
+      return this.failCheckpointReview(run.id, running.key, message)
+    } finally {
+      if (this.activeReviews.get(run.id) === controller) {
+        this.activeReviews.delete(run.id)
+      }
+    }
+  }
+
+  /** Apply a CHECKPOINT FIX/REPLAN decision without merging the Issue branch. */
+  private async applyCheckpointRevision(
+    run: RunAggregate,
+    issueKey: string,
+    review: Extract<ReviewResult, { verdict: 'REVISE' }>,
+  ): Promise<CheckpointReviewOutcome> {
+    const reviewCycles = (run.control?.reviewCycles ?? 0) + 1
+    const limitReached = reviewCycles >= this.maxReviewCycles
+    if (limitReached) {
+      await this.repository.updateRun(run.id, (current) => {
+        assertTransition(current.status, 'WAITING_DECISION')
+        return this.withTransition(current, 'WAITING_DECISION', 'review-cycle-limit', `review:checkpoint-limit:${run.id}:${issueKey}`, {
+          executions: this.resetRunningExecutions(current.executions ?? []),
+          review: this.reviewRecord(review, 'CHECKPOINT', issueKey),
+          control: { ...(current.control ?? this.defaultControl()), reviewCycles },
+          events: this.appendEvent(current.events ?? [], run.id, 'review.finished', {
+            issueKey,
+            summary: `CHECKPOINT ${review.nextAction}`,
+          }),
+        })
+      })
+      this.notify()
+      this.abortRunExecutions(run.id)
+      return 'handled'
+    }
+    if (review.nextAction === 'REPLAN') {
+      const updated = await this.repository.updateRun(run.id, (current) => {
+        assertTransition(current.status, 'PLANNING')
+        return this.withTransition(current, 'PLANNING', 'review-replan', `review:checkpoint-replan:${run.id}:${issueKey}`, {
+          executions: this.resetRunningExecutions(current.executions ?? []),
+          review: this.reviewRecord(review, 'CHECKPOINT', issueKey),
+          control: { ...(current.control ?? this.defaultControl()), reviewCycles },
+          events: this.appendEvent(current.events ?? [], run.id, 'review.finished', {
+            issueKey,
+            summary: 'CHECKPOINT REPLAN',
+          }),
+        })
+      })
+      this.notify()
+      this.scheduleReplan(updated)
+      return 'handled'
+    }
+    await this.repository.updateRun(run.id, (current) => {
+      const next: RunAggregate = {
+        ...current,
+        executions: (current.executions ?? []).map((execution) => (
+          execution.key === issueKey && execution.status === 'running'
+            ? this.resetExecutionForFix(execution)
+            : execution
+        )),
+        review: this.reviewRecord(review, 'CHECKPOINT', issueKey),
+        control: { ...(current.control ?? this.defaultControl()), reviewCycles },
+        updatedAt: this.now(),
+        events: this.appendEvent(current.events ?? [], run.id, 'review.finished', {
+          issueKey,
+          summary: 'CHECKPOINT FIX',
+        }),
+      }
+      runAggregateSchema.parse(next)
+      return next
+    })
+    this.notify()
+    return 'handled'
+  }
+
+  /** Fail closed when the checkpoint reviewer or its Git preparation fails. */
+  private async failCheckpointReview(runId: string, issueKey: string, message: string): Promise<CheckpointReviewOutcome> {
+    try {
+      await this.repository.updateRun(runId, (current) => {
+        if (current.status !== 'EXECUTING') return current
+        assertTransition(current.status, 'FAILED')
+        return this.withTransition(current, 'FAILED', `checkpoint-review-failed: ${issueKey}: ${message}`, `review:checkpoint-fail:${runId}:${issueKey}`, {
+          executions: (current.executions ?? []).map((execution) => (
+            execution.key === issueKey && execution.status === 'running'
+              ? this.resetExecutionForFix(execution)
+              : execution
+          )),
+          events: this.appendEvent(current.events ?? [], runId, 'review.finished', {
+            issueKey,
+            summary: 'CHECKPOINT FAILED',
+          }),
+        })
+      })
+      this.notify()
+    } catch {
+      // A concurrent control transition already owns the durable outcome.
+    }
+    return { error: `taskflow: checkpoint review failed for ${issueKey}: ${message}` }
   }
 
   /** Persist a merge-in-progress marker and merge a successful issue branch
@@ -1313,15 +1530,49 @@ export class TaskFlowService {
 
   /** Converge one issue outcome after the run has already left EXECUTING
    * (a sibling in the same parallel wave failed first and moved the run to
-   * FAILED). The success path still merges the worktree; the outcome is
-   * recorded as done/failed WITHOUT changing the run status, so every claim
-   * in the wave converges to DONE/FAILED and retry never reuses a stale
-   * RUNNING attempt. */
+   * FAILED). With automatic review enabled, an unreviewed success is kept
+   * pending in its worktree so retry must pass CHECKPOINT before merge. When
+   * review is disabled, the legacy path still merges and records the outcome
+   * as done/failed without changing the run status. */
   private async settleIssueOutcome(runId: string, issueKey: string, result: ExecutionResult): Promise<boolean> {
     const run = this.repository.getRun(runId)
     if (run === undefined || run.status !== 'FAILED') return false
     const running = (run.executions ?? []).find((execution) => execution.status === 'running' && execution.key === issueKey)
     if (running === undefined) return false
+    if (result.ok && this.automationEnabled && this.autoReview && this.isRunAutomationEnabled(run)) {
+      try {
+        await this.repository.updateRun(runId, (current) => {
+          const currentRunning = (current.executions ?? []).find((execution) => (
+            execution.status === 'running' && execution.key === issueKey
+          ))
+          if (current.status !== 'FAILED' || currentRunning === undefined) {
+            throw new Error(`taskflow: issue '${issueKey}' is not currently running`)
+          }
+          const next: RunAggregate = {
+            ...current,
+            merging: false,
+            executions: (current.executions ?? []).map((execution) => (
+              execution.key === issueKey && execution.status === 'running'
+                ? this.resetExecutionForFix(execution)
+                : execution
+            )),
+            updatedAt: this.now(),
+            events: this.appendEvent(current.events ?? [], runId, 'run.updated', {
+              issueKey,
+              summary: 'checkpoint-deferred-after-wave-failure',
+            }),
+          }
+          runAggregateSchema.parse(next)
+          return next
+        })
+        this.notify()
+        return true
+      } catch (error) {
+        const message = (error as Error).message
+        if (message.startsWith('taskflow:')) return false
+        throw error
+      }
+    }
     const effectiveResult = await this.mergeIssueIfNeeded(runId, issueKey, result, run, running, ['EXECUTING', 'FAILED'])
     try {
       await this.repository.updateRun(runId, (current) => {
@@ -1340,6 +1591,7 @@ export class TaskFlowService {
               summary: effectiveResult.summary,
               workDir: currentRunning.workDir,
               branch: currentRunning.branch,
+              branchBaseSha: currentRunning.branchBaseSha,
               attemptId: currentRunning.attemptId,
               phase: 'done',
               heartbeatAt: currentRunning.heartbeatAt,
@@ -1352,6 +1604,7 @@ export class TaskFlowService {
               error: effectiveResult.error,
               workDir: currentRunning.workDir,
               branch: currentRunning.branch,
+              branchBaseSha: currentRunning.branchBaseSha,
               attemptId: currentRunning.attemptId,
               phase: 'failed',
               heartbeatAt: currentRunning.heartbeatAt,
@@ -1552,7 +1805,12 @@ export class TaskFlowService {
           const index = executions.findIndex((execution) => execution.key === claim.key)
           if (index < 0) return current
           const nextExecutions = [...executions]
-          nextExecutions[index] = { ...executions[index], workDir: worktree.workDir, branch: worktree.branch }
+          nextExecutions[index] = {
+            ...executions[index],
+            workDir: worktree.workDir,
+            branch: worktree.branch,
+            branchBaseSha: worktree.branchBaseSha,
+          }
           const next: RunAggregate = { ...current, updatedAt: this.now(), executions: nextExecutions }
           runAggregateSchema.parse(next)
           return next
@@ -1779,7 +2037,7 @@ export class TaskFlowService {
         const next: RunAggregate = {
           ...current,
           updatedAt: this.now(),
-          events: this.appendEvent(current.events ?? [], runId, 'review.started'),
+          events: this.appendEvent(current.events ?? [], runId, 'review.started', { summary: 'FINAL' }),
         }
         runAggregateSchema.parse(next)
         return next
@@ -1791,6 +2049,7 @@ export class TaskFlowService {
         : await this.worktrees.getBranchHeadSha(run.repoRoot, integrationBranch)
       if (controller.signal.aborted) return
       const raw = await this.reviewer.review({
+        stage: 'FINAL',
         runId,
         title: run.title,
         description: run.description,
@@ -1806,13 +2065,13 @@ export class TaskFlowService {
       if (controller.signal.aborted) return
       const live = this.repository.getRun(runId)
       if (live === undefined || live.status !== 'INTEGRATION_REVIEW') return
-      const result = this.normalizeReviewResult(live, raw)
+      const result = this.normalizeReviewResult(live, raw, 'FINAL')
       if (result.verdict === 'PASS') {
         await this.repository.updateRun(runId, (current) => {
           assertTransition(current.status, 'AWAITING_HUMAN')
           return this.withTransition(current, 'AWAITING_HUMAN', 'review-passed', `review:pass:${runId}`, {
-            review: { verdict: 'PASS', summary: result.summary, reworkKeys: [], findings: result.findings === undefined ? undefined : result.findings.map((finding) => ({ ...finding, evidenceNeeded: [...finding.evidenceNeeded] })), evidenceChecklist: result.evidenceChecklist === undefined ? undefined : [...result.evidenceChecklist], at: this.now() },
-            events: this.appendEvent(current.events ?? [], runId, 'review.finished', { summary: 'PASS' }),
+            review: this.reviewRecord(result, 'FINAL'),
+            events: this.appendEvent(current.events ?? [], runId, 'review.finished', { summary: 'FINAL PASS' }),
           })
         })
         this.notify()
@@ -1826,21 +2085,34 @@ export class TaskFlowService {
           assertTransition(current.status, 'WAITING_DECISION')
           return this.withTransition(current, 'WAITING_DECISION', 'review-cycle-limit', `review:limit:${runId}`, {
             executions: this.resetReworkExecutions(current.executions ?? [], reworkKeys),
-            review: { verdict: 'REVISE', summary: result.summary, reworkKeys: [...reworkKeys], findings: result.findings === undefined ? undefined : result.findings.map((finding) => ({ ...finding, evidenceNeeded: [...finding.evidenceNeeded] })), evidenceChecklist: result.evidenceChecklist === undefined ? undefined : [...result.evidenceChecklist], at: this.now() },
+            review: this.reviewRecord(result, 'FINAL', undefined, [...reworkKeys]),
             control: { ...(current.control ?? this.defaultControl()), reviewCycles },
-            events: this.appendEvent(current.events ?? [], runId, 'review.finished', { summary: 'REVISE' }),
+            events: this.appendEvent(current.events ?? [], runId, 'review.finished', { summary: `FINAL ${result.nextAction}` }),
           })
         })
         this.notify()
+        return
+      }
+      if (result.nextAction === 'REPLAN') {
+        const updated = await this.repository.updateRun(runId, (current) => {
+          assertTransition(current.status, 'PLANNING')
+          return this.withTransition(current, 'PLANNING', 'review-replan', `review:final-replan:${runId}`, {
+            review: this.reviewRecord(result, 'FINAL', undefined, [...reworkKeys]),
+            control: { ...(current.control ?? this.defaultControl()), reviewCycles },
+            events: this.appendEvent(current.events ?? [], runId, 'review.finished', { summary: 'FINAL REPLAN' }),
+          })
+        })
+        this.notify()
+        this.scheduleReplan(updated)
         return
       }
       await this.repository.updateRun(runId, (current) => {
         assertTransition(current.status, 'EXECUTING')
         return this.withTransition(current, 'EXECUTING', 'review-revise', `review:revise:${runId}`, {
           executions: this.resetReworkExecutions(current.executions ?? [], reworkKeys),
-          review: { verdict: 'REVISE', summary: result.summary, reworkKeys: [...reworkKeys], findings: result.findings === undefined ? undefined : result.findings.map((finding) => ({ ...finding, evidenceNeeded: [...finding.evidenceNeeded] })), evidenceChecklist: result.evidenceChecklist === undefined ? undefined : [...result.evidenceChecklist], at: this.now() },
+          review: this.reviewRecord(result, 'FINAL', undefined, [...reworkKeys]),
           control: { ...(current.control ?? this.defaultControl()), reviewCycles },
-          events: this.appendEvent(current.events ?? [], runId, 'review.finished', { summary: 'REVISE' }),
+          events: this.appendEvent(current.events ?? [], runId, 'review.finished', { summary: 'FINAL FIX' }),
         })
       })
       this.notify()
@@ -1859,16 +2131,24 @@ export class TaskFlowService {
         // The run is already terminal; the first transition attempt recorded the failure.
       }
     } finally {
-      this.activeReviews.delete(runId)
+      if (this.activeReviews.get(runId) === controller) {
+        this.activeReviews.delete(runId)
+      }
     }
   }
 
   /** Validate/normalize a raw reviewer object into a ReviewResult. Unknown
    * rework keys are ignored; an empty (or fully filtered) list means all
    * issues are reworked. */
-  private normalizeReviewResult(run: RunAggregate, raw: unknown): ReviewResult {
+  private normalizeReviewResult(
+    run: RunAggregate,
+    raw: unknown,
+    stage: ReviewStage = 'FINAL',
+    focusIssueKey?: string,
+  ): ReviewResult {
     const object = (raw ?? {}) as {
       verdict?: unknown
+      nextAction?: unknown
       summary?: unknown
       reworkKeys?: unknown
       findings?: unknown
@@ -1880,18 +2160,35 @@ export class TaskFlowService {
     if (typeof object.summary !== 'string') {
       throw new ReviewerError('parse-failed', 'reviewer output has invalid summary')
     }
+    const nextAction = object.nextAction === undefined
+      ? object.verdict === 'PASS' ? 'CONTINUE' : 'FIX'
+      : object.nextAction
+    if (nextAction !== 'CONTINUE' && nextAction !== 'FIX' && nextAction !== 'REPLAN') {
+      throw new ReviewerError('parse-failed', 'reviewer output has invalid nextAction')
+    }
+    if (object.verdict === 'PASS' && nextAction !== 'CONTINUE') {
+      throw new ReviewerError('parse-failed', 'PASS review must use CONTINUE')
+    }
+    if (object.verdict === 'REVISE' && nextAction === 'CONTINUE') {
+      throw new ReviewerError('parse-failed', 'REVISE review must use FIX or REPLAN')
+    }
     const knownKeys = new Set(run.issues.map((issue) => issue.key))
-    const reworkKeys = Array.isArray(object.reworkKeys)
+    let reworkKeys = Array.isArray(object.reworkKeys)
       ? object.reworkKeys.filter((key): key is string => typeof key === 'string' && knownKeys.has(key))
       : []
+    if (stage === 'CHECKPOINT' && object.verdict === 'REVISE' && nextAction === 'FIX' && focusIssueKey !== undefined) {
+      reworkKeys = [focusIssueKey]
+    }
     const findings = Array.isArray(object.findings)
       ? object.findings
           .filter((item): item is { issueKey: string; problem: string; evidenceNeeded: string[]; acceptance: string } =>
             typeof item === 'object' && item !== null
             && typeof (item as { issueKey?: unknown }).issueKey === 'string'
+            && knownKeys.has((item as { issueKey: string }).issueKey)
             && typeof (item as { problem?: unknown }).problem === 'string'
             && Array.isArray((item as { evidenceNeeded?: unknown }).evidenceNeeded)
             && typeof (item as { acceptance?: unknown }).acceptance === 'string')
+          .filter((item) => stage !== 'CHECKPOINT' || nextAction === 'REPLAN' || item.issueKey === focusIssueKey)
           .map((item) => ({
             issueKey: item.issueKey,
             problem: item.problem,
@@ -1904,7 +2201,52 @@ export class TaskFlowService {
       : findings !== undefined
         ? [...new Set(findings.flatMap((finding) => finding.evidenceNeeded))]
         : undefined
-    return { verdict: object.verdict, summary: object.summary, reworkKeys, findings, evidenceChecklist }
+    if (object.verdict === 'PASS') {
+      return { verdict: 'PASS', nextAction: 'CONTINUE', summary: object.summary, reworkKeys: [], findings, evidenceChecklist }
+    }
+    const reviseAction = nextAction === 'REPLAN' ? 'REPLAN' : 'FIX'
+    return { verdict: 'REVISE', nextAction: reviseAction, summary: object.summary, reworkKeys, findings, evidenceChecklist }
+  }
+
+  /** Clone one normalized review into the durable aggregate representation. */
+  private reviewRecord(
+    review: ReviewResult,
+    stage: ReviewStage,
+    issueKey?: string,
+    reworkKeys: readonly string[] = review.reworkKeys,
+  ): RunReview {
+    return {
+      verdict: review.verdict,
+      stage,
+      ...(issueKey === undefined ? {} : { issueKey }),
+      nextAction: review.nextAction,
+      summary: review.summary,
+      reworkKeys: [...reworkKeys],
+      findings: review.findings === undefined
+        ? undefined
+        : review.findings.map((finding) => ({ ...finding, evidenceNeeded: [...finding.evidenceNeeded] })),
+      evidenceChecklist: review.evidenceChecklist === undefined ? undefined : [...review.evidenceChecklist],
+      at: this.now(),
+    }
+  }
+
+  /** Reset one Issue for an in-place repair while preserving its worktree. */
+  private resetExecutionForFix(execution: IssueExecution): IssueExecution {
+    return {
+      key: execution.key,
+      status: 'pending',
+      workDir: execution.workDir,
+      branch: execution.branch,
+      branchBaseSha: execution.branchBaseSha,
+      attemptId: execution.attemptId,
+    }
+  }
+
+  /** Stop a parallel wave before human intervention or a fresh plan. */
+  private resetRunningExecutions(executions: readonly IssueExecution[]): IssueExecution[] {
+    return executions.map((execution) => (
+      execution.status === 'running' ? this.resetExecutionForFix(execution) : execution
+    ))
   }
 
   /** Compute the transitive rework closure: selected keys plus every issue that
@@ -1994,6 +2336,18 @@ export class TaskFlowService {
     return createHash('sha256').update(`${run.title}\n${run.description}`).digest('hex').slice(0, 16)
   }
 
+  /** Turn a REPLAN review into bounded planner feedback. */
+  private replanFeedback(review: RunReview | undefined): string | undefined {
+    if (review?.nextAction !== 'REPLAN') return undefined
+    const findings = (review.findings ?? []).map((finding) => (
+      `- ${finding.issueKey}: ${finding.problem}；验收：${finding.acceptance}`
+    ))
+    return [
+      `${review.stage ?? 'FINAL'} 审查要求重新规划：${review.summary}`,
+      ...(findings.length === 0 ? [] : ['问题清单：', ...findings]),
+    ].join('\n')
+  }
+
   /** Background planning body: planner → validate → READY/FAILED (single-flight via planFlows). */
   private async runPlanningBody(runId: string, inputHash: string): Promise<void> {
     const controller = new AbortController()
@@ -2005,6 +2359,7 @@ export class TaskFlowService {
       const planObject = await this.planner.plan({
         title: run.title,
         description: run.description,
+        replanFeedback: this.replanFeedback(run.review),
         repoRoot: run.repoRoot ?? '',
         workDir: join(defaultPlanRoot(), runId),
         signal: controller.signal,
@@ -2027,6 +2382,11 @@ export class TaskFlowService {
         return this.withTransition(current, 'READY', 'planning-succeeded', `plan:done:${inputHash}`, {
           issueCount: normalizedIssues.length,
           issues: normalizedIssues,
+          executions: [],
+          review: undefined,
+          baseSha: undefined,
+          runGit: undefined,
+          merging: false,
         })
       })
       this.notify()
@@ -2184,6 +2544,58 @@ export class TaskFlowService {
     await this.startExecution(runId).catch(() => undefined)
   }
 
+  /** Stop the current wave, clean its Git isolation, then start a fresh plan. */
+  private scheduleReplan(run: RunAggregate, forcePlan = false): void {
+    this.abortRunExecutions(run.id)
+    const executionFlow = this.executionFlows.get(run.id)
+    const cleanupFlow = (async () => {
+      if (executionFlow !== undefined) {
+        await executionFlow.catch(() => undefined)
+      }
+      await this.cleanupRunGit(run)
+    })()
+    this.replanFlows.set(run.id, cleanupFlow)
+    void cleanupFlow.then(async () => {
+      if (this.replanFlows.get(run.id) === cleanupFlow) {
+        this.replanFlows.delete(run.id)
+      }
+      const current = this.repository.getRun(run.id)
+      if (
+        current?.status === 'PLANNING'
+        && (
+          forcePlan
+          || (
+            this.automationEnabled
+            && this.autoPlan
+            && this.isRunAutomationEnabled(current)
+          )
+        )
+      ) {
+        await this.plan(run.id).catch(() => undefined)
+      }
+    }, () => {
+      if (this.replanFlows.get(run.id) === cleanupFlow) {
+        this.replanFlows.delete(run.id)
+      }
+    })
+  }
+
+  /** Best-effort cleanup of every worktree/branch from the abandoned plan. */
+  private async cleanupRunGit(run: RunAggregate): Promise<void> {
+    if (run.repoRoot === undefined) return
+    const seen = new Set<string>()
+    for (const execution of run.executions ?? []) {
+      if (execution.workDir === undefined || execution.branch === undefined) continue
+      const identity = `${execution.workDir}\n${execution.branch}`
+      if (seen.has(identity)) continue
+      seen.add(identity)
+      await this.worktrees.removeIssueWorktree(run.repoRoot, execution.workDir, execution.branch).catch(() => undefined)
+    }
+    if (run.runGit?.integrationBranch !== undefined) {
+      await this.worktrees.removeIntegrationBranch(run.repoRoot, run.runGit.integrationBranch).catch(() => undefined)
+    }
+  }
+
   /** Serialize automatic outcomes for one run. This keeps the durable merge
    * marker, Git side effects, and the matching execution update in one
    * ordered lane while independent runs still proceed concurrently. */
@@ -2202,6 +2614,26 @@ export class TaskFlowService {
       release()
       if (this.outcomeLocks.get(runId) === current) {
         this.outcomeLocks.delete(runId)
+      }
+    }
+  }
+
+  /** Serialize merge-checkpoint review and report side effects per run. */
+  private async withCheckpointLock<T>(runId: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.checkpointTails.get(runId) ?? Promise.resolve()
+    let release!: () => void
+    const gate = new Promise<void>((resolvePromise) => {
+      release = resolvePromise
+    })
+    const current = previous.catch(() => undefined).then(() => gate)
+    this.checkpointTails.set(runId, current)
+    await previous.catch(() => undefined)
+    try {
+      return await fn()
+    } finally {
+      release()
+      if (this.checkpointTails.get(runId) === current) {
+        this.checkpointTails.delete(runId)
       }
     }
   }
@@ -2394,6 +2826,9 @@ export class TaskFlowService {
       })),
       review: run.review === undefined ? undefined : {
         verdict: run.review.verdict,
+        ...(run.review.stage === undefined ? {} : { stage: run.review.stage }),
+        ...(run.review.issueKey === undefined ? {} : { issueKey: run.review.issueKey }),
+        ...(run.review.nextAction === undefined ? {} : { nextAction: run.review.nextAction }),
         summary: run.review.summary,
         reworkKeys: [...run.review.reworkKeys],
         findings: run.review.findings === undefined ? undefined : run.review.findings.map((finding) => ({ ...finding, evidenceNeeded: [...finding.evidenceNeeded] })),

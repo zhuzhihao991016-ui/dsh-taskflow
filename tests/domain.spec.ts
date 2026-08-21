@@ -85,6 +85,49 @@ describe('runAggregateSchema review integrity', () => {
     expect(() => runAggregateSchema.parse(run)).not.toThrow()
   })
 
+  it('accepts a CHECKPOINT review with its focused Issue and action', () => {
+    const run = validRun({
+      review: {
+        verdict: 'REVISE',
+        stage: 'CHECKPOINT',
+        issueKey: 'issue-001',
+        nextAction: 'FIX',
+        summary: '局部修复',
+        reworkKeys: ['issue-001'],
+        at: 3,
+      },
+    })
+    expect(() => runAggregateSchema.parse(run)).not.toThrow()
+  })
+
+  it('rejects CHECKPOINT reviews without a focused Issue', () => {
+    const run = validRun({
+      review: {
+        verdict: 'REVISE',
+        stage: 'CHECKPOINT',
+        nextAction: 'FIX',
+        summary: '局部修复',
+        reworkKeys: ['issue-001'],
+        at: 3,
+      },
+    })
+    expectIssue(run, 'review.issueKey', /requires an issue key/)
+  })
+
+  it('rejects a verdict/action mismatch', () => {
+    const run = validRun({
+      review: {
+        verdict: 'PASS',
+        stage: 'FINAL',
+        nextAction: 'REPLAN',
+        summary: '矛盾输出',
+        reworkKeys: [],
+        at: 3,
+      },
+    })
+    expectIssue(run, 'review.nextAction', /PASS review must use CONTINUE/)
+  })
+
   it('rejects rework keys that are not planned issues with a clear path', () => {
     const run = validRun({
       review: { verdict: 'REVISE', summary: '返工', reworkKeys: ['issue-999'], at: 3 },

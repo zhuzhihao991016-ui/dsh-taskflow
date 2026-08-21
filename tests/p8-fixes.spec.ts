@@ -158,7 +158,7 @@ describe('P8 remediation', () => {
       ['C:/repo'],
       executor,
       undefined,
-      { git: fakeGit, automationEnabled: true, maxConcurrent: 1 },
+      { git: fakeGit, automationEnabled: true, maxConcurrent: 1, autoReview: false },
     )
     seedReady(repository, [issueA])
 
@@ -185,7 +185,7 @@ describe('P8 remediation', () => {
       ['C:/repo'],
       executor,
       undefined,
-      { git: fakeGit, automationEnabled: true, maxConcurrent: 1 },
+      { git: fakeGit, automationEnabled: true, maxConcurrent: 1, autoReview: false },
     )
     seedReady(repository, [issueA])
     const started = service.startExecution('run-0001')
@@ -214,7 +214,7 @@ describe('P8 remediation', () => {
       ['C:/repo'],
       executor,
       undefined,
-      { git: fakeGit, automationEnabled: true },
+      { git: fakeGit, automationEnabled: true, autoReview: false },
     )
     const run = seedExecuting(repository, [issueA])
     run.control = {
@@ -277,7 +277,7 @@ describe('P8 remediation', () => {
       ['C:/repo'],
       executor,
       undefined,
-      { git: fakeGit, automationEnabled: true, maxConcurrent: 2, maxExecutorProcesses: 1 },
+      { git: fakeGit, automationEnabled: true, maxConcurrent: 2, maxExecutorProcesses: 1, autoReview: false },
     )
     seedReady(repository, [issueA, issueB])
 
@@ -363,7 +363,7 @@ describe('P8 remediation', () => {
       ['C:/repo'],
       executor,
       undefined,
-      { git, automationEnabled: true, maxConcurrent: 1 },
+      { git, automationEnabled: true, maxConcurrent: 1, autoReview: false },
     )
     seedReady(repository, [issueA])
     const started = service.startExecution('run-0001', { wait: true })
@@ -393,7 +393,7 @@ describe('P8 remediation', () => {
       ['C:/repo'],
       executor,
       undefined,
-      { git, automationEnabled: true, maxConcurrent: 1 },
+      { git, automationEnabled: true, maxConcurrent: 1, autoReview: false },
     )
     seedReady(repository, [issueA])
     const started = service.startExecution('run-0001', { wait: true })
@@ -420,7 +420,7 @@ describe('P8 remediation', () => {
       ['C:/repo'],
       executor,
       undefined,
-      { git: fakeGit, automationEnabled: true, maxConcurrent: 1 },
+      { git: fakeGit, automationEnabled: true, maxConcurrent: 1, autoReview: false },
     )
     seedReady(repository, [issueA])
     const started = service.startExecution('run-0001')

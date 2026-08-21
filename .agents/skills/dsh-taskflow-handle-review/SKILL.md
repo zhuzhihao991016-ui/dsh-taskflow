@@ -1,24 +1,28 @@
 ---
 name: dsh-taskflow-handle-review
-description: Operate the read-only Codex review gate of an installed dsh-taskflow run. Use when INTEGRATION_REVIEW needs review, a PASS or REVISE verdict arrives, rework issues must be resumed, or review-cycle limits lead to WAITING_DECISION.
+description: Operate the two-stage read-only Codex review gate of an installed dsh-taskflow run. Use when an EXECUTING checkpoint or INTEGRATION_REVIEW final review is active, PASS or REVISE arrives with CONTINUE, FIX, or REPLAN, rework must resume, or review-cycle limits lead to WAITING_DECISION.
 ---
 
 # dsh-taskflow review gate
 
-Use this skill when a run reaches `INTEGRATION_REVIEW` or when a Codex review verdict must be handled.
+Use this skill when an automatic review is active or when its structured decision must be routed.
 
-## Trigger review
+## Review stages
 
-- With `autoReview=true`, observe the result; do not issue duplicate review calls.
-- Manual mode: `POST /plugins/taskflow/review { runId }` returns `202` when background review starts. Poll `/run` or `/state` until the review finishes.
+- `CHECKPOINT`: after each successful Issue and before merge, `gpt-5.6-sol` with `medium` reasoning checks direction and scope. It runs automatically when `autoReview=true`.
+- `FINAL`: after every Issue has merged, `gpt-5.6-sol` with `max` reasoning reviews the complete integration diff.
+- Both stages are read-only. With `autoReview=true`, observe instead of issuing duplicate calls. `POST /plugins/taskflow/review { runId }` manually starts only `FINAL` while the run is in `INTEGRATION_REVIEW`.
 
-## Verdicts
+## Route decisions
 
-- `PASS` → status becomes `AWAITING_HUMAN`; continue to `dsh-taskflow-control-run` for final human acceptance.
-- `REVISE` → status returns to `EXECUTING`; the selected issue and its downstream dependencies are reset. Continue to `dsh-taskflow-execute-monitor` to re-run the rework.
-- Reaching `maxReviewCycles` → status becomes `WAITING_DECISION`; do not decide for the human. Continue to `dsh-taskflow-control-run`.
+- `PASS / CONTINUE`: a checkpoint permits merge; a final review enters `AWAITING_HUMAN`.
+- `REVISE / FIX`: a checkpoint preserves the worktree and requeues the same Issue; a final review resets the selected Issue and its downstream dependencies.
+- `REVISE / REPLAN`: stop the current execution wave, clean its run-level Git artifacts, return to `PLANNING`, and pass the review findings to the planner.
+- Reaching `maxReviewCycles` across revision decisions enters `WAITING_DECISION`; do not decide for the human.
 
-## Distinguish rework types
+## Continue the workflow
 
-- Codex `REVISE` rework happens inside the same run before final acceptance.
+- After `FIX`, continue to `dsh-taskflow-execute-monitor`.
+- After `REPLAN`, continue to `dsh-taskflow-submit-plan` and observe the existing run.
+- After final `PASS`, continue to `dsh-taskflow-control-run` for human acceptance.
 - Human `rework` via `/human-decision` returns the run to `PLANNING` and clears old execution/review state.

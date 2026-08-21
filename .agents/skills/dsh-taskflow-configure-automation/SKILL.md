@@ -18,6 +18,8 @@ Use this skill when changing or verifying how a taskflow run behaves: automatic 
 
 - `maxConcurrent` controls parallel issues within one run.
 - `maxExecutorProcesses` is the global cap on concurrent Codex executor processes.
+- `autoReview=true` enables both per-Issue `CHECKPOINT` review and the all-Issue `FINAL` review.
+- `maxReviewCycles` limits automated `FIX` / `REPLAN` revision decisions across both stages before human intervention.
 - `allowedRepoRoots=[]` disables planning because no repo root is allowed.
 - `requireExecutionPermission=true` makes runs wait in `WAITING_PERMISSION` until a human `release`.
 

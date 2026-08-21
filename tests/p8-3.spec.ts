@@ -55,10 +55,12 @@ class FakeAutomatedExecutor implements AutomatedExecutor {
 
 class FakeReviewer implements Reviewer {
   calls = 0
-  result: unknown = { verdict: 'PASS', summary: '通过', reworkKeys: [] }
+  inputs: ReviewInput[] = []
+  result: unknown = { verdict: 'PASS', nextAction: 'CONTINUE', summary: '通过', reworkKeys: [] }
 
-  async review(_input: ReviewInput): Promise<unknown> {
+  async review(input: ReviewInput): Promise<unknown> {
     this.calls += 1
+    this.inputs.push(input)
     return this.result
   }
 }
@@ -151,8 +153,9 @@ describe('P8.3 auto coordinator', () => {
     await waitForStatus(service, run.id, 'AWAITING_HUMAN')
 
     expect(executor.calls.map((call) => call.issue.key)).toEqual(['issue-001', 'issue-002'])
-    expect(reviewer.calls).toBe(1)
-    expect(service.snapshot(run.id)?.review).toMatchObject({ verdict: 'PASS' })
+    expect(reviewer.calls).toBe(3)
+    expect(reviewer.inputs.map((input) => input.stage)).toEqual(['CHECKPOINT', 'CHECKPOINT', 'FINAL'])
+    expect(service.snapshot(run.id)?.review).toMatchObject({ verdict: 'PASS', stage: 'FINAL', nextAction: 'CONTINUE' })
     expect(service.runDetail(run.id)?.allowedActions).toEqual(expect.arrayContaining(['accept', 'rework', 'cancel']))
   })
 
@@ -182,6 +185,35 @@ describe('P8.3 auto coordinator', () => {
     const resumed = await service.command('run-0001', 'resume')
     expect(resumed.ok).toBe(true)
     expect(service.snapshot('run-0001')?.status).toBe('EXECUTING')
+  })
+
+  it('resumes a cycle-limited REPLAN decision into PLANNING', async () => {
+    const repository = new MemoryRepository()
+    const reviewer = new FakeReviewer()
+    reviewer.result = {
+      verdict: 'REVISE',
+      nextAction: 'REPLAN',
+      summary: '当前拆分方向错误',
+      reworkKeys: ['issue-001'],
+    }
+    const service = new TaskFlowService(
+      repository,
+      () => 1000,
+      undefined,
+      ['C:/repo'],
+      undefined,
+      reviewer,
+      { git: fakeGit, automationEnabled: false, maxReviewCycles: 1 },
+    )
+    seedIntegrationReview(repository, [issueA])
+
+    await service.startReview('run-0001', { wait: true })
+    expect(service.snapshot('run-0001')?.status).toBe('WAITING_DECISION')
+
+    const resumed = await service.command('run-0001', 'resume')
+
+    expect(resumed.ok).toBe(true)
+    expect(service.snapshot('run-0001')?.status).toBe('PLANNING')
   })
 })
 

@@ -77,6 +77,7 @@ function agentMessageEvent(text: string): string {
 
 const REVIEW_JSON = JSON.stringify({
   verdict: 'PASS',
+  nextAction: 'CONTINUE',
   summary: '全部验收通过',
   reworkKeys: [],
 })
@@ -118,11 +119,12 @@ describe('writeReviewSchema', () => {
     const schema = JSON.parse(await readFile(path, 'utf8')) as {
       required?: string[]
       additionalProperties?: boolean
-      properties?: { verdict?: { enum?: string[] }; reworkKeys?: { type?: string } }
+      properties?: { verdict?: { enum?: string[] }; nextAction?: { enum?: string[] }; reworkKeys?: { type?: string } }
     }
-    expect(schema.required).toEqual(['verdict', 'summary', 'reworkKeys'])
+    expect(schema.required).toEqual(['verdict', 'nextAction', 'summary', 'reworkKeys'])
     expect(schema.additionalProperties).toBe(false)
     expect(schema.properties?.verdict?.enum).toEqual(['PASS', 'REVISE'])
+    expect(schema.properties?.nextAction?.enum).toEqual(['CONTINUE', 'FIX', 'REPLAN'])
     expect(schema.properties?.reworkKeys?.type).toBe('array')
   })
 })
@@ -145,7 +147,7 @@ describe('CodexReviewer', () => {
       'exec',
       'review',
       '--model', 'gpt-5.6-sol',
-      '--config', 'model_reasoning_effort="high"',
+      '--config', 'model_reasoning_effort="max"',
       '--config', 'sandbox_mode="read-only"',
       '--strict-config',
       '--ephemeral',
@@ -159,6 +161,34 @@ describe('CodexReviewer', () => {
     expect(request.stdinText).toContain('验收 A')
     expect(request.stdinText).toContain('完成 B')
     expect(request.stdinText).toContain('REVISE')
+    expect(request.stdinText).toContain('FINAL')
+  })
+
+  it('uses medium reasoning and the issue worktree for a CHECKPOINT review', async () => {
+    const root = await freshRoot()
+    const executor = new FakeExecutor()
+    executor.results = [{ exitCode: 0, stdout: agentMessageEvent(REVIEW_JSON), stderr: '', timedOut: false }]
+    const reviewer = new CodexReviewer(executor, 60_000)
+    const reviewRoot = join(root, 'issue-worktree')
+
+    await reviewer.review({
+      ...INPUT,
+      stage: 'CHECKPOINT',
+      issueKey: 'issue-001',
+      reviewRoot,
+      reviewBaseSha: 'base123',
+      reviewTargetBranch: 'taskflow/run-0001/issue-001',
+      reviewTargetHeadSha: 'head456',
+      workDir: join(root, 'checkpoint-spool'),
+    })
+
+    const request = executor.requests[0]
+    expect(request.command).toContain('model_reasoning_effort="medium"')
+    expect(request.cwd).toBe(resolve(reviewRoot))
+    expect(request.stdinText).toContain('CHECKPOINT')
+    expect(request.stdinText).toContain('issue-001')
+    expect(request.stdinText).toContain('方向')
+    expect(request.stdinText).toContain('REPLAN')
   })
 
   it('forwards an optional abort signal to the process executor', async () => {

@@ -53,7 +53,7 @@ class FakeAutomatedExecutor implements AutomatedExecutor {
 
 class FakeReviewer implements Reviewer {
   calls = 0
-  result: unknown = { verdict: 'PASS', summary: '通过', reworkKeys: [] }
+  result: unknown = { verdict: 'PASS', nextAction: 'CONTINUE', summary: '通过', reworkKeys: [] }
 
   async review(_input: ReviewInput): Promise<unknown> {
     this.calls += 1
@@ -132,7 +132,7 @@ describe('P8.4 automatic execution permission gate', () => {
 
     await waitForStatus(service, run.id, 'AWAITING_HUMAN')
     expect(executor.calls.map((call) => call.issue.key)).toEqual(['issue-001', 'issue-002'])
-    expect(reviewer.calls).toBe(1)
+    expect(reviewer.calls).toBe(3)
   })
 
   it('keeps unattended automation behavior when requireExecutionPermission is explicitly false', async () => {

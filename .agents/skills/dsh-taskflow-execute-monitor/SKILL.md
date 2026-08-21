@@ -1,6 +1,6 @@
 ---
 name: dsh-taskflow-execute-monitor
-description: Operate and monitor execution of an installed dsh-taskflow run. Use when claiming planned issues in manual mode, working in taskflow worktrees, reporting execution or progress, reading state, board, run detail, or SSE events, and handling READY, EXECUTING, INTEGRATION_REVIEW, or FAILED.
+description: Operate and monitor execution of an installed dsh-taskflow run. Use when claiming planned issues in manual mode, working in taskflow worktrees, reporting execution or progress, observing checkpoint review, reading state, board, run detail, or SSE events, and handling READY, EXECUTING, INTEGRATION_REVIEW, or FAILED.
 ---
 
 # dsh-taskflow execute & monitor
@@ -24,7 +24,8 @@ Use this skill after a run is `READY`, during `EXECUTING`, or when observing exe
 
 ## Transitions
 
-- All issues done → `INTEGRATION_REVIEW`; continue to `dsh-taskflow-handle-review`.
+- With automatic review enabled, a successful Issue is committed and enters a read-only `CHECKPOINT` before merge. `CONTINUE` merges it, `FIX` requeues that Issue in the same worktree, and `REPLAN` stops the current wave and returns the run to `PLANNING`.
+- All issues merged → `INTEGRATION_REVIEW`, where the automatic `FINAL` review runs; continue to `dsh-taskflow-handle-review`.
 - Run `FAILED` → inspect the error and, if `retry` is available, continue to `dsh-taskflow-control-run`.
 
 ## Codex CLI compatibility

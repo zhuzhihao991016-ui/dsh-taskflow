@@ -171,6 +171,33 @@ describe('TaskFlowService.startReview', () => {
     expect(run.review?.reworkKeys).toEqual(['issue-001', 'issue-002'])
   })
 
+  it('FINAL REPLAN returns to PLANNING instead of directly re-executing stale issues', async () => {
+    const { repository, service, reviewer } = harness()
+    seedIntegrationReview(repository, [issueA, issueB])
+    reviewer.result = {
+      verdict: 'REVISE',
+      nextAction: 'REPLAN',
+      summary: 'Issue 拆分方向错误',
+      reworkKeys: [],
+    }
+
+    const result = await service.startReview('run-0001', { wait: true })
+
+    expect(result).toMatchObject({ ok: true, status: 'PLANNING', verdict: 'REVISE' })
+    const run = repository.getRun('run-0001') as RunAggregate
+    expect(run.status).toBe('PLANNING')
+    expect(run.review).toMatchObject({
+      verdict: 'REVISE',
+      stage: 'FINAL',
+      nextAction: 'REPLAN',
+    })
+    expect(run.transitions.at(-1)).toMatchObject({
+      from: 'INTEGRATION_REVIEW',
+      to: 'PLANNING',
+      reason: 'review-replan',
+    })
+  })
+
   it('rejects review for unknown runs and runs not in INTEGRATION_REVIEW', async () => {
     const { repository, service } = harness()
     seedIntegrationReview(repository, [issueA])

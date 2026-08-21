@@ -13,7 +13,11 @@ import { execGit, WorktreeError, WorktreeManager, type GitResult, type GitRunner
 /** Scriptable fake git runner recording every command. */
 class FakeGit implements GitRunner {
   calls: string[][] = []
-  resultFor: (args: readonly string[]) => GitResult = () => ({ exitCode: 0, stdout: '', stderr: '' })
+  resultFor: (args: readonly string[]) => GitResult = (args) => (
+    args[0] === 'rev-parse' && args[1] === '--verify'
+      ? { exitCode: 0, stdout: 'abc123\n', stderr: '' }
+      : { exitCode: 0, stdout: '', stderr: '' }
+  )
 
   async run(args: readonly string[], _cwd: string): Promise<GitResult> {
     this.calls.push([...args])
@@ -65,11 +69,12 @@ describe('WorktreeManager', () => {
     const result = await manager.createIssueWorktree(REPO, 'run-0001', 'issue-001', 'taskflow/integration')
 
     expect(result.branch).toBe('taskflow/run-0001/issue-001')
+    expect(result.branchBaseSha).toBe('abc123')
     expect(result.workDir).toBe(join(resolve(REPO), '.taskflow', 'worktrees', 'run-0001', 'issue-001'))
     expect(git.calls).toContainEqual([
       'worktree', 'add', '-b', 'taskflow/run-0001/issue-001',
       join(resolve(REPO), '.taskflow', 'worktrees', 'run-0001', 'issue-001'),
-      'taskflow/integration',
+      'abc123',
     ])
   })
 
@@ -87,7 +92,7 @@ describe('WorktreeManager', () => {
     expect(root).toBe(join(dirname(repoResolved), DEFAULT_WORKTREES_DIR, basename(root)))
     expect(rootOf(second.workDir)).toBe(root)
     expect(git.calls).toContainEqual([
-      'worktree', 'add', '-b', 'taskflow/run-0001/issue-001', first.workDir, 'taskflow/integration',
+      'worktree', 'add', '-b', 'taskflow/run-0001/issue-001', first.workDir, 'abc123',
     ])
   })
 
@@ -113,7 +118,7 @@ describe('WorktreeManager', () => {
 
     expect(result.workDir).toBe(join(root, 'run-0001', 'issue-001'))
     expect(git.calls).toContainEqual([
-      'worktree', 'add', '-b', 'taskflow/run-0001/issue-001', result.workDir, 'taskflow/integration',
+      'worktree', 'add', '-b', 'taskflow/run-0001/issue-001', result.workDir, 'abc123',
     ])
   })
 
@@ -140,14 +145,20 @@ describe('WorktreeManager', () => {
       if (args[0] === 'rev-parse' && args[1] === '--abbrev-ref') {
         return { exitCode: 0, stdout: `${branch}\n`, stderr: '' }
       }
+      if (args[0] === 'rev-parse' && args[1] === '--verify') {
+        return { exitCode: 0, stdout: 'base123\n', stderr: '' }
+      }
+      if (args[0] === 'merge-base') {
+        return { exitCode: 0, stdout: 'base123\n', stderr: '' }
+      }
       return { exitCode: 0, stdout: '', stderr: '' }
     }
     const manager = new WorktreeManager(git, '.taskflow/worktrees')
 
     const result = await manager.createIssueWorktree(REPO, 'run-0001', 'issue-001', 'taskflow/integration')
 
-    expect(result).toEqual({ workDir, branch })
-    expect(git.calls).toContainEqual(['worktree', 'add', '-b', branch, workDir, 'taskflow/integration'])
+    expect(result).toEqual({ workDir, branch, branchBaseSha: 'base123' })
+    expect(git.calls).toContainEqual(['worktree', 'add', '-b', branch, workDir, 'base123'])
     expect(git.calls).toContainEqual(['worktree', 'add', workDir, branch])
     expect(git.calls).toContainEqual(['rev-parse', '--abbrev-ref', 'HEAD'])
   })

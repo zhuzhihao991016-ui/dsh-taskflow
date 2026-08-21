@@ -129,20 +129,34 @@ export class WorktreeManager {
     issueKey: string,
     integrationBranch: string,
     baseSha?: string,
-  ): Promise<{ workDir: string; branch: string }> {
+  ): Promise<{ workDir: string; branch: string; branchBaseSha: string }> {
     await this.ensureIntegrationBranch(repoRoot, integrationBranch, baseSha)
     const branch = `taskflow/${runId}/${issueKey}`
     const workDir = join(this.worktreeRootFor(repoRoot), runId, issueKey)
-    const add = await this.git.run(['worktree', 'add', '-b', branch, workDir, integrationBranch], repoRoot)
-    if (add.exitCode === 0) return { workDir, branch }
+    const branchBaseSha = await this.getBranchHeadSha(repoRoot, integrationBranch)
+    const add = await this.git.run(['worktree', 'add', '-b', branch, workDir, branchBaseSha], repoRoot)
+    if (add.exitCode === 0) return { workDir, branch, branchBaseSha }
     // Crash recovery: a previous attempt may have created the branch or the
     // worktree before the execution record was updated. Reuse a matching
     // existing worktree instead of failing the run.
     const attach = await this.git.run(['worktree', 'add', workDir, branch], repoRoot)
-    if (attach.exitCode === 0) return { workDir, branch }
+    if (attach.exitCode === 0) {
+      return { workDir, branch, branchBaseSha: await this.getMergeBase(repoRoot, branch, integrationBranch) }
+    }
     const check = await this.git.run(['rev-parse', '--abbrev-ref', 'HEAD'], workDir)
-    if (check.exitCode === 0 && check.stdout.trim() === branch) return { workDir, branch }
+    if (check.exitCode === 0 && check.stdout.trim() === branch) {
+      return { workDir, branch, branchBaseSha: await this.getMergeBase(repoRoot, branch, integrationBranch) }
+    }
     throw new WorktreeError(`create worktree for ${issueKey} failed: ${add.stderr.trim()}`)
+  }
+
+  /** Resolve the immutable common base of an issue and integration branch. */
+  private async getMergeBase(repoRoot: string, branch: string, integrationBranch: string): Promise<string> {
+    const result = await this.git.run(['merge-base', branch, integrationBranch], repoRoot)
+    if (result.exitCode !== 0 || result.stdout.trim() === '') {
+      throw new WorktreeError(`resolve merge base for '${branch}' failed: ${result.stderr.trim()}`)
+    }
+    return result.stdout.trim()
   }
 
   /** Resolve a branch's current head SHA (used to pin review to integration). */

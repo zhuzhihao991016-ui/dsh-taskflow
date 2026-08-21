@@ -39,8 +39,11 @@ describe('RUN_TRANSITIONS', () => {
     }
   })
 
-  it('allows rework INTEGRATION_REVIEW → EXECUTING and rejection AWAITING_HUMAN → PLANNING', () => {
+  it('allows direct fixes and Codex-requested replanning', () => {
     expect(canTransition('INTEGRATION_REVIEW', 'EXECUTING')).toBe(true)
+    expect(canTransition('EXECUTING', 'PLANNING')).toBe(true)
+    expect(canTransition('INTEGRATION_REVIEW', 'PLANNING')).toBe(true)
+    expect(canTransition('WAITING_DECISION', 'PLANNING')).toBe(true)
     expect(canTransition('AWAITING_HUMAN', 'PLANNING')).toBe(true)
   })
 
