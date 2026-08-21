@@ -10,7 +10,8 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import type { PlannedIssue } from './dag.ts'
 import type { IssueExecution, ReviewNextAction, ReviewStage } from './domain.ts'
-import {
+import { DEFAULT_CODEX_PROFILES, type CodexInvocationProfile } from './codex-profile.ts'
+import {
   lastAssistantText,
   resolveCodexCli,
   spawnCodexProcess,
@@ -222,10 +223,11 @@ export const DEFAULT_REVIEW_MAX_RETRIES = 1
 export class CodexReviewer {
   constructor(
     private readonly executor: ProcessExecutor = spawnCodexProcess,
-    private readonly timeoutMs: number = DEFAULT_REVIEW_TIMEOUT_MS,
-    private readonly maxRetries: number = DEFAULT_REVIEW_MAX_RETRIES,
-    private readonly cliPath: string = resolveCodexCli(),
-  ) {}
+    private readonly timeoutMs: number = DEFAULT_REVIEW_TIMEOUT_MS,
+    private readonly maxRetries: number = DEFAULT_REVIEW_MAX_RETRIES,
+    private readonly cliPath: string = resolveCodexCli(),
+    private readonly profile?: (stage: ReviewStage) => CodexInvocationProfile,
+  ) {}
 
   /** Produce a review object for one completed run; never mutates the repo
    * (read-only + ephemeral). */
@@ -233,7 +235,10 @@ export class CodexReviewer {
     const schemaPath = await writeReviewSchema(input.workDir)
     const prompt = buildReviewPrompt(input)
     const stage = input.stage ?? 'FINAL'
-    const reasoningEffort = stage === 'CHECKPOINT' ? 'medium' : 'max'
+    const profile = this.profile?.(stage) ?? {
+      ...(stage === 'CHECKPOINT' ? DEFAULT_CODEX_PROFILES.checkpoint : DEFAULT_CODEX_PROFILES.final),
+    }
+    const cliPath = profile.cliPath?.trim() || this.cliPath
     const comparisonBaseSha = input.reviewBaseSha ?? input.baseSha
     // Canonicalize once: checkpoint reviews run inside the issue worktree;
     // final reviews run against the owning repository root.
@@ -244,10 +249,10 @@ export class CodexReviewer {
     // the prompt. Without a base SHA keep the P4 `review --uncommitted` form.
     const command = comparisonBaseSha !== undefined
       ? [
-          this.cliPath,
+          cliPath,
           'exec',
-          '--model', 'gpt-5.6-sol',
-          '--config', `model_reasoning_effort="${reasoningEffort}"`,
+          '--model', profile.model,
+          '--config', 'model_reasoning_effort=' + JSON.stringify(profile.reasoningEffort),
           '--config', 'sandbox_mode="read-only"',
           '--strict-config',
           '--ephemeral',
@@ -258,11 +263,11 @@ export class CodexReviewer {
           '-',
         ]
       : [
-          this.cliPath,
+          cliPath,
           'exec',
           'review',
-          '--model', 'gpt-5.6-sol',
-          '--config', `model_reasoning_effort="${reasoningEffort}"`,
+          '--model', profile.model,
+          '--config', 'model_reasoning_effort=' + JSON.stringify(profile.reasoningEffort),
           '--config', 'sandbox_mode="read-only"',
           '--strict-config',
           '--ephemeral',

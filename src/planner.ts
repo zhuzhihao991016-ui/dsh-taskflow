@@ -13,6 +13,7 @@ import { existsSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import type { PlannedIssue } from './dag.ts'
+import { DEFAULT_CODEX_PROFILES, type CodexInvocationProfile } from './codex-profile.ts'
 
 /** Stable error code for planner failures (surfaced in run transitions). */
 export type PlannerErrorCode =
@@ -86,7 +87,7 @@ function isAbortRequested(signal: AbortSignal | undefined): boolean {
  * executable on PATH) launch directly. .cmd/.bat launchers are rejected:
  * callers should point CODEX_CLI_PATH at the underlying .js or .exe entry.
  */
-function resolveSpawnTarget(command: readonly string[]): {
+export function resolveCodexSpawnTarget(command: readonly string[]): {
   file: string
   args: string[]
   detached: boolean
@@ -149,7 +150,7 @@ export const spawnCodexProcess: ProcessExecutor = {
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
       throw new TypeError('taskflow: timeoutMs must be a positive finite number')
     }
-    const { file, args, detached } = resolveSpawnTarget(request.command)
+    const { file, args, detached } = resolveCodexSpawnTarget(request.command)
     return new Promise((resolve) => {
       const child = spawn(file, args, {
         cwd: request.cwd,
@@ -427,6 +428,7 @@ export class CodexPlanner {
     private readonly timeoutMs: number = DEFAULT_PLAN_TIMEOUT_MS,
     private readonly maxRetries: number = DEFAULT_PLAN_MAX_RETRIES,
     private readonly cliPath: string = resolveCodexCli(),
+    private readonly profile?: () => CodexInvocationProfile,
   ) {}
 
   /** Produce a plan object for one run; never mutates the repo (read-only + ephemeral). */
@@ -436,11 +438,13 @@ export class CodexPlanner {
     // Canonicalize once: cwd and --cd share one absolute path so a relative
     // repoRoot can never resolve as repo/repo.
     const repoRoot = resolve(input.repoRoot)
+    const profile = this.profile?.() ?? { ...DEFAULT_CODEX_PROFILES.planning }
+    const cliPath = profile.cliPath?.trim() || this.cliPath
     const command = [
-      this.cliPath,
+      cliPath,
       'exec',
-      '--model', 'gpt-5.6-sol',
-      '--config', 'model_reasoning_effort="max"',
+      '--model', profile.model,
+      '--config', 'model_reasoning_effort=' + JSON.stringify(profile.reasoningEffort),
       '--strict-config',
       '--sandbox', 'read-only',
       '--ephemeral',

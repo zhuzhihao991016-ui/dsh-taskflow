@@ -133,6 +133,7 @@ export class CodexIssueExecutor implements AutomatedExecutor {
     private readonly timeoutMs: number = DEFAULT_ISSUE_EXECUTOR_TIMEOUT_MS,
     private readonly maxRetries: number = DEFAULT_ISSUE_EXECUTOR_MAX_RETRIES,
     private readonly cliPath: string = resolveCodexCli(),
+    private readonly cliPathSource?: () => string | undefined,
   ) {}
 
   /** Implement one issue; never escapes the issue worktree (workspace-write sandbox). */
@@ -142,8 +143,9 @@ export class CodexIssueExecutor implements AutomatedExecutor {
     const cwd = resolve(input.workDir)
     const schemaPath = await writeIssueExecutionSchema(cwd)
     const prompt = buildIssuePrompt(input)
+    const cliPath = this.cliPathSource?.()?.trim() || this.cliPath
     const command = [
-      this.cliPath,
+      cliPath,
       'exec',
       '--model', 'gpt-5.6-sol',
       '--config', 'model_reasoning_effort="high"',

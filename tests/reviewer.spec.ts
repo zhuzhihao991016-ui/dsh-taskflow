@@ -191,6 +191,36 @@ describe('CodexReviewer', () => {
     expect(request.stdinText).toContain('REPLAN')
   })
 
+  it('uses independent configured profiles for checkpoint and final review', async () => {
+    const root = await freshRoot()
+    const executor = new FakeExecutor()
+    executor.results = [
+      { exitCode: 0, stdout: agentMessageEvent(REVIEW_JSON), stderr: '', timedOut: false },
+      { exitCode: 0, stdout: agentMessageEvent(REVIEW_JSON), stderr: '', timedOut: false },
+    ]
+    const reviewer = new CodexReviewer(executor, 60_000, 0, 'fallback-codex', stage => stage === 'CHECKPOINT'
+      ? { cliPath: 'checkpoint-codex', model: 'gpt-checkpoint', reasoningEffort: 'low' }
+      : { cliPath: 'final-codex', model: 'gpt-final', reasoningEffort: 'xhigh' })
+
+    await reviewer.review({ ...INPUT, stage: 'CHECKPOINT', workDir: join(root, 'checkpoint') })
+    await reviewer.review({ ...INPUT, stage: 'FINAL', workDir: join(root, 'final') })
+
+    expect(executor.requests[0]?.command.slice(0, 7)).toEqual([
+      'checkpoint-codex',
+      'exec',
+      'review',
+      '--model', 'gpt-checkpoint',
+      '--config', 'model_reasoning_effort="low"',
+    ])
+    expect(executor.requests[1]?.command.slice(0, 7)).toEqual([
+      'final-codex',
+      'exec',
+      'review',
+      '--model', 'gpt-final',
+      '--config', 'model_reasoning_effort="xhigh"',
+    ])
+  })
+
   it('forwards an optional abort signal to the process executor', async () => {
     const root = await freshRoot()
     const executor = new FakeExecutor()

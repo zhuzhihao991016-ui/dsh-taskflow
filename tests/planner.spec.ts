@@ -199,6 +199,26 @@ describe('CodexPlanner', () => {
     expect(issueItem?.additionalProperties).toBe(false)
   })
 
+  it('uses the configured planning model, effort, and CLI entry', async () => {
+    const root = await freshRoot()
+    const executor = new FakeExecutor()
+    executor.results = [{ exitCode: 0, stdout: agentMessageEvent(PLAN_JSON), stderr: '', timedOut: false }]
+    const planner = new CodexPlanner(executor, 60_000, 0, 'fallback-codex', () => ({
+      cliPath: 'configured-codex',
+      model: 'gpt-planner',
+      reasoningEffort: 'high',
+    }))
+
+    await planner.plan({ ...INPUT, workDir: join(root, 'configured') })
+
+    expect(executor.requests[0]?.command.slice(0, 6)).toEqual([
+      'configured-codex',
+      'exec',
+      '--model', 'gpt-planner',
+      '--config', 'model_reasoning_effort="high"',
+    ])
+  })
+
   it('canonicalizes a relative repoRoot once for both cwd and --cd', async () => {
     const root = await freshRoot()
     const executor = new FakeExecutor()

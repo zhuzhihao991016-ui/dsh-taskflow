@@ -11,21 +11,32 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-storage-domain'
 import { TASKFLOW_DOMAIN } from './domain.ts'
-import { AUTOMATION_CONTROL_ACTIONS, DEFAULT_AUTOMATION_CONFIG, EXECUTOR_PHASES, type TaskFlowEvent } from './contracts.ts'
+import { AUTOMATION_CONTROL_ACTIONS, EXECUTOR_PHASES, type TaskFlowEvent } from './contracts.ts'
 import type { ExecutionResult } from './executor.ts'
+import { CodexCliBridge } from './codex-cli.ts'
+import {
+  Config as TaskFlowConfigSchema,
+  assertTaskFlowConfig,
+  codexProfile,
+  resolveTaskFlowConfig,
+  type Config,
+  type ResolvedConfig,
+} from './config.ts'
 import { CodexIssueExecutor } from './issue-executor.ts'
 import { CodexPlanner } from './planner.ts'
 import { DomainRepository } from './repository.ts'
+import { CodexReviewer } from './reviewer.ts'
 import { TaskFlowService, type CommandAction, type HumanDecision, type SubmitRequest } from './service.ts'
 import { createTeamBoardSync, type TeamBoardService } from './team-board-sync.ts'
 
 /** P8.2 public adapter exports. */
 export { CodexIssueExecutor, CodexExecutor } from './issue-executor.ts'
+export { Config } from './config.ts'
+export type { CodexReasoningEffort, CodexScene } from './codex-profile.ts'
 
 /** Order of the announcement section within the tool-guidance band. */
 const SECTION_ORDER = 200
@@ -36,60 +47,72 @@ export const inject = ['systemPrompt', 'storageDomain']
 /** Model-facing announcement: plugin presence, capabilities, and limits. */
 export const TASKFLOW_GUIDANCE = '本机已安装 dsh-taskflow 插件（DSH 全自动任务工作流编排）：任务提出后由 Codex CLI 规划拆分为 Issue 并发布看板，DSH 认领执行（串行/并行 + Git worktree 隔离）。每个 Issue 完成后先由 Codex CHECKPOINT（gpt-5.6-sol medium）做合并前方向审查；全部 Issue 完成后由 Codex FINAL（gpt-5.6-sol max）终审。审查可 CONTINUE、FIX 原地修复，或 REPLAN 携带 findings 返回规划，最终由人工验收。当前为 P8.6 阶段：运行台账已持久化，Codex 规划引擎已接入（提交时带 repoRoot 后经 /plugins/taskflow/plan 触发规划，规划通过后运行进入 READY 并携带 Issue 清单）；执行引擎已启用（经 /plugins/taskflow/execute 启动执行，READY → EXECUTING，按 DAG 依赖每次认领最多 maxConcurrent 个可调度 Issue，响应含 currentIssues；每个 Issue 在独立 Git worktree 中执行，workDir/branch 可从 state/execute 响应读取；完成 currentIssue 后经 /plugins/taskflow/exec-result 上报 { runId, issueKey, ok, summary|error }，成功提交后先执行 CHECKPOINT，CONTINUE 才自动合并到集成分支，全部完成后运行进入 INTEGRATION_REVIEW 并执行 FINAL）；P4 双阶段审查门已启用（自动 CHECKPOINT 负责逐步方向审查，/plugins/taskflow/review 仅在 INTEGRATION_REVIEW 手动触发 FINAL；PASS/CONTINUE 继续，REVISE/FIX 打回执行，REVISE/REPLAN 返回 PLANNING）；P6 看板已启用（GET /plugins/taskflow/board 返回五列看板快照，浏览器端状态卡片可打开看板）；P7 人工验收门已启用（POST /plugins/taskflow/human-decision 提交 { runId, decision: accept|rework }，accept 进入 ACCEPTED 终态，rework 回到 PLANNING 重新规划）；P8 自动化契约已冻结且默认开启（automationEnabled=true）；P8.1 已持久化控制元数据、进度事件与运行级 Git 隔离，并提供 GET /plugins/taskflow/run 详情投影与 pause/resume/takeover/release/retry 控制动作；P8.2 已内置 Codex Issue Executor（自动化开启时在独立 worktree 中以 workspace-write 非交互实现 Issue）；P8.3 已接入自动推进协调器（automationEnabled 开启且 autoPlan/autoReview 为 true 时自动完成规划、执行、逐步审查和最终审查），新增 GET /plugins/taskflow/events SSE 事件流，自动修复或重新规划达到 maxReviewCycles 时进入 WAITING_DECISION 人工介入窗口（可用 resume 继续）；P8.4 已接入自动执行授权门（requireExecutionPermission=true 时，规划完成后进入 WAITING_PERMISSION，人工 release 后自动继续执行）；P8.5 已接入浏览器运行台与介入窗口（看板卡片打开运行详情抽屉，经 /plugins/taskflow/run 与 run-scoped SSE 实时刷新，按 allowedActions 渲染操作按钮并二次确认后调用 /plugins/taskflow/command 或 /plugins/taskflow/human-decision）。若同 profile 安装了 team-board 插件，taskflow 看板会自动镜像到 ctx.teamBoard（teamBoardSync=false 可关闭）。用户提到「工作流 / 任务流 / taskflow」时即指本插件，请据此协作。'
 
-/** Plugin config; schema defaults are applied by the loader. */
-export interface Config {
-  /** When true (default), announce the plugin in every agent's system prompt. */
-  announceToAgent?: boolean
-  /** Master switch for the plugin. */
-  enabled?: boolean
-  /** Canonical repo roots the planner may inspect; empty = planning disabled. */
-  allowedRepoRoots?: string[]
-  /** Codex CLI entry override; default resolves via CODEX_CLI_PATH or platform. */
-  codexCliPath?: string
-  /** P5: maximum concurrent issues (default 1 = serial-compatible). */
-  maxConcurrent?: number
-  /** P5: persistent branch where successful issue worktrees are merged. */
-  integrationBranch?: string
-  /** P5: optional worktree root; omitted defaults to a hashed sibling directory outside the repo. */
-  worktreesRoot?: string
-  /** P8: master switch for the automated executor/automation; default on from P8.6. */
-  automationEnabled?: boolean
-  /** P8: when automation is enabled, automatically start planning. */
-  autoPlan?: boolean
-  /** P8: when automation is enabled, automatically trigger Codex review. */
-  autoReview?: boolean
-  /** P8: global cap on concurrent Codex executor processes. */
-  maxExecutorProcesses?: number
-  /** P8: max review/rework cycles before asking a human. */
-  maxReviewCycles?: number
-  /** P8.4: wait for human release before automatic execution starts. */
-  requireExecutionPermission?: boolean
-  /** Optional integration: mirror taskflow board cards to `ctx.teamBoard` when that service is present. */
-  teamBoardSync?: boolean
-  /** Subject marker used to recognize taskflow-created team-board tasks. */
-  teamBoardTaskPrefix?: string
-  /** Owner assigned to mirrored team-board tasks (default: none). */
-  teamBoardOwner?: string
+export function buildTaskFlowGuidance(_config: ResolvedConfig): string {
+  return TASKFLOW_GUIDANCE
+    .replace(
+      'Codex CHECKPOINT（gpt-5.6-sol medium）',
+      'Codex CHECKPOINT（使用插件设置中的步审模型和思考强度）',
+    )
+    .replace(
+      'Codex FINAL（gpt-5.6-sol max）',
+      'Codex FINAL（使用插件设置中的终审模型和思考强度）',
+    )
 }
 
-export const Config: z<Config> = z.object({
-  announceToAgent: z.boolean().default(true),
-  enabled: z.boolean().default(true),
-  allowedRepoRoots: z.array(z.string()).default([]),
-  codexCliPath: z.string().default(''),
-  maxConcurrent: z.number().step(1).min(1).default(1),
-  integrationBranch: z.string().default('taskflow/integration'),
-  worktreesRoot: z.string().default(''),
-  automationEnabled: z.boolean().default(DEFAULT_AUTOMATION_CONFIG.enabled),
-  autoPlan: z.boolean().default(DEFAULT_AUTOMATION_CONFIG.autoPlan),
-  autoReview: z.boolean().default(DEFAULT_AUTOMATION_CONFIG.autoReview),
-  maxExecutorProcesses: z.number().step(1).min(1).default(DEFAULT_AUTOMATION_CONFIG.maxExecutorProcesses),
-  maxReviewCycles: z.number().step(1).min(1).default(DEFAULT_AUTOMATION_CONFIG.maxReviewCycles),
-  requireExecutionPermission: z.boolean().default(DEFAULT_AUTOMATION_CONFIG.requireExecutionPermission),
-  teamBoardSync: z.boolean().default(true),
-  teamBoardTaskPrefix: z.string().default('[taskflow]'),
-  teamBoardOwner: z.string().default(''),
-})
+const TASKFLOW_SETTINGS_NAMESPACE = 'taskflow'
+
+interface HostSettingsScope<T> {
+  get(): T
+}
+
+interface HostSettingsProvider {
+  register<T>(
+    namespace: string,
+    schema: typeof TaskFlowConfigSchema,
+    options: {
+      base: Partial<T>
+      applies: 'restart'
+      validate: (value: T) => void
+    },
+  ): HostSettingsScope<T>
+}
+
+/** Resolve an optional Cordis service without declaration-merging its provider package. */
+function optionalService(scope: Context, name: string): unknown {
+  return (scope as unknown as { get(service: string): unknown }).get(name)
+}
+
+/** Register the Taskflow settings namespace when the Host settings seam is present. */
+function installTaskFlowSettings(scope: Context, entry: ResolvedConfig): () => ResolvedConfig {
+  let source: () => Config = () => entry
+  const attach = (ownerScope: Context, settings: HostSettingsProvider): void => {
+    const owner = settings.register<Config>(
+      TASKFLOW_SETTINGS_NAMESPACE,
+      TaskFlowConfigSchema,
+      {
+        base: entry,
+        applies: 'restart',
+        validate: assertTaskFlowConfig,
+      },
+    )
+    source = () => owner.get()
+    ownerScope.effect(() => () => {
+      source = () => entry
+    }, 'dsh-taskflow: settings source')
+  }
+  const settings = optionalService(scope, 'settings') as HostSettingsProvider | undefined
+  if (settings !== undefined && typeof settings.register === 'function') {
+    attach(scope, settings)
+  } else {
+    scope.inject(['settings'], (settingsScope: Context) => {
+      const available = optionalService(settingsScope, 'settings') as HostSettingsProvider | undefined
+      if (available !== undefined && typeof available.register === 'function') {
+        attach(settingsScope, available)
+      }
+    })
+  }
+  return () => resolveTaskFlowConfig(source())
+}
 
 /** JSON response writer (same-origin routes; no secrets ever enter bodies). */
 function sendJson(res: ServerResponse, body: unknown, status = 200, headers: Record<string, string> = {}): void {
@@ -382,26 +405,126 @@ function handleDelete(service: TaskFlowService, req: IncomingMessage, res: Serve
   })
 }
 
+function publicCodexProfile(config: ResolvedConfig, scene: 'planning' | 'checkpoint' | 'final') {
+  const { model, reasoningEffort } = codexProfile(config, scene)
+  return { model, reasoningEffort }
+}
+
+const RESTART_CONFIG_FIELDS = [
+  'announceToAgent',
+  'enabled',
+  'allowedRepoRoots',
+  'maxConcurrent',
+  'integrationBranch',
+  'worktreesRoot',
+  'automationEnabled',
+  'autoPlan',
+  'autoReview',
+  'maxExecutorProcesses',
+  'maxReviewCycles',
+  'requireExecutionPermission',
+  'teamBoardSync',
+  'teamBoardTaskPrefix',
+  'teamBoardOwner',
+] as const satisfies readonly (keyof ResolvedConfig)[]
+
+function pendingRestartFields(
+  effective: ResolvedConfig,
+  configured: ResolvedConfig,
+): Array<(typeof RESTART_CONFIG_FIELDS)[number]> {
+  return RESTART_CONFIG_FIELDS.filter(
+    field => JSON.stringify(effective[field]) !== JSON.stringify(configured[field]),
+  )
+}
+
 /** GET /plugins/taskflow/status — unified process/config/automation status entry. */
-function handleStatus(config: Config | undefined, _req: IncomingMessage, res: ServerResponse): void {
+export function handleStatus(
+  effectiveConfig: ResolvedConfig,
+  configuredConfig: ResolvedConfig,
+  req: IncomingMessage,
+  res: ServerResponse,
+): void {
+  if (!requireGet(req, res, 'status')) return
+  const pendingFields = pendingRestartFields(effectiveConfig, configuredConfig)
   sendJson(res, {
     ok: true,
     status: {
       pid: process.pid,
       plugin: 'dsh-taskflow',
       version: '0.1.0',
-      hotReload: 'config-patch-live',
-      automation: {
-        enabled: config?.automationEnabled ?? DEFAULT_AUTOMATION_CONFIG.enabled,
-        autoPlan: config?.autoPlan ?? DEFAULT_AUTOMATION_CONFIG.autoPlan,
-        autoReview: config?.autoReview ?? DEFAULT_AUTOMATION_CONFIG.autoReview,
-        requireExecutionPermission: config?.requireExecutionPermission ?? DEFAULT_AUTOMATION_CONFIG.requireExecutionPermission,
-        maxConcurrent: config?.maxConcurrent ?? 1,
-        maxExecutorProcesses: config?.maxExecutorProcesses ?? DEFAULT_AUTOMATION_CONFIG.maxExecutorProcesses,
-        maxReviewCycles: config?.maxReviewCycles ?? DEFAULT_AUTOMATION_CONFIG.maxReviewCycles,
+      enabled: effectiveConfig.enabled,
+      hotReload: 'codex-next-invocation-workflow-restart',
+      settings: {
+        codexApplies: 'next-invocation',
+        workflowApplies: 'restart',
+        restartRequired: pendingFields.length > 0,
+        pendingRestartFields: pendingFields,
       },
-      allowedRepoRoots: config?.allowedRepoRoots ?? [],
+      automation: {
+        enabled: effectiveConfig.automationEnabled,
+        autoPlan: effectiveConfig.autoPlan,
+        autoReview: effectiveConfig.autoReview,
+        requireExecutionPermission: effectiveConfig.requireExecutionPermission,
+        maxConcurrent: effectiveConfig.maxConcurrent,
+        maxExecutorProcesses: effectiveConfig.maxExecutorProcesses,
+        maxReviewCycles: effectiveConfig.maxReviewCycles,
+      },
+      codex: {
+        planning: publicCodexProfile(configuredConfig, 'planning'),
+        checkpoint: publicCodexProfile(configuredConfig, 'checkpoint'),
+        final: publicCodexProfile(configuredConfig, 'final'),
+      },
+      allowedRepoRoots: effectiveConfig.allowedRepoRoots,
     },
+  })
+}
+
+function requireGet(req: IncomingMessage, res: ServerResponse, route: string): boolean {
+  if (req.method === 'GET') return true
+  sendJson(res, { ok: false, error: 'taskflow: ' + route + ' requires GET' }, 405, { Allow: 'GET' })
+  return false
+}
+
+/** GET /plugins/taskflow/codex/models — sanitized CLI model choices. */
+export function handleCodexModels(bridge: CodexCliBridge, req: IncomingMessage, res: ServerResponse): void {
+  if (!requireGet(req, res, 'codex models')) return
+  const refresh = new URL(req.url ?? '', 'http://localhost').searchParams.get('refresh') === '1'
+  void bridge.listModels(refresh).then((result) => {
+    sendJson(res, { ok: true, ...result })
+  }, () => {
+    sendJson(res, { ok: false, error: 'taskflow: 无法读取 Codex 模型列表' }, 503)
+  })
+}
+
+/** GET /plugins/taskflow/codex/auth — boolean auth status only, never account text. */
+export function handleCodexAuth(bridge: CodexCliBridge, req: IncomingMessage, res: ServerResponse): void {
+  if (!requireGet(req, res, 'codex auth')) return
+  void bridge.authStatus().then((status) => {
+    sendJson(res, { ok: true, ...status })
+  }, () => {
+    sendJson(res, { ok: true, available: false, authenticated: false })
+  })
+}
+
+/** POST /plugins/taskflow/codex/login — explicitly launch browser OAuth. */
+export function handleCodexLogin(bridge: CodexCliBridge, req: IncomingMessage, res: ServerResponse): void {
+  const guardError = guardMutation(req)
+  if (guardError !== undefined) {
+    sendJson(res, { ok: false, error: guardError }, 403)
+    return
+  }
+  void readJsonBody(req, 4 * 1024).then((body) => {
+    if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+      sendJson(res, { ok: false, error: 'taskflow: login body must be an object' }, 400)
+      return
+    }
+    void bridge.login().then(() => {
+      sendJson(res, { ok: true, launched: true }, 202)
+    }, () => {
+      sendJson(res, { ok: false, error: 'taskflow: 无法启动 Codex 登录流程' }, 503)
+    })
+  }, (error) => {
+    sendJson(res, { ok: false, error: (error as Error).message }, 400)
   })
 }
 
@@ -678,37 +801,59 @@ export function handleEvents(service: TaskFlowService, req: IncomingMessage, res
  * @param config - resolved plugin config.
  */
 export function apply(ctx: Context, config?: Config): Promise<void> {
-  if ((config?.enabled ?? true) === false) {
+  const entry = resolveTaskFlowConfig(config)
+  const currentConfig = installTaskFlowSettings(ctx, entry)
+  if (!currentConfig().enabled) {
     return Promise.resolve()
   }
   const fiber = ctx.inject(['systemPrompt', 'storageDomain'], async (scope: Context) => {
+    const initial = currentConfig()
+    if (!initial.enabled) return
     const domain = await scope.storageDomain.open(TASKFLOW_DOMAIN)
     // Return the close promise so lifecycle disposal awaits the domain drain
     // and the name frees before a potential reopen.
     scope.effect(() => () => domain.close(), 'dsh-taskflow: domain close')
-    const configuredCli = config?.codexCliPath
-    const cliPath = configuredCli !== undefined && configuredCli !== '' ? configuredCli : process.env.CODEX_CLI_PATH
-    const planner = new CodexPlanner(undefined, undefined, undefined, cliPath)
-    const executor = (config?.automationEnabled ?? DEFAULT_AUTOMATION_CONFIG.enabled)
-      ? new CodexIssueExecutor(undefined, undefined, undefined, cliPath)
+    const planner = new CodexPlanner(
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      () => codexProfile(currentConfig(), 'planning'),
+    )
+    const executor = initial.automationEnabled
+      ? new CodexIssueExecutor(
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          () => currentConfig().codexCliPath,
+        )
       : undefined
+    const reviewer = new CodexReviewer(
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      stage => codexProfile(currentConfig(), stage === 'CHECKPOINT' ? 'checkpoint' : 'final'),
+    )
+    const codexCli = new CodexCliBridge(() => currentConfig().codexCliPath)
     const service = new TaskFlowService(
       new DomainRepository(domain),
       undefined,
       planner,
-      config?.allowedRepoRoots ?? [],
+      initial.allowedRepoRoots,
       executor,
-      undefined,
+      reviewer,
       {
-        maxConcurrent: config?.maxConcurrent ?? 1,
-        integrationBranch: config?.integrationBranch ?? 'taskflow/integration',
-        worktreesRoot: config?.worktreesRoot?.trim() || undefined,
-        automationEnabled: config?.automationEnabled ?? DEFAULT_AUTOMATION_CONFIG.enabled,
-        maxExecutorProcesses: config?.maxExecutorProcesses ?? DEFAULT_AUTOMATION_CONFIG.maxExecutorProcesses,
-        autoPlan: config?.autoPlan ?? DEFAULT_AUTOMATION_CONFIG.autoPlan,
-        autoReview: config?.autoReview ?? DEFAULT_AUTOMATION_CONFIG.autoReview,
-        maxReviewCycles: config?.maxReviewCycles ?? DEFAULT_AUTOMATION_CONFIG.maxReviewCycles,
-        requireExecutionPermission: config?.requireExecutionPermission ?? DEFAULT_AUTOMATION_CONFIG.requireExecutionPermission,
+        maxConcurrent: initial.maxConcurrent,
+        integrationBranch: initial.integrationBranch,
+        worktreesRoot: initial.worktreesRoot.trim() || undefined,
+        automationEnabled: initial.automationEnabled,
+        maxExecutorProcesses: initial.maxExecutorProcesses,
+        autoPlan: initial.autoPlan,
+        autoReview: initial.autoReview,
+        maxReviewCycles: initial.maxReviewCycles,
+        requireExecutionPermission: initial.requireExecutionPermission,
       },
     )
 
@@ -716,11 +861,11 @@ export function apply(ctx: Context, config?: Config): Promise<void> {
     // team-board service. The nested inject starts and stops with the
     // team-board provider, so load order and provider reloads are handled by
     // Cordis instead of a one-time ctx.get() lookup.
-    if ((config?.teamBoardSync ?? true) === true) {
+    if (initial.teamBoardSync) {
       scope.inject(['teamBoard'], (teamScope: Context) => {
         const teamBoard = teamScope.get('teamBoard') as TeamBoardService
-        const teamBoardPrefix = config?.teamBoardTaskPrefix?.trim() || undefined
-        const teamBoardOwner = config?.teamBoardOwner?.trim() || undefined
+        const teamBoardPrefix = initial.teamBoardTaskPrefix.trim() || undefined
+        const teamBoardOwner = initial.teamBoardOwner.trim() || undefined
         const disposeTeamBoardSync = createTeamBoardSync(service, teamBoard, {
           prefix: teamBoardPrefix,
           owner: teamBoardOwner,
@@ -729,11 +874,11 @@ export function apply(ctx: Context, config?: Config): Promise<void> {
       })
     }
 
-    if ((config?.announceToAgent ?? true) === true) {
+    if (initial.announceToAgent) {
       scope.effect(() => scope.systemPrompt.section({
         name: 'plugin:taskflow',
         order: SECTION_ORDER,
-        text: TASKFLOW_GUIDANCE,
+        text: buildTaskFlowGuidance(initial),
       }), 'dsh-taskflow: guidance section')
     }
 
@@ -755,13 +900,34 @@ export function apply(ctx: Context, config?: Config): Promise<void> {
               sendJson(res, { ok: true, runs: service.list() })
             },
           }),
-            webScope.webServer.register({
+          webScope.webServer.register({
               kind: 'exact',
-              path: '/plugins/taskflow/status',
-              handler: (req, res) => {
-                handleStatus(config, req, res)
-              },
+            path: '/plugins/taskflow/status',
+            handler: (req, res) => {
+              handleStatus(initial, currentConfig(), req, res)
+            },
             }),
+          webScope.webServer.register({
+            kind: 'exact',
+            path: '/plugins/taskflow/codex/models',
+            handler: (req, res) => {
+              handleCodexModels(codexCli, req, res)
+            },
+          }),
+          webScope.webServer.register({
+            kind: 'exact',
+            path: '/plugins/taskflow/codex/auth',
+            handler: (req, res) => {
+              handleCodexAuth(codexCli, req, res)
+            },
+          }),
+          webScope.webServer.register({
+            kind: 'exact',
+            path: '/plugins/taskflow/codex/login',
+            handler: (req, res) => {
+              handleCodexLogin(codexCli, req, res)
+            },
+          }),
           webScope.webServer.register({
             kind: 'exact',
             path: '/plugins/taskflow/board',

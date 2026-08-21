@@ -12,12 +12,12 @@ flowchart LR
     B --> C[看板发布]
     C --> D[DSH / Codex 执行]
     D --> E[Git worktree 隔离]
-    E --> F[Codex CHECKPOINT<br/>gpt-5.6-sol medium]
+    E --> F[Codex CHECKPOINT<br/>可配置模型 / 强度]
     F -->|FIX| D
     F -->|REPLAN| B
     F -->|PASS| G[合并到集成分支]
     G -->|仍有步骤| D
-    G -->|全部完成| H[Codex FINAL<br/>gpt-5.6-sol max]
+    G -->|全部完成| H[Codex FINAL<br/>可配置模型 / 强度]
     H -->|FIX| D
     H -->|REPLAN| B
     H -->|PASS| I[人工验收]
@@ -29,8 +29,8 @@ flowchart LR
 2. **Codex 规划**：`CodexPlanner` 以只读、临时会话方式将任务拆分为多个 Issue；每个 Issue 包含验收标准（`acceptance`）、依赖（`deps`）和风险等级（`risk`）。
 3. **看板发布**：通过 DAG 校验后的 Issue 进入五列看板：待办、进行中、待审查、已完成、失败。
 4. **执行**：DSH 会话或内置 `CodexIssueExecutor` 认领 Issue；每个 Issue 在独立 Git worktree 中执行。
-5. **逐步方向审查**：每个 Issue 完成后、合并前，`CodexReviewer` 使用 `gpt-5.6-sol` 的 `medium` 推理强度执行只读 `CHECKPOINT`。`PASS` 才允许合并；`FIX` 保留当前 worktree 原地修复；`REPLAN` 中止当前执行周期并把 findings 带回规划器。
-6. **最终审查**：全部 Issue 合并后，`CodexReviewer` 使用 `gpt-5.6-sol` 的 `max` 推理强度执行只读 `FINAL`。`PASS` 进入人工验收，`FIX` 打回相关 Issue，`REPLAN` 返回规划阶段。
+5. **逐步方向审查**：每个 Issue 完成后、合并前，`CodexReviewer` 按“步审”场景配置执行只读 `CHECKPOINT`（默认 `gpt-5.6-sol / medium`）。`PASS` 才允许合并；`FIX` 保留当前 worktree 原地修复；`REPLAN` 中止当前执行周期并把 findings 带回规划器。
+6. **最终审查**：全部 Issue 合并后，`CodexReviewer` 按“终审”场景配置执行只读 `FINAL`（默认 `gpt-5.6-sol / max`）。`PASS` 进入人工验收，`FIX` 打回相关 Issue，`REPLAN` 返回规划阶段。
 7. **人工验收**：通过 `POST /plugins/taskflow/human-decision` 选择 `accept` 通过，或 `rework` 回到规划阶段重新开始。
 
 ## 特性
@@ -39,7 +39,8 @@ flowchart LR
 - **任务规划**：基于 Codex CLI 的结构化输出，生成带验收标准、依赖 DAG 和风险等级的 Issue 清单。
 - **DAG 调度**：校验依赖关系、检测环，按拓扑序执行；支持 `maxConcurrent` 并行执行。
 - **Git worktree 隔离**：每个 Issue 在独立 worktree 中实现，先通过方向审查，再合并到集成分支。
-- **双阶段自动审查门禁**：每步 `CHECKPOINT / medium` 防止方向走偏；全部完成后 `FINAL / max` 做完整终审，并用 `FIX` / `REPLAN` 区分局部修复与重新规划。
+- **三场景 Codex 配置**：规划、每步 `CHECKPOINT` 与全部完成后的 `FINAL` 可分别选择 Codex 模型和思考强度；审查继续用 `FIX` / `REPLAN` 区分局部修复与重新规划。
+- **原生插件设置卡片**：可在 DSH 的“设置 → 插件 → 插件配置 → Taskflow”读取 CLI 模型目录、保存工作流选项并显式打开 Codex 登录。
 - **人工介入窗口**：支持执行前授权（`requireExecutionPermission`）、暂停/恢复/接管/重试/取消，以及最终人工验收。
 - **持久化运行台账**：基于 storage-domain 持久化 Run 聚合、状态机、事件流，支持重启恢复。
 - **浏览器运行台**：状态卡片、看板弹层、运行详情抽屉、SSE 实时事件和带二次确认的操作按钮。
@@ -67,7 +68,8 @@ Codex 返回 `REPLAN` 时，`EXECUTING` 或 `INTEGRATION_REVIEW` 会直接回到
 
 - 可运行的 DSH 环境（包含 web server 与 storage-domain）。
 - Codex CLI 已安装并可通过 PATH 或 `CODEX_CLI_PATH` 访问；显式路径请指向 `.js` 或 `.exe` 入口，不支持 `.cmd` / `.bat` 包装器。
-- 当前内置规划器、执行器和审查器使用 `gpt-5.6-sol`；逐步审查固定为 `medium`，最终审查固定为 `max`，需要对应的模型访问权限。
+- 默认规划、步审与终审使用 `gpt-5.6-sol`，强度分别为 `max`、`medium`、`max`；可在插件设置中分别覆盖，所选模型需要当前账号具备访问权限。
+- 内置 Codex Issue Executor 仍使用 `gpt-5.6-sol / high` 实现 Issue，不属于本次三个只读编排场景。
 - Git（用于 worktree 隔离与集成分支合并）。
 - Node.js 20.19+ 与 pnpm 11.21（开发/构建）。
 
@@ -95,6 +97,12 @@ dsh plugin --profile web add /path/to/dsh-taskflow
 | `announceToAgent` | `true` | 是否向模型通告插件能力 |
 | `allowedRepoRoots` | `[]` | 允许规划/执行的仓库根目录白名单；为空时禁用规划 |
 | `codexCliPath` | `''` | Codex CLI 路径；为空时使用 `CODEX_CLI_PATH` 或系统 PATH |
+| `codexPlanningModel` | `gpt-5.6-sol` | 规划与 `REPLAN` 使用的模型 |
+| `codexPlanningEffort` | `max` | 规划与 `REPLAN` 的思考强度 |
+| `codexCheckpointModel` | `gpt-5.6-sol` | 每个 Issue 合并前步审使用的模型 |
+| `codexCheckpointEffort` | `medium` | 步审的思考强度 |
+| `codexFinalModel` | `gpt-5.6-sol` | 全部步骤完成后终审使用的模型 |
+| `codexFinalEffort` | `max` | 终审的思考强度 |
 | `maxConcurrent` | `1` | 最多同时执行的 Issue 数量 |
 | `integrationBranch` | `taskflow/integration` | 集成分支名 |
 | `worktreesRoot` | `''` | worktree 根目录；为空时使用仓库外的稳定同级目录，绝对路径按原值使用，相对路径兼容旧版并相对仓库解析 |
@@ -107,6 +115,12 @@ dsh plugin --profile web add /path/to/dsh-taskflow
 | `teamBoardSync` | `true` | 是否将看板镜像到 team-board |
 | `teamBoardTaskPrefix` | `[taskflow]` | team-board 镜像任务的前缀 |
 | `teamBoardOwner` | `''` | team-board 镜像任务的 owner |
+
+插件设置卡片调用 `codex debug models` 读取当前 CLI 的可见模型及其支持的思考强度；在线目录失败时回退到 CLI 内置目录。模型、强度与 CLI 路径从下一次规划或审查调用起生效；插件总开关、自动化、并发、仓库和看板选项保存后建议重启插件。模型目录与登录行为遵循 [Codex CLI reference](https://developers.openai.com/codex/cli/reference/) 和 [Codex authentication](https://developers.openai.com/codex/auth/)。
+
+`GET /plugins/taskflow/status` 会区分生效范围：`status.codex` 是下一次 Codex 调用采用的场景配置，`status.automation` 与 `status.allowedRepoRoots` 是当前运行实例的有效值；`status.settings.pendingRestartFields` 列出已保存但仍需重启插件的字段。
+
+“打开 Codex 登录”只会在本机显式启动 `codex login` 的浏览器 OAuth 流程。Taskflow 的 HTTP 响应仅返回 CLI 是否可用、是否已登录，不返回账号文本、令牌或 Codex 配置文件内容。
 
 如需完全手动模式，可设置：
 
@@ -136,12 +150,15 @@ dsh plugin --profile web add /path/to/dsh-taskflow
 | --- | --- | --- |
 | GET | `/plugins/taskflow/state` | 运行台账快照 |
 | GET | `/plugins/taskflow/status` | 插件与自动化状态 |
+| GET | `/plugins/taskflow/codex/models?refresh=1` | 读取脱敏后的可用模型与思考强度；`refresh=1` 跳过一分钟缓存 |
+| GET | `/plugins/taskflow/codex/auth` | 读取 CLI 可用性与布尔登录状态 |
 | GET | `/plugins/taskflow/board` | 五列看板快照 |
 | GET | `/plugins/taskflow/run?runId=` | 运行详情投影（当前 Issue、允许动作、最近事件） |
 | GET | `/plugins/taskflow/events?runId=` | SSE 实时事件流 |
 | POST | `/plugins/taskflow/submit` | 创建任务 Run |
 | POST | `/plugins/taskflow/command` | 控制动作：`cancel` / `pause` / `resume` / `takeover` / `release` / `retry` |
 | POST | `/plugins/taskflow/delete` | 删除已结束/停滞的 Run |
+| POST | `/plugins/taskflow/codex/login` | 显式启动本机 Codex 浏览器登录 |
 | POST | `/plugins/taskflow/plan` | 触发 Codex 规划 |
 | POST | `/plugins/taskflow/execute` | 启动/继续执行，认领可调度 Issue |
 | POST | `/plugins/taskflow/exec-result` | 上报 Issue 执行结果 |
@@ -198,13 +215,15 @@ pnpm run check
 - `src/domain.ts` / `src/repository.ts` — Run 聚合持久化与原子读写。
 - `src/state.ts` — Run 状态机与合法迁移表。
 - `src/dag.ts` — Issue 计划校验与依赖拓扑排序。
+- `src/config.ts` / `src/codex-profile.ts` — Taskflow 设置契约与三场景 Codex 配置。
+- `src/codex-cli.ts` — 模型目录、登录状态与显式登录的脱敏 CLI 桥接。
 - `src/planner.ts` — Codex CLI 规划执行器。
 - `src/reviewer.ts` — Codex CLI 双阶段只读审查执行器（CHECKPOINT / FINAL）。
 - `src/executor.ts` / `src/issue-executor.ts` — 执行器接口与内置 Codex Issue Executor。
 - `src/worktree.ts` — Git worktree 管理（建分支、合并、清理）。
 - `src/contracts.ts` — 自动化执行器、控制动作、事件与配置契约。
 - `src/team-board-sync.ts` — 可选 team-board 看板同步。
-- `src/client/` — 浏览器端状态卡片、看板与运行台。
+- `src/client/` — 浏览器端状态卡片、看板、运行台与原生 Taskflow 插件设置卡片。
 - `.agents/skills/` — 配套 DSH/Codex Agent skills（提交规划、执行监控、审查、控制、自动化配置、浏览器控制台）。
 - `tests/` — 服务、状态机、DAG、规划器、持久化、执行引擎与 UI 测试。
 

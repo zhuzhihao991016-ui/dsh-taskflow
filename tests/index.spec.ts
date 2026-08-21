@@ -7,7 +7,8 @@
 
 import { describe, expect, it, vi } from 'vitest'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { guardMutation, handleBoard, handleEvents } from '../src/index.ts'
+import { buildTaskFlowGuidance, guardMutation, handleBoard, handleEvents, handleStatus } from '../src/index.ts'
+import { resolveTaskFlowConfig } from '../src/config.ts'
 import type { BoardSnapshot, TaskFlowService } from '../src/service.ts'
 
 function captureResponse() {
@@ -34,6 +35,54 @@ function captureResponse() {
 function boardService(columns: BoardSnapshot['columns']): Pick<TaskFlowService, 'board'> {
   return { board: () => ({ columns }) }
 }
+
+describe('handleStatus', () => {
+  it('separates next-invocation Codex settings from restart-only workflow settings', () => {
+    const effective = resolveTaskFlowConfig({
+      allowedRepoRoots: ['C:/effective'],
+      maxConcurrent: 1,
+    })
+    const configured = resolveTaskFlowConfig({
+      allowedRepoRoots: ['C:/pending'],
+      maxConcurrent: 4,
+      codexCheckpointModel: 'gpt-alt',
+      codexCheckpointEffort: 'high',
+    })
+    const { res, status, body } = captureResponse()
+
+    handleStatus(effective, configured, { method: 'GET' } as IncomingMessage, res)
+
+    const payload = JSON.parse(body()) as {
+      status: {
+        automation: { maxConcurrent: number }
+        allowedRepoRoots: string[]
+        codex: { checkpoint: unknown }
+        settings: unknown
+      }
+    }
+    expect(status()).toBe(200)
+    expect(payload.status.automation.maxConcurrent).toBe(1)
+    expect(payload.status.allowedRepoRoots).toEqual(['C:/effective'])
+    expect(payload.status.codex.checkpoint).toEqual({ model: 'gpt-alt', reasoningEffort: 'high' })
+    expect(payload.status.settings).toMatchObject({
+      codexApplies: 'next-invocation',
+      workflowApplies: 'restart',
+      restartRequired: true,
+      pendingRestartFields: ['allowedRepoRoots', 'maxConcurrent'],
+    })
+  })
+
+  it('keeps model-facing guidance correct after live scene changes', () => {
+    const guidance = buildTaskFlowGuidance(resolveTaskFlowConfig({
+      codexCheckpointModel: 'gpt-alt',
+      codexFinalModel: 'gpt-final',
+    }))
+
+    expect(guidance).toContain('使用插件设置中的步审模型和思考强度')
+    expect(guidance).toContain('使用插件设置中的终审模型和思考强度')
+    expect(guidance).not.toContain('gpt-alt')
+  })
+})
 
 describe('handleBoard', () => {
   it('returns the board columns for GET requests', () => {

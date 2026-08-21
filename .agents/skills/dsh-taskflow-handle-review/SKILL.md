@@ -9,8 +9,8 @@ Use this skill when an automatic review is active or when its structured decisio
 
 ## Review stages
 
-- `CHECKPOINT`: after each successful Issue and before merge, `gpt-5.6-sol` with `medium` reasoning checks direction and scope. It runs automatically when `autoReview=true`.
-- `FINAL`: after every Issue has merged, `gpt-5.6-sol` with `max` reasoning reviews the complete integration diff.
+- `CHECKPOINT`: after each successful Issue and before merge, the configured checkpoint model/effort checks direction and scope (default `gpt-5.6-sol / medium`). It runs automatically when `autoReview=true`.
+- `FINAL`: after every Issue has merged, the configured final model/effort reviews the complete integration diff (default `gpt-5.6-sol / max`).
 - Both stages are read-only. With `autoReview=true`, observe instead of issuing duplicate calls. `POST /plugins/taskflow/review { runId }` manually starts only `FINAL` while the run is in `INTEGRATION_REVIEW`.
 
 ## Route decisions

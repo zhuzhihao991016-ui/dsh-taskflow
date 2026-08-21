@@ -8,14 +8,24 @@
  * @module dsh-taskflow/client
  */
 
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+import type { ClientContext, SettingsScope } from '@deepseek-ai/dsh-client-runtime/client'
 // Type-only: pulls the ui-conversation SlotMap merge (the input dock entry).
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {} from '@deepseek-ai/dsh-client-ui-slots'
 import { TaskFlowStatus } from './TaskFlowStatus.tsx'
+import {
+  createTaskFlowSettingsCard,
+  type TaskFlowSettingsValue,
+} from './TaskFlowSettings.tsx'
 
 export { TaskFlowStatus } from './TaskFlowStatus.tsx'
 export type { TaskFlowStatusProps } from './TaskFlowStatus.tsx'
+export { TaskFlowSettings } from './TaskFlowSettings.tsx'
+export type { TaskFlowSettingsProps, TaskFlowSettingsValue } from './TaskFlowSettings.tsx'
+
+interface SettingsScopeBinder {
+  bind<T>(spec: { namespace: string }): SettingsScope<T>
+}
 
 /** Required services: slots for the dock entry, conversation for scope. */
 export const inject = ['slots', 'conversation']
@@ -31,5 +41,16 @@ export function apply(ctx: ClientContext): void {
       id: 'taskflow',
       order: 150,
     }, TaskFlowStatus), 'dsh-taskflow: dock registration')
+  })
+
+  ctx.inject(['slots', 'settingsScope'], (scope: ClientContext) => {
+    const binder = (scope as unknown as { settingsScope: SettingsScopeBinder }).settingsScope
+    const settings = binder.bind<TaskFlowSettingsValue>({ namespace: 'taskflow' })
+    const SettingsCard = createTaskFlowSettingsCard(settings)
+    scope.slots.inject('settings.plugin.item' as never, () => scope.slots.register({
+      name: 'settings.plugin.item',
+      key: 'taskflow',
+      order: 120,
+    } as never, SettingsCard as never))
   })
 }

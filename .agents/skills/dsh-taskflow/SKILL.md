@@ -19,7 +19,7 @@ Run this skill only when the user explicitly invokes `dsh-taskflow` by name. It 
 | Execute or monitor a run | `dsh-taskflow-execute-monitor` |
 | Handle checkpoint/final review or remediation | `dsh-taskflow-handle-review` |
 | Pause, resume, cancel, accept, or rework | `dsh-taskflow-control-run` |
-| Configure automation or manual mode | `dsh-taskflow-configure-automation` |
+| Configure automation, Codex scenes, CLI path, or login | `dsh-taskflow-configure-automation` |
 | Use the browser board or run console | `dsh-taskflow-use-console` |
 
 The model loads the matching skill automatically when the conversation reaches that stage. This entry skill only helps the user name the area or confirm which workflow guide applies.
