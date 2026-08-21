@@ -89,7 +89,7 @@ describe('TaskFlowService.startExecution', () => {
     const run = repository.getRun('run-0001') as RunAggregate
     expect(run.status).toBe('EXECUTING')
     expect(run.executions[0]).toMatchObject({ key: 'issue-001', status: 'running', startedAt: 1000 })
-    expect(run.executions[0].workDir).toContain('.taskflow')
+    expect(run.executions[0].workDir).toContain('.dsh-taskflow-worktrees')
     expect(run.executions[0].branch).toBe('taskflow/run-0001/issue-001')
     expect(run.transitions.map((t) => t.reason)).toEqual([
       'created', 'planning-started', 'planning-succeeded', 'execution-started',
@@ -114,7 +114,7 @@ describe('TaskFlowService.startExecution', () => {
       summary: undefined,
       error: undefined,
     })
-    expect(snapshot?.executions[0].workDir).toContain('.taskflow')
+    expect(snapshot?.executions[0].workDir).toContain('.dsh-taskflow-worktrees')
     expect(snapshot?.executions[0].branch).toBe('taskflow/run-0001/issue-001')
   })
 
@@ -218,6 +218,23 @@ describe('TaskFlowService.startExecution', () => {
     const third = await service.startExecution('run-0001')
     expect(third).toMatchObject({ ok: true, currentIssue: 'issue-002' })
     expect((repository.getRun('run-0001') as RunAggregate).executions.filter((e) => e.status === 'running')).toHaveLength(1)
+  })
+
+  it('agent mode: retry from FAILED makes the pending issue claimable again', async () => {
+    const { repository, service } = harness()
+    seedReady(repository, [issueA])
+    await service.startExecution('run-0001')
+    await service.reportResult('run-0001', 'issue-001', { ok: false, error: '失败' })
+
+    const retry = await service.command('run-0001', 'retry')
+    expect(retry.ok).toBe(true)
+    const run = repository.getRun('run-0001') as RunAggregate
+    expect(run.status).toBe('EXECUTING')
+    expect(run.executions.find((execution) => execution.key === issueA.key)?.status).toBe('pending')
+
+    const claim = await service.startExecution('run-0001')
+    expect(claim).toMatchObject({ ok: true, currentIssue: 'issue-001' })
+    expect((repository.getRun('run-0001') as RunAggregate).executions.find((execution) => execution.key === issueA.key)?.status).toBe('running')
   })
 })
 

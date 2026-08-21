@@ -67,6 +67,35 @@ class TrackingExecutor implements AutomatedExecutor {
   }
 }
 
+/** Executor with a per-issue failure switch; returns the service attemptId. */
+class ResultMapExecutor implements AutomatedExecutor {
+  calls: string[] = []
+  failures = new Set<string>()
+
+  async execute(input: AutomatedExecutionInput): Promise<AutomatedExecutionResult> {
+    this.calls.push(input.issue.key)
+    if (this.failures.has(input.issue.key)) {
+      return { ok: false, error: `失败 ${input.issue.key}`, attemptId: input.attemptId, phase: 'failed' }
+    }
+    return { ok: true, summary: `完成 ${input.issue.key}`, attemptId: input.attemptId, phase: 'done' }
+  }
+}
+
+/** Git runner that blocks worktree creation until released. */
+class GatedGit implements GitRunner {
+  worktreeAdds = 0
+  release!: () => void
+  readonly gate = new Promise<void>((resolvePromise) => { this.release = resolvePromise })
+
+  async run(args: readonly string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+    if (args[0] === 'worktree' && args[1] === 'add' && args[2] === '-b') {
+      this.worktreeAdds += 1
+      await this.gate
+    }
+    return { exitCode: 0, stdout: 'master\n', stderr: '' }
+  }
+}
+
 function seedReady(repository: MemoryRepository, issues: PlannedIssue[], id = 'run-0001'): RunAggregate {
   const aggregate: RunAggregate = {
     id,
@@ -146,6 +175,35 @@ describe('P8 remediation', () => {
     await started.catch(() => undefined)
   })
 
+  it('rejects pause while merging without aborting the active executor', async () => {
+    const repository = new MemoryRepository()
+    const executor = new BlockingExecutor()
+    const service = new TaskFlowService(
+      repository,
+      () => 1000,
+      undefined,
+      ['C:/repo'],
+      executor,
+      undefined,
+      { git: fakeGit, automationEnabled: true, maxConcurrent: 1 },
+    )
+    seedReady(repository, [issueA])
+    const started = service.startExecution('run-0001')
+    await waitFor(() => executor.calls.length === 1)
+    await repository.updateRun('run-0001', (current) => ({ ...current, merging: true }))
+
+    const result = await service.command('run-0001', 'pause')
+    expect(result.ok).toBe(false)
+    expect(executor.calls[0]?.input.signal?.aborted).toBe(false)
+
+    const run = repository.getRun('run-0001') as RunAggregate
+    expect(run.status).toBe('EXECUTING')
+    expect(run.executions[0]?.status).toBe('running')
+
+    executor.calls[0]?.reject(new Error('test teardown'))
+    await started.catch(() => undefined)
+  })
+
   it('does not auto-resume manual EXECUTING runs when global automation is enabled', async () => {
     const repository = new MemoryRepository()
     const executor = new TrackingExecutor()
@@ -183,7 +241,7 @@ describe('P8 remediation', () => {
       ['C:/repo'],
       executor,
       new FakeReviewer(),
-      { git: fakeGit, automationEnabled: true, autoReview: false },
+      { git: fakeGit, automationEnabled: true, autoReview: false, requireExecutionPermission: false },
     )
     const automatic = seedReady(repository, [issueA])
     automatic.control = {
@@ -259,5 +317,121 @@ describe('P8 remediation', () => {
     const run = repository.getRun('run-0001') as RunAggregate
     expect(run.status).toBe('EXECUTING')
     expect(run.executions.find((execution) => execution.key === issueA.key)?.status).toBe('pending')
+  })
+
+  it('automatic mode: retry from FAILED restarts the executor with a fresh attempt', async () => {
+    const repository = new MemoryRepository()
+    const executor = new ResultMapExecutor()
+    executor.failures.add('issue-001')
+    const service = new TaskFlowService(
+      repository,
+      () => 1000,
+      undefined,
+      ['C:/repo'],
+      executor,
+      undefined,
+      { git: fakeGit, automationEnabled: true, maxConcurrent: 1, autoReview: false },
+    )
+    seedReady(repository, [issueA])
+    await service.startExecution('run-0001', { wait: true })
+    expect(service.snapshot('run-0001')?.status).toBe('FAILED')
+    expect(service.runDetail('run-0001')?.allowedActions).toContain('retry')
+    const firstAttempt = (repository.getRun('run-0001') as RunAggregate).executions[0]?.attemptId
+
+    executor.failures.delete('issue-001')
+    const retried = await service.command('run-0001', 'retry')
+    expect(retried.ok).toBe(true)
+    await waitFor(() => service.snapshot('run-0001')?.status === 'INTEGRATION_REVIEW')
+
+    const run = repository.getRun('run-0001') as RunAggregate
+    expect(run.status).toBe('INTEGRATION_REVIEW')
+    expect(executor.calls).toEqual(['issue-001', 'issue-001'])
+    const done = run.executions.find((execution) => execution.key === 'issue-001')
+    expect(done?.status).toBe('done')
+    expect(done?.attemptId).not.toBe(firstAttempt)
+    expect(done?.summary).toBe('完成 issue-001')
+  })
+
+  it('pause during worktree preparation does not start a new executor', async () => {
+    const repository = new MemoryRepository()
+    const executor = new BlockingExecutor()
+    const git = new GatedGit()
+    const service = new TaskFlowService(
+      repository,
+      () => 1000,
+      undefined,
+      ['C:/repo'],
+      executor,
+      undefined,
+      { git, automationEnabled: true, maxConcurrent: 1 },
+    )
+    seedReady(repository, [issueA])
+    const started = service.startExecution('run-0001', { wait: true })
+    await waitFor(() => git.worktreeAdds === 1)
+    // The claim is durable (running) while the worktree is still prepared.
+    expect((repository.getRun('run-0001') as RunAggregate).executions[0]?.status).toBe('running')
+
+    const paused = await service.command('run-0001', 'pause')
+    expect(paused.ok).toBe(true)
+    git.release()
+    await started.catch(() => undefined)
+
+    expect(executor.calls).toHaveLength(0)
+    const run = repository.getRun('run-0001') as RunAggregate
+    expect(run.status).toBe('PAUSED')
+    expect(run.executions[0]?.status).toBe('pending')
+  })
+
+  it('cancel during worktree preparation resets the claim and starts no executor', async () => {
+    const repository = new MemoryRepository()
+    const executor = new BlockingExecutor()
+    const git = new GatedGit()
+    const service = new TaskFlowService(
+      repository,
+      () => 1000,
+      undefined,
+      ['C:/repo'],
+      executor,
+      undefined,
+      { git, automationEnabled: true, maxConcurrent: 1 },
+    )
+    seedReady(repository, [issueA])
+    const started = service.startExecution('run-0001', { wait: true })
+    await waitFor(() => git.worktreeAdds === 1)
+
+    const cancelled = await service.command('run-0001', 'cancel')
+    expect(cancelled.ok).toBe(true)
+    git.release()
+    await started.catch(() => undefined)
+
+    expect(executor.calls).toHaveLength(0)
+    const run = repository.getRun('run-0001') as RunAggregate
+    expect(run.status).toBe('CANCELLED')
+    expect(run.executions[0]?.status).toBe('pending')
+  })
+
+  it('cancel aborts an active automated executor and resets running issues to pending', async () => {
+    const repository = new MemoryRepository()
+    const executor = new BlockingExecutor()
+    const service = new TaskFlowService(
+      repository,
+      () => 1000,
+      undefined,
+      ['C:/repo'],
+      executor,
+      undefined,
+      { git: fakeGit, automationEnabled: true, maxConcurrent: 1 },
+    )
+    seedReady(repository, [issueA])
+    const started = service.startExecution('run-0001')
+    await waitFor(() => executor.calls.length === 1)
+
+    const cancelled = await service.command('run-0001', 'cancel')
+    expect(cancelled.ok).toBe(true)
+    expect(executor.calls[0]?.input.signal?.aborted).toBe(true)
+    const run = repository.getRun('run-0001') as RunAggregate
+    expect(run.status).toBe('CANCELLED')
+    expect(run.executions[0]?.status).toBe('pending')
+    await started.catch(() => undefined)
   })
 })

@@ -135,7 +135,7 @@ describe('P8.4 automatic execution permission gate', () => {
     expect(reviewer.calls).toBe(1)
   })
 
-  it('keeps default automation behavior when requireExecutionPermission is false', async () => {
+  it('keeps unattended automation behavior when requireExecutionPermission is explicitly false', async () => {
     const repository = new MemoryRepository()
     const planner = new FakePlanner()
     const executor = new FakeAutomatedExecutor()
@@ -147,7 +147,7 @@ describe('P8.4 automatic execution permission gate', () => {
       ['C:/repo'],
       executor,
       reviewer,
-      { git: fakeGit, automationEnabled: true, autoPlan: true, autoReview: true },
+      { git: fakeGit, automationEnabled: true, autoPlan: true, autoReview: true, requireExecutionPermission: false },
     )
 
     const run = await service.submit({ title: '无需授权', repoRoot: 'C:/repo' })

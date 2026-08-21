@@ -194,7 +194,7 @@ describe('P8.1 run-level Git isolation', () => {
     const run = repository.getRun('run-0001') as RunAggregate
     expect(run.runGit).toEqual({ integrationBranch: 'taskflow/integration/run-0001' })
     expect(service.snapshot('run-0001')?.runGit).toEqual({ integrationBranch: 'taskflow/integration/run-0001' })
-    expect(service.runDetail('run-0001')?.currentIssue?.workDir).toContain('.taskflow')
+    expect(service.runDetail('run-0001')?.currentIssue?.workDir).toContain('.dsh-taskflow-worktrees')
     expect(service.runDetail('run-0001')?.currentIssue?.branch).toBe('taskflow/run-0001/issue-001')
   })
 

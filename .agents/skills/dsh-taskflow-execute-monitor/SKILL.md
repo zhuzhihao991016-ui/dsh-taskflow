@@ -31,4 +31,5 @@ Use this skill after a run is `READY`, during `EXECUTING`, or when observing exe
 
 - The built-in automated executor invokes `codex exec --full-auto --sandbox workspace-write --json`.
 - Do not use `--ask-for-approval`; current Codex CLI (0.146.x) does not accept it and exits with a process failure.
-- The plugin spawns Codex through the Node entry directly, not through Git Bash or PowerShell, so Windows paths are passed as argv without shell escaping.
+- The plugin does not interpolate commands through Git Bash or PowerShell: JavaScript CLI entries run through Node, while native/PATH executables run directly with an argv array.
+- Point `CODEX_CLI_PATH` at the underlying `.js` or `.exe` entry; `.cmd` and `.bat` wrappers are rejected.

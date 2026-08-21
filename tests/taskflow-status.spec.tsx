@@ -16,8 +16,34 @@ function jsonResponse(body: unknown): Response {
   } as Response
 }
 
+/** Minimal EventSource fake used to verify the SSE lifecycle contract:
+ * errors must not close the stream, unmount must. */
+class FakeEventSource {
+  static instances: FakeEventSource[] = []
+  listeners = new Map<string, Set<() => void>>()
+  onmessage: (() => void) | null = null
+  onerror: (() => void) | null = null
+  closed = false
+
+  constructor(public url: string) {
+    FakeEventSource.instances.push(this)
+  }
+
+  addEventListener(kind: string, handler: () => void): void {
+    const set = this.listeners.get(kind) ?? new Set<() => void>()
+    set.add(handler)
+    this.listeners.set(kind, set)
+  }
+
+  close(): void {
+    this.closed = true
+  }
+}
+
 describe('TaskFlowStatus', () => {
   beforeEach(() => {
+    FakeEventSource.instances = []
+    vi.stubGlobal('EventSource', FakeEventSource)
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
       const url = String(input)
       if (url === '/plugins/taskflow/state') {
@@ -162,5 +188,76 @@ describe('TaskFlowStatus', () => {
     await waitFor(() => {
       expect(screen.getByText('taskflow · 1 个运行中')).toBeTruthy()
     })
+  })
+
+  it('keeps EventSource open on errors and closes it on unmount', async () => {
+    const fetchMock = vi.mocked(fetch)
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url === '/plugins/taskflow/state') {
+        return Promise.resolve(jsonResponse({ ok: true, runs: [] }))
+      }
+      if (url === '/plugins/taskflow/board') {
+        return Promise.resolve(jsonResponse({
+          ok: true,
+          columns: [
+            {
+              id: 'todo',
+              title: '待办',
+              cards: [
+                {
+                  runId: 'run-0001',
+                  runTitle: '任务',
+                  runStatus: 'READY',
+                  issueKey: 'issue-001',
+                  acceptance: '验收 A',
+                  deps: [],
+                  status: 'pending',
+                },
+              ],
+            },
+          ],
+        }))
+      }
+      if (url.startsWith('/plugins/taskflow/run?runId=')) {
+        return Promise.resolve(jsonResponse({
+          ok: true,
+          run: {
+            runId: 'run-0001',
+            status: 'READY',
+            automation: { enabled: true, mode: 'automatic' },
+            allowedActions: [],
+            recentEvents: [],
+          },
+        }))
+      }
+      return Promise.reject(new Error(`unexpected fetch ${url}`))
+    })
+
+    const { unmount } = render(<TaskFlowStatus {...({} as TaskFlowStatusProps)} />)
+    await waitFor(() => {
+      expect(FakeEventSource.instances.length).toBeGreaterThan(0)
+    })
+    const globalSource = FakeEventSource.instances[0]!
+
+    fireEvent.click(await screen.findByTestId('taskflow-chip'))
+    fireEvent.click(await screen.findByTestId('taskflow-card-run-0001:issue-001'))
+    await waitFor(() => {
+      expect(FakeEventSource.instances).toHaveLength(2)
+    })
+    const runSource = FakeEventSource.instances[1]!
+
+    // An EventSource error must not close the stream so the browser can
+    // reconnect; the component only closes on unmount.
+    for (const source of [globalSource, runSource]) {
+      expect(source.onerror).toBeNull()
+      expect(source.closed).toBe(false)
+      source.onerror?.()
+      expect(source.closed).toBe(false)
+    }
+
+    unmount()
+    expect(globalSource.closed).toBe(true)
+    expect(runSource.closed).toBe(true)
   })
 })

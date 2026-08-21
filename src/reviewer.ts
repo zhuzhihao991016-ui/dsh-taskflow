@@ -52,6 +52,8 @@ export interface ReviewInput {
   executions: readonly IssueExecution[]
   /** Spool directory for this run's review artifacts. */
   workDir: string
+  /** Optional cancellation signal forwarded to the process executor. */
+  signal?: AbortSignal
   /** P5: base commit SHA the execution started from; when present the review
    * inspects the integration-branch diff against this SHA instead of
    * uncommitted changes. */
@@ -245,10 +247,17 @@ export class CodexReviewer {
         cwd: repoRoot,
         stdinText: prompt,
         timeoutMs: this.timeoutMs,
+        signal: input.signal,
       })
-      if (result.timedOut) {
-        lastError = new ReviewerError('timeout', `codex exec review exceeded ${this.timeoutMs}ms`)
-        continue
+      if (result.aborted === true) {
+        throw new ReviewerError('process-failed', 'aborted')
+      }
+      if (result.outputLimitExceeded === true) {
+        throw new ReviewerError('process-failed', 'output limit exceeded')
+      }
+      if (result.timedOut) {
+        lastError = new ReviewerError('timeout', `codex exec review exceeded ${this.timeoutMs}ms`)
+        continue
       }
       if (result.exitCode !== 0) {
         const detail = result.stderr.trim() || result.stdout.trim()

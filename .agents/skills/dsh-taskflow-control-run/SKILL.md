@@ -21,7 +21,8 @@ Use this skill when a run needs a control action or a final human decision.
 
 ## Outcome map
 
-- `release`, `resume`, or `retry` → back to `EXECUTING` when applicable.
+- `release` or execution `resume` → back to `EXECUTING` when applicable.
+- `retry` resumes the failed phase: planning, execution, or integration review.
 - `accept` → `ACCEPTED`.
 - `rework` → `PLANNING` and clears old execution/review state.
 - Continue to the relevant lifecycle skill after the state changes.

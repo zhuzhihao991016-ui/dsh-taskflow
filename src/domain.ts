@@ -164,16 +164,18 @@ const issueExecutionSchema = z.object({
   heartbeatAt: z.number().optional(),
 })
 
+const reviewFindingSchema = z.object({
+  issueKey: z.string().regex(ISSUE_KEY_PATTERN, 'unsafe issue key'),
+  problem: z.string(),
+  evidenceNeeded: z.array(z.string()).default([]),
+  acceptance: z.string(),
+})
+
 const reviewSchema = z.object({
   verdict: z.enum(['PASS', 'REVISE']),
   summary: z.string(),
-  reworkKeys: z.array(z.string()).default([]),
-  findings: z.array(z.object({
-    issueKey: z.string(),
-    problem: z.string(),
-    evidenceNeeded: z.array(z.string()).default([]),
-    acceptance: z.string(),
-  })).optional(),
+  reworkKeys: z.array(z.string().regex(ISSUE_KEY_PATTERN, 'unsafe issue key')).default([]),
+  findings: z.array(reviewFindingSchema).optional(),
   evidenceChecklist: z.array(z.string()).optional(),
   at: z.number(),
 })
@@ -263,6 +265,31 @@ const runAggregateSchema = z.object({
     executedKeys.add(execution.key)
     if (!issueKeys.has(execution.key)) {
       ctx.addIssue({ code: 'custom', message: `execution references unknown issue '${execution.key}'` })
+    }
+  }
+  // Review consistency: rework keys and finding issue keys must reference a
+  // currently planned issue. Issue keys themselves are already restricted to
+  // ISSUE_KEY_PATTERN by plannedIssueSchema, so a reference check against the
+  // planned set also covers the pattern; standalone malformed strings are
+  // rejected earlier with a `review.*` Zod path.
+  if (run.review !== undefined) {
+    for (const [index, key] of run.review.reworkKeys.entries()) {
+      if (!issueKeys.has(key)) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['review', 'reworkKeys', index],
+          message: `rework key '${key}' does not reference a planned issue`,
+        })
+      }
+    }
+    for (const [index, finding] of (run.review.findings ?? []).entries()) {
+      if (!issueKeys.has(finding.issueKey)) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['review', 'findings', index, 'issueKey'],
+          message: `finding issue key '${finding.issueKey}' does not reference a planned issue`,
+        })
+      }
     }
   }
 })

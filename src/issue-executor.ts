@@ -158,20 +158,25 @@ export class CodexIssueExecutor implements AutomatedExecutor {
       '-',
     ]
 
-    const abortPromise = input.signal === undefined
-      ? undefined
-      : new Promise<never>((_, reject) => {
-          if (input.signal?.aborted === true) {
-            reject(new IssueExecutorError('process-failed', 'aborted before start'))
-            return
-          }
-          input.signal?.addEventListener('abort', () => {
-            reject(new IssueExecutorError('process-failed', 'aborted'))
-          }, { once: true })
-        })
-
+    let abortListener: (() => void) | undefined
     let lastError: IssueExecutorError | undefined
     try {
+      // An already-aborted signal rejects before any process work starts.
+      if (input.signal?.aborted === true) {
+        throw new IssueExecutorError('process-failed', 'aborted before start')
+      }
+      const abortPromise = input.signal === undefined
+        ? undefined
+        : new Promise<never>((_, reject) => {
+            abortListener = () => {
+              reject(new IssueExecutorError('process-failed', 'aborted'))
+            }
+            input.signal?.addEventListener('abort', abortListener, { once: true })
+            // abort() can dispatch synchronously on Node's EventTarget, so
+            // re-check after registration closes the check/register race.
+            if (input.signal?.aborted === true) abortListener()
+          })
+
       for (let attempt = 0; attempt <= this.maxRetries; attempt += 1) {
         input.onProgress?.({ phase: 'preparing', summary: `开始执行 ${input.issue.key}`, at: Date.now() })
         input.onProgress?.({ phase: 'running', summary: `正在执行 ${input.issue.key}`, at: Date.now() })
@@ -193,6 +198,12 @@ export class CodexIssueExecutor implements AutomatedExecutor {
               }),
               abortPromise,
             ])
+        if (result.aborted === true) {
+          throw new IssueExecutorError('process-failed', 'aborted')
+        }
+        if (result.outputLimitExceeded === true) {
+          throw new IssueExecutorError('process-failed', 'output limit exceeded')
+        }
         if (result.timedOut) {
           lastError = new IssueExecutorError('timeout', `codex exec exceeded ${this.timeoutMs}ms`)
           continue
@@ -220,6 +231,9 @@ export class CodexIssueExecutor implements AutomatedExecutor {
       }
       throw lastError ?? new IssueExecutorError('process-failed', 'issue executor failed')
     } finally {
+      if (abortListener !== undefined) {
+        input.signal?.removeEventListener('abort', abortListener)
+      }
       // Never let the internal schema leak into the issue worktree / product
       // repository. Removing it before reportResult prevents git add -A from
       // committing an internal control file.

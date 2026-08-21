@@ -15,6 +15,6 @@ Use this skill when the agent must create a taskflow run or move it through plan
 
 ## Plan
 
-- With P8.6 defaults, automation is on and `repoRoot` is set, so planning may start automatically after submit. Observe `/plugins/taskflow/state` or `/plugins/taskflow/run` instead of issuing duplicate `plan` calls.
+- With P8.6 defaults, automation is on and `repoRoot` is set, so planning may start automatically after submit. Execution then waits in `WAITING_PERMISSION` until a human `release`. Observe `/plugins/taskflow/state` or `/plugins/taskflow/run` instead of issuing duplicate `plan` calls.
 - Manual mode: `POST /plugins/taskflow/plan { runId }` returns `202` when background planning starts. Poll `/run` or `/state` until status becomes `READY` or `FAILED`.
 - On `READY`, continue to `dsh-taskflow-execute-monitor`. On planning failure, read the error and decide whether to retry with a corrected request.

@@ -29,7 +29,7 @@ flowchart LR
 
 ## 特性
 
-- **全自动编排**：默认开启自动化，自动规划、自动执行、自动审查；也可切换为手动/半自动模式。
+- **自动编排**：默认自动规划与自动审查，并在执行前等待人工 `release`；可显式关闭授权门进入全自动模式，也可切换为手动模式。
 - **任务规划**：基于 Codex CLI 的结构化输出，生成带验收标准、依赖 DAG 和风险等级的 Issue 清单。
 - **DAG 调度**：校验依赖关系、检测环，按拓扑序执行；支持 `maxConcurrent` 并行执行。
 - **Git worktree 隔离**：每个 Issue 在独立 worktree 中实现，避免互相污染；成功改动统一合并到集成分支。
@@ -52,16 +52,16 @@ RECEIVED → PLANNING → READY → EXECUTING → INTEGRATION_REVIEW → AWAITIN
 - `WAITING_PERMISSION`：自动执行前等待人工放行。
 - `WAITING_DECISION`：自动审查返工达到上限后等待人工决策。
 - `PAUSED`：暂停执行。
-- `FAILED`：执行失败，可重试。
+- `FAILED`：规划、执行或审查失败，可按失败前阶段重试。
 - `CANCELLED`：取消。
 
 ## 环境要求
 
 - 可运行的 DSH 环境（包含 web server 与 storage-domain）。
-- Codex CLI 已安装并可通过 PATH 或 `CODEX_CLI_PATH` 访问。
+- Codex CLI 已安装并可通过 PATH 或 `CODEX_CLI_PATH` 访问；显式路径请指向 `.js` 或 `.exe` 入口，不支持 `.cmd` / `.bat` 包装器。
 - 当前内置规划器/执行器/审查器使用 `gpt-5.6-sol` 模型，需要对应的模型访问权限。
 - Git（用于 worktree 隔离与集成分支合并）。
-- Node.js 与 pnpm（开发/构建）。
+- Node.js 20.19+ 与 pnpm 11.21（开发/构建）。
 
 
 ## 安装
@@ -89,13 +89,13 @@ dsh plugin --profile web add /path/to/dsh-taskflow
 | `codexCliPath` | `''` | Codex CLI 路径；为空时使用 `CODEX_CLI_PATH` 或系统 PATH |
 | `maxConcurrent` | `1` | 最多同时执行的 Issue 数量 |
 | `integrationBranch` | `taskflow/integration` | 集成分支名 |
-| `worktreesRoot` | `.taskflow/worktrees` | worktree 根目录（相对仓库根） |
+| `worktreesRoot` | `''` | worktree 根目录；为空时使用仓库外的稳定同级目录，绝对路径按原值使用，相对路径兼容旧版并相对仓库解析 |
 | `automationEnabled` | `true` | 是否启用自动化编排 |
 | `autoPlan` | `true` | 自动化开启后是否自动规划 |
 | `autoReview` | `true` | 自动化开启后是否自动触发 Codex 审查 |
 | `maxExecutorProcesses` | `2` | 全局最大 Codex 执行进程数 |
 | `maxReviewCycles` | `3` | 自动审查返工的最大轮数，超过后进入人工决策 |
-| `requireExecutionPermission` | `false` | 自动执行前是否需要人工 `release` 放行 |
+| `requireExecutionPermission` | `true` | 自动执行前是否需要人工 `release` 放行 |
 | `teamBoardSync` | `true` | 是否将看板镜像到 team-board |
 | `teamBoardTaskPrefix` | `[taskflow]` | team-board 镜像任务的前缀 |
 | `teamBoardOwner` | `''` | team-board 镜像任务的 owner |
@@ -110,17 +110,19 @@ dsh plugin --profile web add /path/to/dsh-taskflow
 }
 ```
 
-如需在自动规划后保留执行前人工授权：
+默认会在自动规划后等待执行授权。如需无人值守的全自动执行，可显式关闭授权门：
 
 ```json
 {
-  "requireExecutionPermission": true
+  "requireExecutionPermission": false
 }
 ```
 
+默认 worktree 位于仓库同级的 `.dsh-taskflow-worktrees/<repo-hash>/`，不会把工作树嵌套在源仓库内。仅在兼容旧部署时才建议配置相对 `worktreesRoot`。
+
 ## HTTP API
 
-所有写接口均要求同源 `application/json` POST，跨域写请求会被拒绝。
+所有写接口均只接受来自环回连接、目标 Host 也是 `localhost`/环回 IP 的 `application/json` POST；浏览器请求还必须严格同源。该限制用于阻止跨站请求与 DNS rebinding，不应将写接口直接暴露到局域网或公网。
 
 | Method | Path | 说明 |
 | --- | --- | --- |
@@ -161,7 +163,7 @@ dsh plugin --profile web add /path/to/dsh-taskflow
 | `dsh-taskflow-configure-automation` | 自动化/手动模式与并发/权限配置 |
 | `dsh-taskflow-use-console` | 浏览器看板、运行台、SSE 与确认操作 |
 
-如果你的 DSH 环境从本仓库加载 Agent skills，可以直接使用 `.agents/skills/` 目录；也可以将其中任意 skill 复制到目标环境的 `.agents/skills/` 目录。
+如果你的 DSH 环境从本仓库或 npm 包加载 Agent skills，可以直接使用随包发布的 `.agents/skills/` 目录；也可以将其中任意 skill 复制到目标环境的 `.agents/skills/` 目录。
 
 
 ## 开发
@@ -178,6 +180,8 @@ pnpm run build
 ```sh
 pnpm run check
 ```
+
+发布前使用 `pnpm pack --dry-run` 检查包内容。`prepack` 会先构建 `lib/`，发布包必须同时包含运行入口、类型声明、Cordis patch 与 `.agents/skills/`。
 
 ## 目录结构
 
@@ -198,4 +202,4 @@ pnpm run check
 
 ## License
 
-MIT
+[MIT](./LICENSE)

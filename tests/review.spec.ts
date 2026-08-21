@@ -26,9 +26,11 @@ class FakeReviewer implements Reviewer {
   delayMs = 0
   result: unknown = { verdict: 'PASS', summary: '通过', reworkKeys: [] }
   error?: Error
+  lastInput?: ReviewInput
 
-  async review(_input: ReviewInput): Promise<unknown> {
+  async review(input: ReviewInput): Promise<unknown> {
     this.calls += 1
+    this.lastInput = input
     if (this.delayMs > 0) {
       await new Promise((resolvePromise) => setTimeout(resolvePromise, this.delayMs))
     }
@@ -53,6 +55,29 @@ function harness(reviewer = new FakeReviewer(), executor?: Executor, options: { 
     { git: fakeGit, ...options },
   )
   return { repository, service, reviewer }
+}
+
+async function waitForStatus(
+  service: TaskFlowService,
+  runId: string,
+  status: string,
+  timeoutMs = 500,
+): Promise<void> {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    if (service.snapshot(runId)?.status === status) return
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 5))
+  }
+  throw new Error(`timed out waiting for ${runId} to reach ${status}, got ${service.snapshot(runId)?.status}`)
+}
+
+async function waitFor(fn: () => boolean, timeoutMs = 500): Promise<void> {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    if (fn()) return
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 5))
+  }
+  throw new Error('timed out waiting for condition')
 }
 
 /** Insert an INTEGRATION_REVIEW aggregate (all issues done) directly. */
@@ -188,5 +213,64 @@ describe('TaskFlowService.startReview', () => {
     const run = repository.getRun('run-0001') as RunAggregate
     expect(run.status).toBe('FAILED')
     expect(run.transitions.at(-1)?.reason).toContain('review-failed')
+  })
+
+  it('retry after a reviewer infrastructure failure recovers through INTEGRATION_REVIEW', async () => {
+    const { repository, service, reviewer } = harness()
+    seedIntegrationReview(repository, [issueA])
+    reviewer.error = new ReviewerError('timeout', 'exceeded')
+    await service.startReview('run-0001', { wait: true })
+    expect(service.snapshot('run-0001')?.status).toBe('FAILED')
+    expect(service.runDetail('run-0001')?.allowedActions).toContain('retry')
+
+    const retry = await service.command('run-0001', 'retry')
+    expect(retry.ok).toBe(true)
+    expect((repository.getRun('run-0001') as RunAggregate).status).toBe('INTEGRATION_REVIEW')
+
+    reviewer.error = undefined
+    reviewer.result = { verdict: 'PASS', summary: '通过', reworkKeys: [] }
+    const reviewed = await service.startReview('run-0001', { wait: true })
+    expect(reviewed).toMatchObject({ ok: true, status: 'AWAITING_HUMAN', verdict: 'PASS' })
+    expect(reviewer.calls).toBe(2)
+  })
+
+  it('automatic mode: retry after a review failure restarts the reviewer', async () => {
+    const repository = new MemoryRepository()
+    const reviewer = new FakeReviewer()
+    reviewer.error = new ReviewerError('timeout', 'exceeded')
+    const service = new TaskFlowService(
+      repository,
+      () => 1000,
+      undefined,
+      ['C:/repo'],
+      undefined,
+      reviewer,
+      { git: fakeGit, automationEnabled: true, autoReview: true },
+    )
+    seedIntegrationReview(repository, [issueA])
+    await service.startReview('run-0001', { wait: true })
+    expect(service.snapshot('run-0001')?.status).toBe('FAILED')
+
+    reviewer.error = undefined
+    const retry = await service.command('run-0001', 'retry')
+    expect(retry.ok).toBe(true)
+    await waitForStatus(service, 'run-0001', 'AWAITING_HUMAN')
+    expect(reviewer.calls).toBe(2)
+  })
+
+  it('cancel aborts the in-flight reviewer and late results cannot rewrite the run', async () => {
+    const { repository, service, reviewer } = harness()
+    seedIntegrationReview(repository, [issueA])
+    reviewer.delayMs = 30
+    const reviewing = service.startReview('run-0001')
+    await waitFor(() => reviewer.calls === 1)
+    await service.command('run-0001', 'cancel')
+    expect(reviewer.lastInput?.signal?.aborted).toBe(true)
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 60))
+    const aggregate = repository.getRun('run-0001')
+    expect(aggregate?.status).toBe('CANCELLED')
+    expect(aggregate?.transitions.at(-1)?.to).toBe('CANCELLED')
+    expect(reviewer.calls).toBe(1)
+    await reviewing.catch(() => undefined)
   })
 })

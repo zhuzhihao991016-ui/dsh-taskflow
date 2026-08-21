@@ -35,11 +35,30 @@ afterEach(async () => {
 
 /** Fake executor recording requests and returning scripted results. */
 class FakeExecutor implements ProcessExecutor {
-  readonly requests: Array<{ command: readonly string[]; cwd: string; stdinText: string }> = []
+  readonly requests: Array<{
+    command: readonly string[]
+    cwd: string
+    stdinText: string
+    signal?: AbortSignal
+    maxOutputBytes?: number
+  }> = []
   results: ProcessResult[] = []
 
-  run(request: { command: readonly string[]; cwd: string; stdinText: string; timeoutMs: number }): Promise<ProcessResult> {
-    this.requests.push({ command: request.command, cwd: request.cwd, stdinText: request.stdinText })
+  run(request: {
+    command: readonly string[]
+    cwd: string
+    stdinText: string
+    timeoutMs: number
+    signal?: AbortSignal
+    maxOutputBytes?: number
+  }): Promise<ProcessResult> {
+    this.requests.push({
+      command: request.command,
+      cwd: request.cwd,
+      stdinText: request.stdinText,
+      signal: request.signal,
+      maxOutputBytes: request.maxOutputBytes,
+    })
     const result = this.results.shift()
     if (result === undefined) {
       return Promise.reject(new Error('fake executor: no scripted result'))
@@ -140,6 +159,51 @@ describe('CodexReviewer', () => {
     expect(request.stdinText).toContain('验收 A')
     expect(request.stdinText).toContain('完成 B')
     expect(request.stdinText).toContain('REVISE')
+  })
+
+  it('forwards an optional abort signal to the process executor', async () => {
+    const root = await freshRoot()
+    const executor = new FakeExecutor()
+    executor.results = [{ exitCode: 0, stdout: agentMessageEvent(REVIEW_JSON), stderr: '', timedOut: false }]
+    const controller = new AbortController()
+    const reviewer = new CodexReviewer(executor, 60_000)
+
+    await reviewer.review({ ...INPUT, workDir: join(root, 'spool'), signal: controller.signal })
+
+    expect(executor.requests).toHaveLength(1)
+    expect(executor.requests[0].signal).toBe(controller.signal)
+  })
+
+  it('treats an abort/timeout race as cancellation without retrying', async () => {
+    const root = await freshRoot()
+    const executor = new FakeExecutor()
+    executor.results = [{ exitCode: null, stdout: '', stderr: '', timedOut: true, aborted: true }]
+    const reviewer = new CodexReviewer(executor, 60_000)
+
+    await expect(reviewer.review({ ...INPUT, workDir: join(root, 'spool') })).rejects.toMatchObject({
+      code: 'process-failed',
+      message: expect.stringContaining('aborted'),
+    })
+    expect(executor.requests).toHaveLength(1)
+  })
+
+  it('reports output-limit termination without retrying', async () => {
+    const root = await freshRoot()
+    const executor = new FakeExecutor()
+    executor.results = [{
+      exitCode: null,
+      stdout: 'truncated',
+      stderr: '',
+      timedOut: false,
+      outputLimitExceeded: true,
+    }]
+    const reviewer = new CodexReviewer(executor, 60_000)
+
+    await expect(reviewer.review({ ...INPUT, workDir: join(root, 'spool') })).rejects.toMatchObject({
+      code: 'process-failed',
+      message: expect.stringContaining('output limit exceeded'),
+    })
+    expect(executor.requests).toHaveLength(1)
   })
 
   it('canonicalizes a relative repoRoot once for cwd', async () => {

@@ -6,7 +6,7 @@
 
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { basename, dirname, join, resolve, sep } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { execGit, WorktreeError, WorktreeManager, type GitResult, type GitRunner } from '../src/worktree.ts'
 
@@ -22,6 +22,14 @@ class FakeGit implements GitRunner {
 }
 
 const REPO = 'C:/repo'
+
+/** Default sibling directory name used when no worktreesRoot is configured. */
+const DEFAULT_WORKTREES_DIR = '.dsh-taskflow-worktrees'
+
+/** Root that holds all worktrees for a repo: <sibling>/<repoRootHash>. */
+function rootOf(workDir: string): string {
+  return dirname(dirname(workDir))
+}
 
 describe('WorktreeManager', () => {
   it('creates the integration branch when it is missing', async () => {
@@ -63,6 +71,59 @@ describe('WorktreeManager', () => {
       join(resolve(REPO), '.taskflow', 'worktrees', 'run-0001', 'issue-001'),
       'taskflow/integration',
     ])
+  })
+
+  it('defaults worktrees to a stable sibling root outside the repo', async () => {
+    const git = new FakeGit()
+    const manager = new WorktreeManager(git)
+
+    const first = await manager.createIssueWorktree(REPO, 'run-0001', 'issue-001', 'taskflow/integration')
+    const second = await manager.createIssueWorktree(REPO, 'run-0002', 'issue-001', 'taskflow/integration')
+
+    const repoResolved = resolve(REPO)
+    const root = rootOf(first.workDir)
+    expect(first.workDir.startsWith(repoResolved + sep)).toBe(false)
+    expect(basename(root)).toMatch(/^[0-9a-f]{8}$/)
+    expect(root).toBe(join(dirname(repoResolved), DEFAULT_WORKTREES_DIR, basename(root)))
+    expect(rootOf(second.workDir)).toBe(root)
+    expect(git.calls).toContainEqual([
+      'worktree', 'add', '-b', 'taskflow/run-0001/issue-001', first.workDir, 'taskflow/integration',
+    ])
+  })
+
+  it('isolates same-named repos at different paths under the default root', async () => {
+    const git = new FakeGit()
+    const manager = new WorktreeManager(git)
+
+    const repoA = 'C:/workspaces/alpha/project'
+    const repoB = 'C:/workspaces/beta/project'
+    const a = await manager.createIssueWorktree(repoA, 'run-0001', 'issue-001', 'taskflow/integration')
+    const b = await manager.createIssueWorktree(repoB, 'run-0001', 'issue-001', 'taskflow/integration')
+
+    expect(rootOf(a.workDir)).not.toBe(rootOf(b.workDir))
+    expect(basename(rootOf(a.workDir))).not.toBe(basename(rootOf(b.workDir)))
+  })
+
+  it('uses an explicit absolute worktreesRoot as configured', async () => {
+    const git = new FakeGit()
+    const root = resolve('/custom/taskflow-worktrees')
+    const manager = new WorktreeManager(git, root)
+
+    const result = await manager.createIssueWorktree(REPO, 'run-0001', 'issue-001', 'taskflow/integration')
+
+    expect(result.workDir).toBe(join(root, 'run-0001', 'issue-001'))
+    expect(git.calls).toContainEqual([
+      'worktree', 'add', '-b', 'taskflow/run-0001/issue-001', result.workDir, 'taskflow/integration',
+    ])
+  })
+
+  it('keeps an explicit relative worktreesRoot relative to the repo root', async () => {
+    const git = new FakeGit()
+    const manager = new WorktreeManager(git, 'custom/worktrees')
+
+    const result = await manager.createIssueWorktree(REPO, 'run-0001', 'issue-001', 'taskflow/integration')
+
+    expect(result.workDir).toBe(join(resolve(REPO), 'custom', 'worktrees', 'run-0001', 'issue-001'))
   })
 
   it('reuses an existing worktree after a crashed create', async () => {
@@ -115,6 +176,19 @@ describe('WorktreeManager', () => {
     ])
     expect(git.calls).toContainEqual(['worktree', 'remove', '--force', integrationWorktree])
     expect(git.calls.some((args) => args[0] === 'checkout')).toBe(false)
+  })
+
+  it('keeps default integration worktrees outside the repo on the same root', async () => {
+    const git = new FakeGit()
+    const manager = new WorktreeManager(git)
+    const issue = await manager.createIssueWorktree(REPO, 'run-0001', 'issue-001', 'taskflow/integration')
+    await manager.mergeIssueWorktree(REPO, 'taskflow/run-0001/issue-001', 'msg', 'taskflow/integration')
+
+    const add = git.calls.find((args) => args[0] === 'worktree' && args[1] === 'add' && args.length === 4)
+    expect(add).toBeDefined()
+    const integrationWorktree = add![2]
+    expect(integrationWorktree.startsWith(resolve(REPO) + sep)).toBe(false)
+    expect(rootOf(integrationWorktree)).toBe(rootOf(issue.workDir))
   })
 
   it('throws a stable WorktreeError when merge fails and aborts the merge', async () => {
@@ -173,6 +247,18 @@ describe('WorktreeManager', () => {
       ['worktree', 'remove', '--force', 'C:/worktree'],
       ['branch', '-D', 'taskflow/run-0001/issue-001'],
     ])
+  })
+
+  it('resolves issue cleanup through the same default root', async () => {
+    const git = new FakeGit()
+    const manager = new WorktreeManager(git)
+    const created = await manager.createIssueWorktree(REPO, 'run-0001', 'issue-001', 'taskflow/integration')
+
+    const forwardSlashPath = join(rootOf(created.workDir), 'run-0001', 'issue-001').replace(/\\/g, '/')
+    await manager.removeIssueWorktree(REPO, forwardSlashPath, created.branch)
+
+    expect(git.calls).toContainEqual(['worktree', 'remove', '--force', resolve(forwardSlashPath)])
+    expect(git.calls).toContainEqual(['branch', '-D', created.branch])
   })
 
   it('real git merge advances the integration branch', async () => {

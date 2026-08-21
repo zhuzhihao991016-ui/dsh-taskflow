@@ -18,9 +18,11 @@ class FakePlanner implements Planner {
   delayMs = 0
   result: unknown = { issues: [] }
   error?: Error
+  lastInput?: PlanInput
 
-  async plan(_input: PlanInput): Promise<unknown> {
+  async plan(input: PlanInput): Promise<unknown> {
     this.calls += 1
+    this.lastInput = input
     if (this.delayMs > 0) {
       await new Promise((resolvePromise) => setTimeout(resolvePromise, this.delayMs))
     }
@@ -34,6 +36,20 @@ function harness() {
   const planner = new FakePlanner()
   const service = new TaskFlowService(repository, () => 1000, planner, ['C:/repo'])
   return { repository, service, planner }
+}
+
+async function waitForStatus(
+  service: TaskFlowService,
+  runId: string,
+  status: string,
+  timeoutMs = 500,
+): Promise<void> {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    if (service.snapshot(runId)?.status === status) return
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 5))
+  }
+  throw new Error(`timed out waiting for ${runId} to reach ${status}, got ${service.snapshot(runId)?.status}`)
 }
 
 describe('validateSubmit', () => {
@@ -516,5 +532,72 @@ describe('TaskFlowService.plan', () => {
     ])
     expect(results.every((result) => result.status === 'rejected')).toBe(true)
     expect(planner.calls).toBe(0)
+  })
+
+  it('retry after a planning infrastructure failure recovers through PLANNING', async () => {
+    const { repository, service, planner } = harness()
+    const run = await service.submit({ title: '规划失败重试', repoRoot: 'C:/repo' })
+    planner.error = new PlannerError('timeout', 'exceeded')
+    await service.plan(run.id, { wait: true })
+    expect(service.snapshot(run.id)?.status).toBe('FAILED')
+    expect(service.runDetail(run.id)?.allowedActions).toContain('retry')
+    // A failed re-plan can retain the previous published Issue set. Recovery
+    // must use the FAILED transition's source phase, not issues.length.
+    await repository.updateRun(run.id, (current) => ({
+      ...current,
+      issueCount: 1,
+      issues: [{ key: 'stale-issue', acceptance: '旧验收标准' }],
+    }))
+
+    const retry = await service.command(run.id, 'retry')
+    expect(retry.ok).toBe(true)
+    expect((repository.getRun(run.id) as RunAggregate).status).toBe('PLANNING')
+
+    planner.error = undefined
+    planner.result = { issues: [{ key: 'issue-001', acceptance: '验收 A' }] }
+    await service.plan(run.id, { wait: true })
+    expect(service.snapshot(run.id)?.status).toBe('READY')
+    expect(planner.calls).toBe(2)
+  })
+
+  it('automatic mode: retry after a planning failure restarts the planner', async () => {
+    const repository = new MemoryRepository()
+    const planner = new FakePlanner()
+    planner.error = new PlannerError('process-failed', 'boom')
+    const service = new TaskFlowService(
+      repository,
+      () => 1000,
+      planner,
+      ['C:/repo'],
+      undefined,
+      undefined,
+      { automationEnabled: true, autoPlan: true },
+    )
+    const run = await service.submit({ title: '自动重规划', repoRoot: 'C:/repo' })
+    await waitForStatus(service, run.id, 'FAILED')
+    expect(planner.calls).toBe(1)
+
+    planner.error = undefined
+    planner.result = { issues: [{ key: 'issue-001', acceptance: '验收 A' }] }
+    const retry = await service.command(run.id, 'retry')
+    expect(retry.ok).toBe(true)
+    await waitForStatus(service, run.id, 'READY')
+    expect(planner.calls).toBe(2)
+  })
+
+  it('cancel aborts the in-flight planner and late results cannot rewrite the run', async () => {
+    const { repository, service, planner } = harness()
+    planner.delayMs = 30
+    planner.result = PLAN
+    const run = await service.submit({ title: '取消规划', repoRoot: 'C:/repo' })
+    await service.plan(run.id)
+    expect(planner.calls).toBe(1)
+    await service.command(run.id, 'cancel')
+    expect(planner.lastInput?.signal?.aborted).toBe(true)
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 60))
+    const aggregate = repository.getRun(run.id)
+    expect(aggregate?.status).toBe('CANCELLED')
+    expect(aggregate?.transitions.at(-1)?.to).toBe('CANCELLED')
+    expect(planner.calls).toBe(1)
   })
 })

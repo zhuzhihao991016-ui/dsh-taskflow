@@ -5,9 +5,10 @@
  * production uses the system `git` executable.
  */
 
+import { createHash } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { join, resolve } from 'node:path'
+import { dirname, isAbsolute, join, normalize, resolve, sep } from 'node:path'
 
 const execFileAsync = promisify(execFile)
 
@@ -58,15 +59,56 @@ export class WorktreeError extends Error {
   }
 }
 
+/** Sibling directory that holds the default per-repo worktree roots. */
+const DEFAULT_WORKTREES_DIR = '.dsh-taskflow-worktrees'
+
+/** Number of hex characters taken from the normalized repoRoot hash. */
+const REPO_ROOT_HASH_LENGTH = 8
+
+/** Short stable hash of a normalized repo root (case-folded on Windows). */
+function repoRootHash(repoRoot: string): string {
+  let normalized = normalize(resolve(repoRoot)).replace(/\\/g, '/')
+  if (process.platform === 'win32') {
+    normalized = normalized.toLowerCase()
+  }
+  return createHash('sha256').update(normalized, 'utf8').digest('hex').slice(0, REPO_ROOT_HASH_LENGTH)
+}
+
+/**
+ * Resolve the safe root that holds all managed worktrees for one repository.
+ * An explicit absolute root is used as-is; an explicit relative root keeps the
+ * legacy "relative to repoRoot" semantics; when no root is configured, the
+ * root lives in a sibling directory of the repo keyed by a short hash of the
+ * normalized repoRoot, so worktrees never pollute the main checkout and
+ * same-named repos at different paths cannot collide.
+ */
+function resolveWorktreesRoot(repoRoot: string, worktreesRoot: string | undefined): string {
+  const configured = worktreesRoot?.trim()
+  if (configured !== undefined && configured !== '') {
+    return isAbsolute(configured) ? resolve(configured) : join(resolve(repoRoot), configured)
+  }
+  return join(dirname(resolve(repoRoot)), DEFAULT_WORKTREES_DIR, repoRootHash(repoRoot))
+}
+
 /**
  * Worktree operations for one repository. The integration branch is the
  * persistent target where every successful Issue branch is merged.
  */
 export class WorktreeManager {
+  /**
+   * @param worktreesRoot Explicit worktree root. Absolute values are used
+   * as-is, relative values are resolved against each repoRoot; when omitted,
+   * worktrees live outside the repo in a hashed sibling directory.
+   */
   constructor(
     private readonly git: GitRunner = execGit,
-    private readonly worktreesRoot = '.taskflow/worktrees',
+    private readonly worktreesRoot?: string,
   ) {}
+
+  /** Resolve the managed worktree root for one repository. */
+  private worktreeRootFor(repoRoot: string): string {
+    return resolveWorktreesRoot(repoRoot, this.worktreesRoot)
+  }
 
   /** Ensure the integration branch exists; create it from baseSha (or HEAD)
    * when missing so the review range stays pinned to the run's captured base. */
@@ -90,7 +132,7 @@ export class WorktreeManager {
   ): Promise<{ workDir: string; branch: string }> {
     await this.ensureIntegrationBranch(repoRoot, integrationBranch, baseSha)
     const branch = `taskflow/${runId}/${issueKey}`
-    const workDir = join(resolve(repoRoot), this.worktreesRoot, runId, issueKey)
+    const workDir = join(this.worktreeRootFor(repoRoot), runId, issueKey)
     const add = await this.git.run(['worktree', 'add', '-b', branch, workDir, integrationBranch], repoRoot)
     if (add.exitCode === 0) return { workDir, branch }
     // Crash recovery: a previous attempt may have created the branch or the
@@ -158,8 +200,7 @@ export class WorktreeManager {
   ): Promise<void> {
     await this.ensureIntegrationBranch(repoRoot, integrationBranch, baseSha)
     const integrationWorktree = join(
-      resolve(repoRoot),
-      this.worktreesRoot,
+      this.worktreeRootFor(repoRoot),
       '_integration',
       branch.replace(/[^A-Za-z0-9._-]/g, '-'),
     )
@@ -185,7 +226,12 @@ export class WorktreeManager {
 
   /** Remove a merged worktree and its branch (best-effort cleanup). */
   async removeIssueWorktree(repoRoot: string, workDir: string, branch: string): Promise<void> {
-    await this.git.run(['worktree', 'remove', '--force', workDir], repoRoot)
+    // Paths from createIssueWorktree already live under the same resolved
+    // root; legacy worktrees from older layouts are still removed as given.
+    const root = this.worktreeRootFor(repoRoot)
+    const resolved = isAbsolute(workDir) ? resolve(workDir) : resolve(repoRoot, workDir)
+    const target = resolved.startsWith(root + sep) ? resolved : workDir
+    await this.git.run(['worktree', 'remove', '--force', target], repoRoot)
     await this.git.run(['branch', '-D', branch], repoRoot)
   }
 

@@ -10,8 +10,9 @@ Use this skill when changing or verifying how a taskflow run behaves: automatic 
 ## P8.6 defaults
 
 - `automationEnabled=true`, `autoPlan=true`, `autoReview=true`.
-- `requireExecutionPermission=false`, `maxReviewCycles=3`, `maxExecutorProcesses=2`.
+- `requireExecutionPermission=true`, `maxReviewCycles=3`, `maxExecutorProcesses=2`.
 - Set `automationEnabled=false` to restore manual/agent-driven mode.
+- Set `requireExecutionPermission=false` only when unattended automatic execution is intended.
 
 ## Settings
 
@@ -22,5 +23,5 @@ Use this skill when changing or verifying how a taskflow run behaves: automatic 
 
 ## Apply and verify
 
-- Configuration is applied through host plugin config and takes effect after restart; there is no HTTP config route.
+- Configuration is applied through the host's live config patch (`hotReload=config-patch-live`); there is no HTTP config route. If the host reports that live reload failed, restart that host before relying on the new values.
 - After a new run is created, verify `GET /plugins/taskflow/run?runId=<id>` and check `automation.enabled` / `automation.mode`.

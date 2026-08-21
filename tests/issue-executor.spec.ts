@@ -5,10 +5,11 @@
  * executor.
  */
 
+import { getEventListeners } from 'node:events'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AutomatedExecutionInput } from '../src/contracts.ts'
 import type { ProcessExecutor, ProcessResult } from '../src/planner.ts'
 import {
@@ -34,16 +35,64 @@ afterEach(async () => {
 
 /** Fake executor recording requests and returning scripted results. */
 class FakeExecutor implements ProcessExecutor {
-  readonly requests: Array<{ command: readonly string[]; cwd: string; stdinText: string }> = []
+  readonly requests: Array<{
+    command: readonly string[]
+    cwd: string
+    stdinText: string
+    signal?: AbortSignal
+    maxOutputBytes?: number
+  }> = []
   results: ProcessResult[] = []
 
-  run(request: { command: readonly string[]; cwd: string; stdinText: string; timeoutMs: number }): Promise<ProcessResult> {
-    this.requests.push({ command: request.command, cwd: request.cwd, stdinText: request.stdinText })
+  run(request: {
+    command: readonly string[]
+    cwd: string
+    stdinText: string
+    timeoutMs: number
+    signal?: AbortSignal
+    maxOutputBytes?: number
+  }): Promise<ProcessResult> {
+    this.requests.push({
+      command: request.command,
+      cwd: request.cwd,
+      stdinText: request.stdinText,
+      signal: request.signal,
+      maxOutputBytes: request.maxOutputBytes,
+    })
     const result = this.results.shift()
     if (result === undefined) {
       return Promise.reject(new Error('fake executor: no scripted result'))
     }
     return Promise.resolve(result)
+  }
+}
+
+/** Fake executor that holds each run pending until the test releases it. */
+class ControlledExecutor implements ProcessExecutor {
+  readonly pending: Array<{
+    request: {
+      command: readonly string[]
+      cwd: string
+      stdinText: string
+      timeoutMs: number
+      signal?: AbortSignal
+      maxOutputBytes?: number
+    }
+    resolve: (result: ProcessResult) => void
+    reject: (error: Error) => void
+  }> = []
+
+  run(request: {
+    command: readonly string[]
+    cwd: string
+    stdinText: string
+    timeoutMs: number
+    signal?: AbortSignal
+    maxOutputBytes?: number
+  }): Promise<ProcessResult> {
+    return new Promise((resolve, reject) => {
+      this.pending.push({ request, resolve, reject })
+    })
   }
 }
 
@@ -144,6 +193,85 @@ describe('CodexIssueExecutor', () => {
     const command = executor.requests[0].command
     const cdIndex = command.indexOf('--cd')
     expect(command[cdIndex + 1]).toBe(executor.requests[0].cwd)
+  })
+
+  it('passes the abort signal through to the process executor', async () => {
+    const root = await freshRoot()
+    const executor = new FakeExecutor()
+    executor.results = [{ exitCode: 0, stdout: agentMessageEvent(EXECUTION_JSON), stderr: '', timedOut: false }]
+    const controller = new AbortController()
+    const issueExecutor = new CodexIssueExecutor(executor, 60_000)
+
+    await issueExecutor.execute({ ...INPUT, workDir: join(root, 'spool'), signal: controller.signal })
+
+    expect(executor.requests).toHaveLength(1)
+    expect(executor.requests[0].signal).toBe(controller.signal)
+    expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0)
+  })
+
+  it('treats an abort/timeout race as cancellation without retrying', async () => {
+    const root = await freshRoot()
+    const executor = new FakeExecutor()
+    executor.results = [{ exitCode: null, stdout: '', stderr: '', timedOut: true, aborted: true }]
+    const issueExecutor = new CodexIssueExecutor(executor, 60_000)
+
+    await expect(issueExecutor.execute({ ...INPUT, workDir: join(root, 'spool') })).rejects.toMatchObject({
+      code: 'process-failed',
+      message: expect.stringContaining('aborted'),
+    })
+    expect(executor.requests).toHaveLength(1)
+  })
+
+  it('reports output-limit termination without retrying, ahead of timeout', async () => {
+    const root = await freshRoot()
+    const executor = new FakeExecutor()
+    executor.results = [{
+      exitCode: null,
+      stdout: 'truncated',
+      stderr: '',
+      timedOut: true,
+      outputLimitExceeded: true,
+    }]
+    const issueExecutor = new CodexIssueExecutor(executor, 60_000)
+
+    await expect(issueExecutor.execute({ ...INPUT, workDir: join(root, 's') })).rejects.toMatchObject({
+      code: 'process-failed',
+      message: expect.stringContaining('output limit exceeded'),
+    })
+    expect(executor.requests).toHaveLength(1)
+  })
+
+  it('rejects before starting a run when the signal is already aborted', async () => {
+    const root = await freshRoot()
+    const executor = new FakeExecutor()
+    executor.results = [{ exitCode: 0, stdout: agentMessageEvent(EXECUTION_JSON), stderr: '', timedOut: false }]
+    const controller = new AbortController()
+    controller.abort()
+    const issueExecutor = new CodexIssueExecutor(executor, 60_000)
+
+    await expect(issueExecutor.execute({ ...INPUT, workDir: join(root, 's'), signal: controller.signal })).rejects.toMatchObject({
+      code: 'process-failed',
+      message: /aborted before start/,
+    })
+    expect(executor.requests).toHaveLength(0)
+  })
+
+  it('rejects on a mid-run abort and cleans up the abort listener', async () => {
+    const root = await freshRoot()
+    const executor = new ControlledExecutor()
+    const controller = new AbortController()
+    const issueExecutor = new CodexIssueExecutor(executor, 60_000)
+    const pending = issueExecutor.execute({ ...INPUT, workDir: join(root, 's'), signal: controller.signal })
+
+    await vi.waitFor(() => expect(executor.pending).toHaveLength(1))
+    const entry = executor.pending[0]!
+    expect(entry.request.signal).toBe(controller.signal)
+    controller.abort()
+    await expect(pending).rejects.toMatchObject({
+      code: 'process-failed',
+      message: /aborted/,
+    })
+    expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0)
   })
 
   it('returns a failure result when the schema object has a non-empty error', async () => {

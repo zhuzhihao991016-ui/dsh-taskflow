@@ -286,9 +286,15 @@ export class TaskFlowService {
   private readonly maxExecutorProcesses: number
   /** Active automated-executor AbortControllers per run (for pause/cancel/takeover). */
   private readonly activeExecutions = new Map<string, Set<AbortController>>()
+  /** Active planner AbortControllers per run (aborted by cancel). */
+  private readonly activePlanning = new Map<string, AbortController>()
+  /** Active reviewer AbortControllers per run (aborted by cancel). */
+  private readonly activeReviews = new Map<string, AbortController>()
   /** Global automated-executor concurrency semaphore state. */
   private executorActive = 0
   private readonly executorWaiters: Array<() => void> = []
+  /** Per-run outcome tails: parallel reports/merges settle in claim order. */
+  private readonly outcomeLocks = new Map<string, Promise<void>>()
 
   constructor(
     private readonly repository: TaskFlowRepository,
@@ -306,7 +312,7 @@ export class TaskFlowService {
   ) {
     this.maxConcurrent = Math.max(1, Math.floor(options.maxConcurrent ?? 1))
     this.integrationBranch = options.integrationBranch ?? 'taskflow/integration'
-    this.worktrees = new WorktreeManager(options.git, options.worktreesRoot ?? '.taskflow/worktrees')
+    this.worktrees = new WorktreeManager(options.git, options.worktreesRoot)
     this.automationEnabled = options.automationEnabled ?? false
     this.automationMode = this.automationEnabled ? 'automatic' : 'manual'
     this.autoPlan = options.autoPlan ?? DEFAULT_AUTOMATION_CONFIG.autoPlan
@@ -516,6 +522,8 @@ export class TaskFlowService {
    * CANCELLED); unknown ids, terminal runs, and unimplemented actions fail
    * with a stable error. The transition check runs inside the repository's
    * atomic update, so a concurrent status change cannot be overwritten.
+   * Control aborts (execution/planning/review) happen only after the durable
+   * transition commits; a rejected command never aborts active work.
    */
   async command(runId: string, action: CommandAction, actor = 'host'): Promise<CommandResult> {
     if (!(AUTOMATION_CONTROL_ACTIONS as readonly string[]).includes(action)) {
@@ -525,9 +533,6 @@ export class TaskFlowService {
       return { ok: false, error: `taskflow: unknown run ${runId}` }
     }
     try {
-      if (action === 'cancel' || action === 'pause' || action === 'takeover') {
-        this.abortRunExecutions(runId)
-      }
       const updated = await this.repository.updateRun(runId, (current) => {
         if (current.merging === true) {
           throw new Error('taskflow: cannot control while a merge is in progress')
@@ -568,6 +573,9 @@ export class TaskFlowService {
             assertTransition(current.status, 'CANCELLED')
             return transitionTo('CANCELLED', 'cancelled', `command:cancel:${runId}:${current.transitions.length}`, {
               control: { ...control, paused: false, takenOver: false },
+              executions: (current.executions ?? []).map((execution) => (
+                execution.status === 'running' ? { ...execution, status: 'pending' as const } : execution
+              )),
               events: append('run.updated', { summary: 'cancelled' }),
             })
           case 'pause':
@@ -604,36 +612,78 @@ export class TaskFlowService {
             if (current.status !== 'EXECUTING' && current.status !== 'FAILED') {
               throw new Error(`taskflow: retry requires EXECUTING or FAILED, got ${current.status}`)
             }
-            const hasFailed = (current.executions ?? []).some((execution) => execution.status === 'failed')
-            if (!hasFailed) {
-              throw new Error('taskflow: retry requires at least one failed issue')
+            const executions = current.executions ?? []
+            if (current.status === 'EXECUTING') {
+              const hasFailed = executions.some((execution) => execution.status === 'failed')
+              if (!hasFailed) {
+                throw new Error('taskflow: retry requires at least one failed issue')
+              }
+              const next: RunAggregate = {
+                ...current,
+                control: { ...control, retryCount: control.retryCount + 1 },
+                executions: executions.map((execution) => (
+                  execution.status === 'failed' ? { ...execution, status: 'pending' as const } : execution
+                )),
+                events: append('run.updated', { summary: 'retry' }),
+                updatedAt: now,
+              }
+              runAggregateSchema.parse(next)
+              return next
             }
-            const executions = (current.executions ?? []).map((execution) => (
-              execution.status === 'failed' ? { ...execution, status: 'pending' as const } : execution
-            ))
-            if (current.status === 'FAILED') {
+            // FAILED recovery: choose the phase to re-enter from persisted
+            // state so planning/review infrastructure failures are recoverable
+            // and allowedActions matches what command actually does.
+            const target = this.retryTarget(current)
+            if (target === undefined) {
+              throw new Error('taskflow: retry requires a recoverable FAILED state')
+            }
+            const retryControl = { ...control, retryCount: control.retryCount + 1 }
+            if (target === 'execution') {
               assertTransition(current.status, 'EXECUTING')
               return transitionTo('EXECUTING', 'retry', `command:retry:${runId}:${current.transitions.length}`, {
-                control: { ...control, retryCount: control.retryCount + 1 },
-                executions,
+                control: retryControl,
+                executions: executions.map((execution) => (
+                  execution.status === 'failed' ? { ...execution, status: 'pending' as const } : execution
+                )),
                 events: append('run.updated', { summary: 'retry' }),
               })
             }
-            const next: RunAggregate = {
-              ...current,
-              control: { ...control, retryCount: control.retryCount + 1 },
-              executions,
-              events: append('run.updated', { summary: 'retry' }),
-              updatedAt: now,
+            if (target === 'planning') {
+              assertTransition(current.status, 'PLANNING')
+              return transitionTo('PLANNING', 'retry-planning', `command:retry-planning:${runId}:${current.transitions.length}`, {
+                control: retryControl,
+                events: append('run.updated', { summary: 'retry-planning' }),
+              })
             }
-            runAggregateSchema.parse(next)
-            return next
+            assertTransition(current.status, 'INTEGRATION_REVIEW')
+            return transitionTo('INTEGRATION_REVIEW', 'retry-review', `command:retry-review:${runId}:${current.transitions.length}`, {
+              control: retryControl,
+              events: append('run.updated', { summary: 'retry-review' }),
+            })
           }
         }
       })
       this.notify()
-      if ((action === 'resume' || action === 'release') && updated.status === 'EXECUTING' && this.automationEnabled && this.executor !== undefined && this.isRunAutomationEnabled(updated)) {
-        void this.startExecution(runId).catch(() => undefined)
+      // The durable transition is the ordering point: abort controllers only
+      // after the update commits. This pass also catches controllers
+      // registered while the transition was being written, so no executor can
+      // start after a successful control action; a rejected command (e.g.
+      // merging=true) never aborts active work.
+      if (action === 'cancel' || action === 'pause' || action === 'takeover') {
+        this.abortRunExecutions(runId)
+        if (action === 'cancel') {
+          this.abortRunPlanning(runId)
+          this.abortRunReview(runId)
+        }
+      }
+      if ((action === 'resume' || action === 'release' || action === 'retry') && updated.status === 'EXECUTING' && this.automationEnabled && this.executor !== undefined && this.isRunAutomationEnabled(updated)) {
+        void this.ensureExecutionFlow(runId).catch(() => undefined)
+      }
+      if (action === 'retry' && updated.status === 'PLANNING' && this.automationEnabled && this.autoPlan && this.isRunAutomationEnabled(updated)) {
+        void this.plan(runId).catch(() => undefined)
+      }
+      if (action === 'retry' && updated.status === 'INTEGRATION_REVIEW' && this.automationEnabled && this.autoReview && this.isRunAutomationEnabled(updated)) {
+        void this.startReview(runId).catch(() => undefined)
       }
       return { ok: true }
     } catch (error) {
@@ -1018,7 +1068,13 @@ export class TaskFlowService {
     const flow = this.runExecutionBody(runId)
     this.executionFlows.set(runId, flow)
     void flow.then(
-      () => { this.executionFlows.delete(runId) },
+      () => {
+        this.executionFlows.delete(runId)
+        // Safety net: if a retry/rework kick raced the end of this flow, the
+        // run must not sit EXECUTING without a live wave loop. No-op unless
+        // pending issues remain and the run still needs execution.
+        void this.ensureExecutionFlow(runId).catch(() => undefined)
+      },
       () => { this.executionFlows.delete(runId) },
     )
     if (options.wait === true) {
@@ -1062,56 +1118,15 @@ export class TaskFlowService {
     if (running === undefined) {
       return { ok: false, error: `taskflow: issue '${issueKey}' is not currently running` }
     }
-    const repoRoot = run.repoRoot
-    const workDir = running.workDir
-    const branch = running.branch
-    let effectiveResult = result
-    if (result.ok && repoRoot !== undefined && workDir !== undefined && branch !== undefined) {
-      // Persist a merge-in-progress marker before touching Git so a concurrent
-      // cancel cannot interleave between the Git side effects and the ledger
-      // update. The marker is cleared in the final report update below.
-      try {
-        await this.repository.updateRun(runId, (current) => {
-          const currentRunning = current.executions?.find((execution) => execution.status === 'running' && execution.key === issueKey)
-          if (current.status !== 'EXECUTING' || currentRunning === undefined) {
-            throw new Error(`taskflow: issue '${issueKey}' is not currently running`)
-          }
-          if (current.merging === true) {
-            throw new Error('taskflow: merge already in progress')
-          }
-          const next: RunAggregate = { ...current, merging: true, updatedAt: this.now() }
-          runAggregateSchema.parse(next)
-          return next
-        })
-      } catch (error) {
-        const message = (error as Error).message
-        if (message.startsWith('taskflow:')) {
-          return { ok: false, error: message }
-        }
-        throw error
+    let effectiveResult: ExecutionResult
+    try {
+      effectiveResult = await this.mergeIssueIfNeeded(runId, issueKey, result, run, running, ['EXECUTING'])
+    } catch (error) {
+      const message = (error as Error).message
+      if (message.startsWith('taskflow:')) {
+        return { ok: false, error: message }
       }
-      try {
-        // Ensure uncommitted worktree edits are on the issue branch before the
-        // integration merge; otherwise merge would be a no-op and cleanup would
-        // silently discard the executor's work.
-        await this.worktrees.commitWorktreeEdits(workDir, `taskflow ${runId} ${issueKey}`)
-        await this.withMergeLock(repoRoot, () => this.worktrees.mergeIssueWorktree(
-          repoRoot,
-          branch,
-          `taskflow ${runId} ${issueKey}`,
-          run.runGit?.integrationBranch ?? this.integrationBranch,
-          run.baseSha,
-        ))
-      } catch (error) {
-        effectiveResult = { ok: false, error: `worktree merge failed: ${(error as Error).message}` }
-        // Best-effort clear the marker so a transient merge failure can retry.
-        await this.repository.updateRun(runId, (current) => {
-          if (current.merging !== true) return current
-          const next: RunAggregate = { ...current, merging: false, updatedAt: this.now() }
-          runAggregateSchema.parse(next)
-          return next
-        }).catch(() => undefined)
-      }
+      throw error
     }
     try {
       await this.repository.updateRun(runId, (current) => {
@@ -1194,6 +1209,180 @@ export class TaskFlowService {
       if (message.startsWith('taskflow:')) {
         return { ok: false, error: message }
       }
+      throw error
+    }
+  }
+
+  /** Persist a merge-in-progress marker and merge a successful issue branch
+   * into the integration branch. Shared by the normal EXECUTING report path
+   * and the parallel-wave settle path (run already FAILED after a sibling
+   * failure). A failed merge degrades to a failure result and clears the
+   * marker so a transient merge failure can retry. */
+  private async mergeIssueIfNeeded(
+    runId: string,
+    issueKey: string,
+    result: ExecutionResult,
+    run: RunAggregate,
+    running: IssueExecution,
+    allowedStatuses: readonly RunStatus[],
+  ): Promise<ExecutionResult> {
+    if (!result.ok) return result
+    const repoRoot = run.repoRoot
+    const workDir = running.workDir
+    const branch = running.branch
+    if (repoRoot === undefined || workDir === undefined || branch === undefined) return result
+    try {
+      // Persist a merge-in-progress marker before touching Git so a concurrent
+      // cancel cannot interleave between the Git side effects and the ledger
+      // update. The marker is cleared in the final report update below. When a
+      // sibling in the same wave holds the marker, wait for it instead of
+      // rejecting this claim (which would strand it RUNNING).
+      let acquired = false
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        const marker = await this.trySetMergeMarker(runId, issueKey, allowedStatuses)
+        if (marker === 'acquired') {
+          acquired = true
+          break
+        }
+        if (marker === 'invalid') {
+          throw new Error(`taskflow: issue '${issueKey}' is not currently running`)
+        }
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 25))
+      }
+      if (!acquired) {
+        throw new Error('taskflow: merge already in progress')
+      }
+      // Ensure uncommitted worktree edits are on the issue branch before the
+      // integration merge; otherwise merge would be a no-op and cleanup would
+      // silently discard the executor's work.
+      await this.worktrees.commitWorktreeEdits(workDir, `taskflow ${runId} ${issueKey}`)
+      await this.withMergeLock(repoRoot, () => this.worktrees.mergeIssueWorktree(
+        repoRoot,
+        branch,
+        `taskflow ${runId} ${issueKey}`,
+        run.runGit?.integrationBranch ?? this.integrationBranch,
+        run.baseSha,
+      ))
+      return result
+    } catch (error) {
+      const message = (error as Error).message
+      if (message.startsWith('taskflow:')) {
+        // A conflicting control action or merge marker must reject the report
+        // without recording anything.
+        throw error
+      }
+      const failed: ExecutionResult = { ok: false, error: `worktree merge failed: ${message}` }
+      // Best-effort clear the marker so a transient merge failure can retry.
+      await this.repository.updateRun(runId, (current) => {
+        if (current.merging !== true) return current
+        const next: RunAggregate = { ...current, merging: false, updatedAt: this.now() }
+        runAggregateSchema.parse(next)
+        return next
+      }).catch(() => undefined)
+      return failed
+    }
+  }
+
+  /** Atomically set the run merge-in-progress marker for one issue, or report
+   * why it could not be set ('busy' when a sibling merge still holds it).
+   * Returning the current aggregate for invalid/busy makes the attempt a
+   * no-op write; backend failures still propagate. */
+  private async trySetMergeMarker(
+    runId: string,
+    issueKey: string,
+    allowedStatuses: readonly RunStatus[],
+  ): Promise<'acquired' | 'busy' | 'invalid'> {
+    let result: 'acquired' | 'busy' | 'invalid' = 'invalid'
+    await this.repository.updateRun(runId, (current) => {
+      const currentRunning = current.executions?.find((execution) => execution.status === 'running' && execution.key === issueKey)
+      if (!allowedStatuses.includes(current.status) || currentRunning === undefined) {
+        result = 'invalid'
+        return current
+      }
+      if (current.merging === true) {
+        result = 'busy'
+        return current
+      }
+      const next: RunAggregate = { ...current, merging: true, updatedAt: this.now() }
+      runAggregateSchema.parse(next)
+      result = 'acquired'
+      return next
+    })
+    return result
+  }
+
+  /** Converge one issue outcome after the run has already left EXECUTING
+   * (a sibling in the same parallel wave failed first and moved the run to
+   * FAILED). The success path still merges the worktree; the outcome is
+   * recorded as done/failed WITHOUT changing the run status, so every claim
+   * in the wave converges to DONE/FAILED and retry never reuses a stale
+   * RUNNING attempt. */
+  private async settleIssueOutcome(runId: string, issueKey: string, result: ExecutionResult): Promise<boolean> {
+    const run = this.repository.getRun(runId)
+    if (run === undefined || run.status !== 'FAILED') return false
+    const running = (run.executions ?? []).find((execution) => execution.status === 'running' && execution.key === issueKey)
+    if (running === undefined) return false
+    const effectiveResult = await this.mergeIssueIfNeeded(runId, issueKey, result, run, running, ['EXECUTING', 'FAILED'])
+    try {
+      await this.repository.updateRun(runId, (current) => {
+        const currentExecutions = current.executions ?? []
+        const currentRunning = currentExecutions.find((execution) => execution.status === 'running' && execution.key === issueKey)
+        if (currentRunning === undefined) {
+          throw new Error(`taskflow: issue '${issueKey}' is not currently running`)
+        }
+        const now = this.now()
+        const finished: IssueExecution = effectiveResult.ok
+          ? {
+              key: issueKey,
+              status: 'done',
+              startedAt: currentRunning.startedAt,
+              finishedAt: now,
+              summary: effectiveResult.summary,
+              workDir: currentRunning.workDir,
+              branch: currentRunning.branch,
+              attemptId: currentRunning.attemptId,
+              phase: 'done',
+              heartbeatAt: currentRunning.heartbeatAt,
+            }
+          : {
+              key: issueKey,
+              status: 'failed',
+              startedAt: currentRunning.startedAt,
+              finishedAt: now,
+              error: effectiveResult.error,
+              workDir: currentRunning.workDir,
+              branch: currentRunning.branch,
+              attemptId: currentRunning.attemptId,
+              phase: 'failed',
+              heartbeatAt: currentRunning.heartbeatAt,
+            }
+        const executionsNext = [
+          ...currentExecutions.filter((execution) => execution.key !== issueKey),
+          finished,
+        ]
+        const next: RunAggregate = {
+          ...current,
+          merging: false,
+          executions: executionsNext,
+          updatedAt: now,
+          events: this.appendEvent(current.events ?? [], runId, effectiveResult.ok ? 'issue.finished' : 'issue.failed', {
+            issueKey,
+            summary: effectiveResult.ok ? effectiveResult.summary : effectiveResult.error,
+          }),
+        }
+        runAggregateSchema.parse(next)
+        return next
+      })
+      this.notify()
+      if (effectiveResult.ok && run.repoRoot !== undefined && running.workDir !== undefined && running.branch !== undefined) {
+        // Best-effort cleanup after the durable success record; a failure here
+        // must not fail an already-merged issue.
+        await this.worktrees.removeIssueWorktree(run.repoRoot, running.workDir, running.branch).catch(() => undefined)
+      }
+      return true
+    } catch (error) {
+      const message = (error as Error).message
+      if (message.startsWith('taskflow:')) return false
       throw error
     }
   }
@@ -1317,8 +1506,8 @@ export class TaskFlowService {
         const existing = executions.find((execution) => execution.key === candidate.key)
         claimed.push({ key: candidate.key, issue: candidate, existing })
         const running: IssueExecution = existing !== undefined
-          ? { ...existing, status: 'running', startedAt: existing.startedAt ?? this.now(), attemptId: `attempt-${candidate.key}-${this.now()}` }
-          : { key: candidate.key, status: 'running', startedAt: this.now(), attemptId: `attempt-${candidate.key}-${this.now()}` }
+          ? { ...existing, status: 'running', startedAt: existing.startedAt ?? this.now(), attemptId: this.nextAttemptId(candidate.key, existing) }
+          : { key: candidate.key, status: 'running', startedAt: this.now(), attemptId: this.nextAttemptId(candidate.key, undefined) }
         const index = nextExecutions.findIndex((execution) => execution.key === candidate.key)
         if (index >= 0) nextExecutions[index] = running
         else nextExecutions.push(running)
@@ -1345,7 +1534,8 @@ export class TaskFlowService {
         continue
       }
       const run = this.repository.getRun(runId)
-      if (run?.repoRoot === undefined) {
+      if (run === undefined || run.status !== 'EXECUTING') break
+      if (run.repoRoot === undefined) {
         await this.failRunningIssue(runId, claim.key, 'taskflow: run has no repoRoot')
         break
       }
@@ -1374,6 +1564,15 @@ export class TaskFlowService {
       }
     }
     return result
+  }
+
+  /** Monotonic per-issue attempt id: retry/re-claim never reuses the previous
+   * attempt number, so a late result from an older attempt is always rejected
+   * as stale. */
+  private nextAttemptId(issueKey: string, existing?: IssueExecution): string {
+    const match = /^attempt-[A-Za-z0-9._-]+-(\d+)$/.exec(existing?.attemptId ?? '')
+    const next = match === null ? 1 : Number(match[1]) + 1
+    return `attempt-${issueKey}-${next}`
   }
 
   /** Mark a claimed issue failed (and the run FAILED) after an infrastructure error. */
@@ -1426,16 +1625,33 @@ export class TaskFlowService {
       if (run === undefined || run.repoRoot === undefined) return
       const repoRoot = run.repoRoot
       const outcomes = await Promise.all(claims.map(async (claim) => {
-        let result: ExecutionResult
+        let outcome: { executed: false } | { executed: true; result: ExecutionResult }
         try {
-          result = await this.executeClaim(runId, claim, repoRoot)
+          outcome = await this.executeClaim(runId, claim, repoRoot)
         } catch (error) {
           // An executor infrastructure crash is a run failure, not a client
           // conflict: strip any taskflow: prefix so the record lands as FAILED.
-          result = { ok: false, error: (error as Error).message.replace(/^taskflow:\s*/, '') }
+          outcome = { executed: true, result: { ok: false, error: (error as Error).message.replace(/^taskflow:\s*/, '') } }
         }
-        const report = await this.reportResult(runId, claim.key, result)
-        return report.ok && result.ok
+        if (!outcome.executed) return true
+        const settled = await this.withOutcomeLock(runId, async () => {
+          let report: ExecutionReport
+          try {
+            report = await this.reportResult(runId, claim.key, outcome.result)
+          } catch (error) {
+            report = { ok: false, error: (error as Error).message }
+          }
+          if (report.ok) return true
+          // A sibling failed first and moved the run to FAILED; converge this
+          // claim's per-issue state without rewriting the run status.
+          try {
+            return await this.settleIssueOutcome(runId, claim.key, outcome.result)
+          } catch {
+            return false
+          }
+        })
+        if (!settled) return false
+        return outcome.result.ok
       }))
       if (outcomes.some((ok) => !ok)) return
     }
@@ -1449,10 +1665,10 @@ export class TaskFlowService {
     runId: string,
     claim: { key: string; issue: PlannedIssue; workDir?: string; branch?: string },
     repoRoot: string,
-  ): Promise<ExecutionResult> {
+  ): Promise<{ executed: false } | { executed: true; result: ExecutionResult }> {
     const executor = this.executor
     if (executor === undefined) {
-      return { ok: false, error: 'taskflow: no executor configured' }
+      return { executed: false }
     }
     const workDir = claim.workDir ?? join(defaultPlanRoot(), runId, claim.issue.key)
     const persisted = this.repository.getRun(runId)
@@ -1471,31 +1687,55 @@ export class TaskFlowService {
 
     const controller = new AbortController()
     this.registerActiveExecution(runId, controller)
-    const currentRun = this.repository.getRun(runId)
-    const reviewFindings = currentRun?.review?.findings?.filter((finding) => finding.issueKey === claim.key)
-    const input: AutomatedExecutionInput = {
-      runId,
-      issue: claim.issue,
-      repoRoot,
-      workDir,
-      attemptId,
-      reviewFindings,
-      signal: controller.signal,
-      onProgress: (event) => {
-        void this.recordProgress(runId, claim.key, {
-          attemptId,
-          phase: event.phase,
-          summary: event.summary,
-          at: event.at,
-        })
-      },
-    }
     try {
-      const raw = await this.withExecutorSlot(() => executor.execute(input as never))
-      if (this.isAutomatedResult(raw) && raw.attemptId !== attemptId) {
-        return { ok: false, error: `stale executor result for ${claim.key}: expected ${attemptId}, got ${raw.attemptId}` }
+      // Authorize the executor BEFORE it starts: a pause/cancel/takeover that
+      // completed during claim/worktree preparation must never be followed by
+      // a new executor, and any RUNNING claim it reset must stay pending.
+      const currentRun = this.repository.getRun(runId)
+      const currentExecution = currentRun?.executions?.find((execution) => execution.key === claim.key)
+      if (
+        currentRun === undefined
+        || currentRun.status !== 'EXECUTING'
+        || currentRun.control?.paused === true
+        || currentRun.control?.takenOver === true
+        || currentExecution?.status !== 'running'
+        || controller.signal.aborted
+      ) {
+        return { executed: false }
       }
-      return this.normalizeExecutorResult(raw)
+      const reviewFindings = currentRun.review?.findings?.filter((finding) => finding.issueKey === claim.key)
+      const input: AutomatedExecutionInput = {
+        runId,
+        issue: claim.issue,
+        repoRoot,
+        workDir,
+        attemptId,
+        reviewFindings,
+        signal: controller.signal,
+        onProgress: (event) => {
+          void this.recordProgress(runId, claim.key, {
+            attemptId,
+            phase: event.phase,
+            summary: event.summary,
+            at: event.at,
+          })
+        },
+      }
+      const slot = await this.withExecutorSlot(async () => {
+        if (controller.signal.aborted) {
+          // The slot was acquired after the control action completed; never
+          // hand a new Codex process to a run that is no longer authorized.
+          return { skipped: true as const }
+        }
+        const raw = await executor.execute(input as never)
+        return { skipped: false as const, raw }
+      })
+      if (slot.skipped) return { executed: false }
+      const raw = slot.raw
+      if (this.isAutomatedResult(raw) && raw.attemptId !== attemptId) {
+        return { executed: true, result: { ok: false, error: `stale executor result for ${claim.key}: expected ${attemptId}, got ${raw.attemptId}` } }
+      }
+      return { executed: true, result: this.normalizeExecutorResult(raw) }
     } finally {
       this.unregisterActiveExecution(runId, controller)
     }
@@ -1526,6 +1766,8 @@ export class TaskFlowService {
   /** Background P4 review body: reviewer → PASS/REVISE transition
    * (single-flight via reviewFlows). */
   private async runReviewBody(runId: string): Promise<void> {
+    const controller = new AbortController()
+    this.activeReviews.set(runId, controller)
     try {
       const run = this.repository.getRun(runId)
       if (run === undefined) return
@@ -1542,10 +1784,12 @@ export class TaskFlowService {
         runAggregateSchema.parse(next)
         return next
       })
+      if (controller.signal.aborted) return
       const integrationBranch = run.runGit?.integrationBranch ?? this.integrationBranch
       const integrationHeadSha = run.baseSha === undefined
         ? undefined
         : await this.worktrees.getBranchHeadSha(run.repoRoot, integrationBranch)
+      if (controller.signal.aborted) return
       const raw = await this.reviewer.review({
         runId,
         title: run.title,
@@ -1557,8 +1801,12 @@ export class TaskFlowService {
         baseSha: run.baseSha,
         integrationBranch,
         integrationHeadSha,
+        signal: controller.signal,
       })
-      const result = this.normalizeReviewResult(run, raw)
+      if (controller.signal.aborted) return
+      const live = this.repository.getRun(runId)
+      if (live === undefined || live.status !== 'INTEGRATION_REVIEW') return
+      const result = this.normalizeReviewResult(live, raw)
       if (result.verdict === 'PASS') {
         await this.repository.updateRun(runId, (current) => {
           assertTransition(current.status, 'AWAITING_HUMAN')
@@ -1570,8 +1818,8 @@ export class TaskFlowService {
         this.notify()
         return
       }
-      const reworkKeys = this.reworkClosure(run, result.reworkKeys)
-      const reviewCycles = (run.control?.reviewCycles ?? 0) + 1
+      const reworkKeys = this.reworkClosure(live, result.reworkKeys)
+      const reviewCycles = (live.control?.reviewCycles ?? 0) + 1
       const limitReached = reviewCycles >= this.maxReviewCycles
       if (limitReached) {
         await this.repository.updateRun(runId, (current) => {
@@ -1598,9 +1846,10 @@ export class TaskFlowService {
       this.notify()
       const runAfterReview = this.repository.getRun(runId)
       if (this.automationEnabled && this.executor !== undefined && runAfterReview?.status === 'EXECUTING' && this.isRunAutomationEnabled(runAfterReview)) {
-        void this.startExecution(runId).catch(() => undefined)
+        void this.ensureExecutionFlow(runId).catch(() => undefined)
       }
     } catch (error) {
+      if (controller.signal.aborted) return
       const message = error instanceof ReviewerError
         ? error.message
         : (error as Error).message
@@ -1609,6 +1858,8 @@ export class TaskFlowService {
       } catch {
         // The run is already terminal; the first transition attempt recorded the failure.
       }
+    } finally {
+      this.activeReviews.delete(runId)
     }
   }
 
@@ -1745,15 +1996,22 @@ export class TaskFlowService {
 
   /** Background planning body: planner → validate → READY/FAILED (single-flight via planFlows). */
   private async runPlanningBody(runId: string, inputHash: string): Promise<void> {
+    const controller = new AbortController()
+    this.activePlanning.set(runId, controller)
     try {
       const run = this.repository.getRun(runId)
       if (run === undefined) return
+      if (controller.signal.aborted) return
       const planObject = await this.planner.plan({
         title: run.title,
         description: run.description,
         repoRoot: run.repoRoot ?? '',
         workDir: join(defaultPlanRoot(), runId),
+        signal: controller.signal,
       })
+      if (controller.signal.aborted) return
+      const live = this.repository.getRun(runId)
+      if (live === undefined || live.status !== 'PLANNING') return
       const rawIssues = (planObject as { issues?: unknown } | null)?.issues
       const issues = Array.isArray(rawIssues) ? rawIssues as PlannedIssue[] : undefined
       const verdict = issues === undefined
@@ -1781,6 +2039,7 @@ export class TaskFlowService {
         }
       }
     } catch (error) {
+      if (controller.signal.aborted) return
       const message = error instanceof PlannerError
         ? error.message
         : (error as Error).message
@@ -1789,6 +2048,8 @@ export class TaskFlowService {
       } catch {
         // The run is already terminal; the first transition attempt recorded the failure.
       }
+    } finally {
+      this.activePlanning.delete(runId)
     }
   }
 
@@ -1840,9 +2101,10 @@ export class TaskFlowService {
         allowed.add('cancel')
         break
       case 'FAILED':
-        if ((run.executions ?? []).some((execution) => execution.status === 'failed')) {
-          allowed.add('retry')
-        }
+        // retry is always recoverable from FAILED: a failed execution
+        // re-enters EXECUTING, a planning failure re-enters PLANNING, and a
+        // review failure re-enters INTEGRATION_REVIEW.
+        allowed.add('retry')
         break
     }
     return Array.from(allowed)
@@ -1875,6 +2137,73 @@ export class TaskFlowService {
     const set = this.activeExecutions.get(runId)
     if (set === undefined) return
     for (const controller of set) controller.abort()
+  }
+
+  /** Abort the in-flight planner for one run (cancel). */
+  private abortRunPlanning(runId: string): void {
+    this.activePlanning.get(runId)?.abort()
+  }
+
+  /** Abort the in-flight reviewer for one run (cancel). */
+  private abortRunReview(runId: string): void {
+    this.activeReviews.get(runId)?.abort()
+  }
+
+  /** Decide which phase a FAILED run's retry must re-enter: a failed
+   * execution re-enters EXECUTING, a never-published plan re-enters
+   * PLANNING, and a review-gate failure re-enters INTEGRATION_REVIEW. */
+  private retryTarget(run: RunAggregate): 'execution' | 'planning' | 'review' | undefined {
+    const failure = [...run.transitions].reverse().find((transition) => transition.to === 'FAILED')
+    if (failure?.from === 'PLANNING') return 'planning'
+    if (failure?.from === 'INTEGRATION_REVIEW') return 'review'
+    if (failure?.from === 'EXECUTING') return 'execution'
+    if ((run.executions ?? []).some((execution) => execution.status === 'failed')) return 'execution'
+    if (run.issues.length === 0) return 'planning'
+    return 'review'
+  }
+
+  /** Restart the automatic execution wave after a control/recovery transition.
+   * Awaits a still-settling flow so the new wave cannot be swallowed by the
+   * single-flight gate, then starts a fresh flow only when the run still
+   * needs execution (EXECUTING, not paused/taken over, pending issues). */
+  private async ensureExecutionFlow(runId: string): Promise<void> {
+    const existing = this.executionFlows.get(runId)
+    if (existing !== undefined) {
+      await existing.catch(() => undefined)
+    }
+    const run = this.repository.getRun(runId)
+    if (run === undefined || run.status !== 'EXECUTING') return
+    if (!this.automationEnabled || this.executor === undefined || !this.isRunAutomationEnabled(run)) return
+    if (run.control?.paused === true || run.control?.takenOver === true) return
+    const executions = run.executions ?? []
+    const hasPending = run.issues.some((issue) => {
+      const execution = executions.find((item) => item.key === issue.key)
+      return execution === undefined || execution.status === 'pending'
+    })
+    if (!hasPending) return
+    await this.startExecution(runId).catch(() => undefined)
+  }
+
+  /** Serialize automatic outcomes for one run. This keeps the durable merge
+   * marker, Git side effects, and the matching execution update in one
+   * ordered lane while independent runs still proceed concurrently. */
+  private async withOutcomeLock<T>(runId: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.outcomeLocks.get(runId) ?? Promise.resolve()
+    let release!: () => void
+    const gate = new Promise<void>((resolvePromise) => {
+      release = resolvePromise
+    })
+    const current = previous.catch(() => undefined).then(() => gate)
+    this.outcomeLocks.set(runId, current)
+    await previous.catch(() => undefined)
+    try {
+      return await fn()
+    } finally {
+      release()
+      if (this.outcomeLocks.get(runId) === current) {
+        this.outcomeLocks.delete(runId)
+      }
+    }
   }
 
   /** Global semaphore enforcing `maxExecutorProcesses` across all runs. */

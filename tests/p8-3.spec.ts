@@ -122,7 +122,7 @@ describe('P8.3 auto coordinator', () => {
       ['C:/repo'],
       undefined,
       undefined,
-      { git: fakeGit, automationEnabled: true, autoPlan: true },
+      { git: fakeGit, automationEnabled: true, autoPlan: true, requireExecutionPermission: false },
     )
 
     const run = await service.submit({ title: '自动规划', repoRoot: 'C:/repo' })
@@ -144,7 +144,7 @@ describe('P8.3 auto coordinator', () => {
       ['C:/repo'],
       executor,
       reviewer,
-      { git: fakeGit, automationEnabled: true, autoPlan: true, autoReview: true },
+      { git: fakeGit, automationEnabled: true, autoPlan: true, autoReview: true, requireExecutionPermission: false },
     )
 
     const run = await service.submit({ title: '全自动', repoRoot: 'C:/repo' })

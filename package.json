@@ -1,8 +1,12 @@
 {
   "name": "dsh-taskflow",
-  "description": "DSH 全自动任务工作流插件：Codex 规划拆分 Issue，看板编排，DAG 并行执行，自动审查与人工验收。",
+  "description": "DSH 任务工作流插件：Codex 规划拆分 Issue，看板编排，DAG 并行执行，自动审查与人工验收。",
   "version": "0.1.0",
   "private": false,
+  "packageManager": "pnpm@11.21.0",
+  "engines": {
+    "node": ">=20.19.0"
+  },
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -20,15 +24,19 @@
     "./package.json": "./package.json"
   },
   "files": [
+    ".agents",
     "lib",
     "src",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "LICENSE",
+    "README.md"
   ],
   "scripts": {
     "build": "tsdown && tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.client.json",
     "test": "vitest run",
-    "check": "pnpm run typecheck && pnpm run test && pnpm run build"
+    "check": "pnpm run typecheck && pnpm run test && pnpm run build",
+    "prepack": "pnpm run build"
   },
   "dsh": {
     "bundle": {
@@ -83,5 +91,13 @@
     "typescript": "^5.9.3",
     "vitest": "^4.1.1"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zhuzhihao991016-ui/dsh-taskflow.git"
+  },
+  "bugs": {
+    "url": "https://github.com/zhuzhihao991016-ui/dsh-taskflow/issues"
+  },
+  "homepage": "https://github.com/zhuzhihao991016-ui/dsh-taskflow#readme",
   "license": "MIT"
 }

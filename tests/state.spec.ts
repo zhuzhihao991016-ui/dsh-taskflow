@@ -61,8 +61,10 @@ describe('RUN_TRANSITIONS', () => {
     }
   })
 
-  it('allows retry from FAILED back to EXECUTING', () => {
+  it('allows FAILED recovery back to planning, execution, or review', () => {
+    expect(canTransition('FAILED', 'PLANNING')).toBe(true)
     expect(canTransition('FAILED', 'EXECUTING')).toBe(true)
+    expect(canTransition('FAILED', 'INTEGRATION_REVIEW')).toBe(true)
   })
 })
 

@@ -3,11 +3,12 @@
  * ephemeral, schema-constrained run to produce the Issue plan for a run,
  * then parses the JSONL event stream back into issue objects. The process
  * executor is injectable so contract tests drive the adapter with fakes;
- * the production executor spawns the npm-global Codex CLI directly (node
- * entry, no shell).
+ * the production executor launches the Codex CLI: JS entries through the
+ * current Node runtime and native/PATH executables directly. Batch launchers
+ * are rejected because cmd.exe cannot preserve an arbitrary argv safely.
  */
 
-import { spawn } from 'node:child_process'
+import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
@@ -38,6 +39,10 @@ export interface ProcessResult {
   stdout: string
   stderr: string
   timedOut: boolean
+  /** True when the run was terminated by an abort signal (not a timeout). */
+  aborted?: boolean
+  /** True when the run was terminated because combined output exceeded the cap. */
+  outputLimitExceeded?: boolean
 }
 
 /** Executor contract; production uses {@link spawnCodexProcess}, tests use fakes. */
@@ -48,50 +53,209 @@ export interface ProcessExecutor {
     stdinText: string
     timeoutMs: number
     signal?: AbortSignal
+    /** Combined stdout+stderr cap in bytes (defaults to 64 MiB). */
+    maxOutputBytes?: number
   }): Promise<ProcessResult>
 }
 
+/** Default cap for combined stdout+stderr collected from one Codex run. */
+const DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024 * 1024
+
+/** Grace period before force-settling a killed run if 'close' never arrives. */
+const KILL_SETTLE_GRACE_MS = 3000
+
+/** Signal used to terminate the whole child process tree. */
+const TREE_KILL_SIGNAL: NodeJS.Signals = 'SIGKILL'
+
+function isJavaScriptEntry(file: string): boolean {
+  return /\.(?:c|m)?js$/i.test(file)
+}
+
+function isCmdEntry(file: string): boolean {
+  return /\.(?:cmd|bat)$/i.test(file)
+}
+
+/** Read the live AbortSignal state without retaining a stale type narrowing. */
+function isAbortRequested(signal: AbortSignal | undefined): boolean {
+  return signal?.aborted === true
+}
+
 /**
- * Production executor: spawns the Codex CLI node entry with the given argv,
- * writes the prompt to stdin, collects stdout/stderr, and kills the process
- * (then waits for exit) on timeout or abort signal.
+ * Resolve the spawn target for a Codex CLI command. JS entries run under the
+ * current Node runtime; native entries (including the bare `codex`
+ * executable on PATH) launch directly. .cmd/.bat launchers are rejected:
+ * callers should point CODEX_CLI_PATH at the underlying .js or .exe entry.
+ */
+function resolveSpawnTarget(command: readonly string[]): {
+  file: string
+  args: string[]
+  detached: boolean
+} {
+  const [entry, ...rest] = command
+  if (isJavaScriptEntry(entry)) {
+    return { file: process.execPath, args: [entry, ...rest], detached: process.platform !== 'win32' }
+  }
+  if (isCmdEntry(entry)) {
+    throw new TypeError(
+      'taskflow: .cmd/.bat launchers are not supported; set CODEX_CLI_PATH to the underlying .js or .exe entry',
+    )
+  }
+  return { file: entry, args: [...rest], detached: process.platform !== 'win32' }
+}
+
+/**
+ * Terminate the entire process tree of one spawned child. POSIX children are
+ * spawned detached into their own process group, so `kill(-pid)` reaches every
+ * descendant; Windows uses `taskkill /T /F` with argv-only arguments (the PID
+ * is a plain argument, never a shell expression).
+ */
+function killProcessTree(child: ChildProcess): void {
+  const pid = child.pid
+  if (pid === undefined) {
+    child.kill(TREE_KILL_SIGNAL)
+    return
+  }
+  if (process.platform === 'win32') {
+    execFile('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true }, () => undefined)
+  } else {
+    try {
+      process.kill(-pid, TREE_KILL_SIGNAL)
+    } catch {
+      child.kill(TREE_KILL_SIGNAL)
+    }
+  }
+}
+
+/**
+ * Production executor: resolves the CLI entry (Node script or native
+ * executable), writes the prompt to stdin, collects
+ * stdout/stderr under a hard output cap, and terminates the whole child
+ * process tree on timeout, abort, or output-limit overflow. Every run settles
+ * exactly once and always removes the timer and abort listener.
  */
 export const spawnCodexProcess: ProcessExecutor = {
   async run(request) {
+    if (request.command.length === 0) {
+      throw new TypeError('taskflow: spawnCodexProcess requires a non-empty command')
+    }
+    if (isAbortRequested(request.signal)) {
+      return { exitCode: null, stdout: '', stderr: '', timedOut: false, aborted: true }
+    }
+    const maxOutputBytes = Math.floor(request.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES)
+    if (!Number.isFinite(maxOutputBytes) || maxOutputBytes <= 0) {
+      throw new TypeError('taskflow: maxOutputBytes must be a positive finite number')
+    }
+    const timeoutMs = Math.floor(request.timeoutMs)
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      throw new TypeError('taskflow: timeoutMs must be a positive finite number')
+    }
+    const { file, args, detached } = resolveSpawnTarget(request.command)
     return new Promise((resolve) => {
-      const child = spawn(process.execPath, [...request.command], {
+      const child = spawn(file, args, {
         cwd: request.cwd,
         stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true,
+        detached,
       })
       let stdout = ''
       let stderr = ''
+      let stdoutBytes = 0
+      let stderrBytes = 0
       let timedOut = false
-      const timer = setTimeout(() => {
-        timedOut = true
-        child.kill()
-      }, request.timeoutMs)
-      const onAbort = (): void => {
-        child.kill()
-      }
-      if (request.signal?.aborted === true) {
-        child.kill()
-      } else {
-        request.signal?.addEventListener('abort', onAbort, { once: true })
-      }
-      const cleanup = (): void => {
-        clearTimeout(timer)
+      let aborted = false
+      let outputLimitExceeded = false
+      let settled = false
+      let timer: NodeJS.Timeout | undefined
+      let killFallbackTimer: NodeJS.Timeout | undefined
+
+      function cleanup(): void {
+        if (timer !== undefined) clearTimeout(timer)
+        if (killFallbackTimer !== undefined) clearTimeout(killFallbackTimer)
         request.signal?.removeEventListener('abort', onAbort)
       }
-      child.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf8') })
-      child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf8') })
-      child.on('error', (error) => {
+      function settle(result: ProcessResult): void {
+        if (settled) return
+        settled = true
         cleanup()
-        resolve({ exitCode: null, stdout, stderr: `${stderr}\n${error.message}`, timedOut })
+        resolve(result)
+      }
+      function armKillFallback(): void {
+        if (killFallbackTimer !== undefined) return
+        killFallbackTimer = setTimeout(() => {
+          settle({
+            exitCode: null,
+            stdout,
+            stderr,
+            timedOut,
+            ...(aborted ? { aborted: true } : {}),
+            ...(outputLimitExceeded ? { outputLimitExceeded: true } : {}),
+          })
+        }, KILL_SETTLE_GRACE_MS)
+      }
+      function onAbort(): void {
+        aborted = true
+        killProcessTree(child)
+        armKillFallback()
+      }
+      timer = setTimeout(() => {
+        timedOut = true
+        killProcessTree(child)
+        armKillFallback()
+      }, timeoutMs)
+
+      if (isAbortRequested(request.signal)) {
+        onAbort()
+      } else {
+        request.signal?.addEventListener('abort', onAbort, { once: true })
+        // abort() can dispatch synchronously on Node's EventTarget, so the
+        // signal may flip between the check and the registration; re-check.
+        if (isAbortRequested(request.signal)) onAbort()
+      }
+      child.stdout.on('data', (chunk: Buffer) => {
+        if (settled || outputLimitExceeded) return
+        const remaining = Math.max(0, maxOutputBytes - stdoutBytes - stderrBytes)
+        if (remaining > 0) stdout += chunk.subarray(0, remaining).toString('utf8')
+        stdoutBytes += chunk.length
+        if (stdoutBytes + stderrBytes > maxOutputBytes) {
+          outputLimitExceeded = true
+          killProcessTree(child)
+          armKillFallback()
+        }
+      })
+      child.stderr.on('data', (chunk: Buffer) => {
+        if (settled || outputLimitExceeded) return
+        const remaining = Math.max(0, maxOutputBytes - stdoutBytes - stderrBytes)
+        if (remaining > 0) stderr += chunk.subarray(0, remaining).toString('utf8')
+        stderrBytes += chunk.length
+        if (stdoutBytes + stderrBytes > maxOutputBytes) {
+          outputLimitExceeded = true
+          killProcessTree(child)
+          armKillFallback()
+        }
+      })
+      child.stdout.on('error', () => undefined)
+      child.stderr.on('error', () => undefined)
+      child.stdin.on('error', () => undefined)
+      child.on('error', (error) => {
+        settle({
+          exitCode: null,
+          stdout,
+          stderr: `${stderr}\n${error.message}`,
+          timedOut,
+          ...(aborted ? { aborted: true } : {}),
+          ...(outputLimitExceeded ? { outputLimitExceeded: true } : {}),
+        })
       })
       child.on('close', (code) => {
-        cleanup()
-        resolve({ exitCode: code, stdout, stderr, timedOut })
+        const exitCode = timedOut || aborted || outputLimitExceeded ? null : code
+        settle({
+          exitCode,
+          stdout,
+          stderr,
+          timedOut,
+          ...(aborted ? { aborted: true } : {}),
+          ...(outputLimitExceeded ? { outputLimitExceeded: true } : {}),
+        })
       })
       child.stdin.write(request.stdinText)
       child.stdin.end()
@@ -107,6 +271,8 @@ export interface PlanInput {
   repoRoot: string
   /** Spool/work directory for the schema file and artifacts. */
   workDir: string
+  /** Optional cancellation signal forwarded to the process executor. */
+  signal?: AbortSignal
 }
 
 /** Plan outcome: the validated issue list (validation happens in the service). */
@@ -221,7 +387,8 @@ export const DEFAULT_PLAN_MAX_RETRIES = 1
 /**
  * Resolve the Codex CLI entry to spawn. Order: explicit `CODEX_CLI_PATH`
  * environment override, the npm-global node entry on Windows, else the bare
- * `codex` executable (Unix PATH lookup by the spawned node process).
+ * `codex` executable (launched directly on Unix; on Windows it must resolve
+ * to an .exe or use `CODEX_CLI_PATH` for the underlying .js entry).
  */
 export function resolveCodexCli(): string {
   const explicit = process.env.CODEX_CLI_PATH
@@ -281,7 +448,14 @@ export class CodexPlanner {
         cwd: repoRoot,
         stdinText: prompt,
         timeoutMs: this.timeoutMs,
+        signal: input.signal,
       })
+      if (result.aborted === true) {
+        throw new PlannerError('process-failed', 'aborted')
+      }
+      if (result.outputLimitExceeded === true) {
+        throw new PlannerError('process-failed', 'output limit exceeded')
+      }
       if (result.timedOut) {
         lastError = new PlannerError('timeout', `codex exec exceeded ${this.timeoutMs}ms`)
         continue

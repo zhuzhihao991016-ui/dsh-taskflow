@@ -50,7 +50,7 @@ export interface Config {
   maxConcurrent?: number
   /** P5: persistent branch where successful issue worktrees are merged. */
   integrationBranch?: string
-  /** P5: directory under the repo root that holds per-issue worktrees. */
+  /** P5: optional worktree root; omitted defaults to a hashed sibling directory outside the repo. */
   worktreesRoot?: string
   /** P8: master switch for the automated executor/automation; default on from P8.6. */
   automationEnabled?: boolean
@@ -79,7 +79,7 @@ export const Config: z<Config> = z.object({
   codexCliPath: z.string().default(''),
   maxConcurrent: z.number().step(1).min(1).default(1),
   integrationBranch: z.string().default('taskflow/integration'),
-  worktreesRoot: z.string().default('.taskflow/worktrees'),
+  worktreesRoot: z.string().default(''),
   automationEnabled: z.boolean().default(DEFAULT_AUTOMATION_CONFIG.enabled),
   autoPlan: z.boolean().default(DEFAULT_AUTOMATION_CONFIG.autoPlan),
   autoReview: z.boolean().default(DEFAULT_AUTOMATION_CONFIG.autoReview),
@@ -113,25 +113,149 @@ function errorStatus(error: unknown): number {
 }
 
 /**
- * Reject requests that are not same-origin POST with a JSON body. The host
- * binds loopback by default but may be exposed on 0.0.0.0, and a CORS-safelisted
- * text/plain POST would otherwise mutate the ledger without a preflight.
+ * Parse a Host header into its lowercase hostname and optional port, or null
+ * when the value is malformed. Accepts `localhost`, `127.x.x.x`, bracketed
+ * IPv6 (`[::1]:port`) and the bare `::1` loopback form; rejects embedded
+ * credentials, paths, whitespace, extra hosts and invalid ports.
+ */
+function parseHostHeader(host: string | undefined): { hostname: string; port?: string } | null {
+  if (host === undefined) return null
+  const raw = host.trim()
+  if (
+    raw === ''
+    || raw !== host
+    || /\s/.test(raw)
+    || raw.includes('@')
+    || raw.includes('/')
+    || raw.includes('\\')
+    || raw.includes(',')
+  ) {
+    return null
+  }
+  let hostname: string
+  let port: string | undefined
+  if (raw.startsWith('[')) {
+    const close = raw.indexOf(']')
+    if (close <= 1) return null
+    hostname = raw.slice(1, close)
+    const suffix = raw.slice(close + 1)
+    if (suffix === '') {
+      port = undefined
+    } else if (suffix.startsWith(':')) {
+      port = suffix.slice(1)
+    } else {
+      return null
+    }
+  } else {
+    const firstColon = raw.indexOf(':')
+    if (firstColon === -1) {
+      hostname = raw
+      port = undefined
+    } else if (raw.indexOf(':', firstColon + 1) !== -1) {
+      // Bare IPv6 is only accepted for the exact loopback form; anything else
+      // must use the bracketed syntax.
+      if (raw !== '::1') return null
+      hostname = raw
+      port = undefined
+    } else {
+      hostname = raw.slice(0, firstColon)
+      port = raw.slice(firstColon + 1)
+    }
+  }
+  if (hostname === '') return null
+  if (port !== undefined && (!/^\d{1,5}$/.test(port) || Number(port) > 65535)) return null
+  return { hostname: hostname.toLowerCase(), port }
+}
+
+/** Whether a hostname or socket address belongs to the loopback network. */
+function isLoopbackHostname(hostname: string): boolean {
+  if (hostname === 'localhost' || hostname === '::1') return true
+  if (hostname.startsWith('::ffff:')) {
+    return isMappedLoopback(hostname.slice('::ffff:'.length))
+  }
+  return isDottedLoopback(hostname)
+}
+
+/** Whether a dotted-quad address is within 127.0.0.0/8. */
+function isDottedLoopback(address: string): boolean {
+  if (!/^127(?:\.\d{1,3}){3}$/.test(address)) return false
+  return address.split('.').every((part) => Number(part) <= 255)
+}
+
+/**
+ * Whether the remainder after the `::ffff:` prefix is an IPv4-mapped 127/8
+ * address: either the dotted quad `127.a.b.c` or canonical hex with the first
+ * group in `7f00`..`7fff`. Other mapped values are not loopback.
+ */
+function isMappedLoopback(address: string): boolean {
+  if (isDottedLoopback(address)) return true
+  const hex = /^([0-9a-f]{1,4}):[0-9a-f]{1,4}$/.exec(address)
+  if (hex === null) return false
+  const high = Number.parseInt(hex[1], 16)
+  return high >= 0x7f00 && high <= 0x7fff
+}
+
+/** Whether an Origin header value is strictly same-origin with the Host. */
+function originMatchesHost(
+  origin: string | undefined,
+  host: { hostname: string; port?: string },
+  requestProtocol: 'http:' | 'https:',
+): boolean {
+  if (origin === undefined) return true
+  if (origin === 'null') return false
+  let parsed: URL
+  try {
+    parsed = new URL(origin)
+  } catch {
+    return false
+  }
+  if (parsed.protocol !== requestProtocol) return false
+  if (parsed.username !== '' || parsed.password !== '') return false
+  if (parsed.pathname !== '/' || parsed.search !== '' || parsed.hash !== '') return false
+  let originHostname = parsed.hostname.toLowerCase()
+  if (originHostname.startsWith('[') && originHostname.endsWith(']')) {
+    originHostname = originHostname.slice(1, -1)
+  }
+  const defaultPort = requestProtocol === 'http:' ? '80' : '443'
+  const originPort = parsed.port === '' ? defaultPort : parsed.port
+  const hostPort = host.port ?? defaultPort
+  return originHostname === host.hostname && originPort === hostPort
+}
+
+/**
+ * Reject requests that are not loopback JSON POSTs. The host binds loopback by
+ * default but may be exposed on 0.0.0.0, and a CORS-safelisted text/plain POST
+ * would otherwise mutate the ledger without a preflight. DNS rebinding and
+ * forged Host headers are blocked by requiring a loopback Host (and, when a
+ * socket address is available, a loopback peer); browser requests must also
+ * carry an Origin that is strictly same-origin with the Host. Local
+ * non-browser clients (CLI/DSH) may omit Origin.
  * @returns an error message when the request is rejected, else undefined.
  */
-function guardMutation(req: IncomingMessage): string | undefined {
+export function guardMutation(req: IncomingMessage): string | undefined {
   if (req.method !== 'POST') {
     return 'taskflow: mutation routes require POST'
   }
   const contentType = req.headers['content-type'] ?? ''
-  if (!contentType.toLowerCase().startsWith('application/json')) {
+  const mediaType = contentType.split(';', 1)[0]?.trim().toLowerCase()
+  if (mediaType !== 'application/json') {
     return 'taskflow: mutation routes require application/json'
   }
-  const origin = req.headers.origin
-  if (origin !== undefined) {
-    const host = req.headers.host
-    if (host === undefined || (origin !== `http://${host}` && origin !== `https://${host}`)) {
-      return 'taskflow: cross-origin request rejected'
-    }
+  // Test shims and Unix-domain sockets may not expose a remote address; real
+  // TCP requests always do, and non-loopback peers are rejected.
+  const remoteAddress = req.socket?.remoteAddress
+  if (remoteAddress !== undefined && !isLoopbackHostname(remoteAddress)) {
+    return 'taskflow: non-loopback connection rejected'
+  }
+  const host = parseHostHeader(req.headers.host)
+  if (host === null || !isLoopbackHostname(host.hostname)) {
+    return 'taskflow: non-loopback host rejected'
+  }
+  const requestProtocol = (req.socket as { encrypted?: boolean } | undefined)?.encrypted === true
+    ? 'https:'
+    : 'http:'
+  if (!originMatchesHost(req.headers.origin, host, requestProtocol)) {
+    return 'taskflow: cross-origin request rejected'
   }
   return undefined
 }
@@ -484,6 +608,10 @@ data: ${JSON.stringify(event)}
 `
 }
 
+/** Heartbeat cadence for the SSE channel (comment frames keep proxies and
+ * EventSource clients from timing the stream out). */
+const SSE_HEARTBEAT_MS = 15_000
+
 /** GET /plugins/taskflow/events — P8.3 SSE channel for whitelisted taskflow
  * events. Optional `?runId=` filters to one run. On connect the most recent
  * events are replayed, then new durable events are streamed as they occur. */
@@ -513,8 +641,33 @@ export function handleEvents(service: TaskFlowService, req: IncomingMessage, res
       res.write(sseEvent(event))
     }
   })
-  res.on('close', unsubscribe)
-  res.on('error', unsubscribe)
+  let heartbeat: ReturnType<typeof setInterval> | undefined
+  let disposed = false
+  const dispose = (): void => {
+    if (disposed) return
+    disposed = true
+    if (heartbeat !== undefined) clearInterval(heartbeat)
+    heartbeat = undefined
+    unsubscribe()
+  }
+  heartbeat = setInterval(() => {
+    try {
+      if (!res.writableEnded && !res.destroyed) {
+        res.write(': heartbeat\n\n')
+      } else {
+        dispose()
+      }
+    } catch {
+      dispose()
+    }
+  }, SSE_HEARTBEAT_MS)
+  // Unref so a stranded test/CLI process is not kept alive by the channel;
+  // real server sockets keep the process alive and the timer still fires.
+  if (typeof (heartbeat as { unref?: () => void }).unref === 'function') {
+    (heartbeat as { unref?: () => void }).unref?.()
+  }
+  res.on('close', dispose)
+  res.on('error', dispose)
 }
 
 /**
@@ -549,7 +702,7 @@ export function apply(ctx: Context, config?: Config): Promise<void> {
       {
         maxConcurrent: config?.maxConcurrent ?? 1,
         integrationBranch: config?.integrationBranch ?? 'taskflow/integration',
-        worktreesRoot: config?.worktreesRoot ?? '.taskflow/worktrees',
+        worktreesRoot: config?.worktreesRoot?.trim() || undefined,
         automationEnabled: config?.automationEnabled ?? DEFAULT_AUTOMATION_CONFIG.enabled,
         maxExecutorProcesses: config?.maxExecutorProcesses ?? DEFAULT_AUTOMATION_CONFIG.maxExecutorProcesses,
         autoPlan: config?.autoPlan ?? DEFAULT_AUTOMATION_CONFIG.autoPlan,

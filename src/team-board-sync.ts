@@ -39,6 +39,11 @@ export interface TeamBoardSyncOptions {
   prefix?: string
   /** Optional owner assigned to mirrored tasks. */
   owner?: string
+  /** Runtime-only identity map (`runId:issueKey` → team-board task id)
+   * retained by `createTeamBoardSync` so a user-edited subject that loses the
+   * parseable marker is still matched in-process. Explicitly NOT durable:
+   * after a restart only subject-based rediscovery applies. */
+  knownTaskIds?: Map<string, string>
 }
 
 /** Default subject marker; stable so restarts can rediscover mirrored tasks. */
@@ -90,9 +95,36 @@ export async function syncTaskflowToTeamBoard(
 
   const existing = await teamBoard.listTasks()
   const tasksByKey = new Map<string, TeamBoardTask>()
+  const tasksById = new Map<string, TeamBoardTask>()
   for (const task of existing) {
+    tasksById.set(task.id, task)
     const parsed = parseTaskSubject(task.subject, prefix)
-    if (parsed !== null) tasksByKey.set(`${parsed.runId}:${parsed.issueKey}`, task)
+    if (parsed !== null) {
+      const key = `${parsed.runId}:${parsed.issueKey}`
+      tasksByKey.set(key, task)
+      options.knownTaskIds?.set(key, task.id)
+    }
+  }
+  // Re-bind runtime-known ids to keys even when the user edited the subject
+  // and removed the marker. This only works while this process is alive; a
+  // task that no longer exists externally falls back to re-creation.
+  if (options.knownTaskIds !== undefined) {
+    for (const [key, id] of options.knownTaskIds) {
+      if (tasksByKey.has(key)) continue
+      const task = tasksById.get(id)
+      if (task !== undefined) {
+        const parsed = parseTaskSubject(task.subject, prefix)
+        if (parsed !== null && `${parsed.runId}:${parsed.issueKey}` !== key) {
+          // The task now claims a different taskflow identity; the old
+          // runtime mapping is stale and must not double-bind one task.
+          options.knownTaskIds.delete(key)
+          continue
+        }
+        tasksByKey.set(key, task)
+      } else {
+        options.knownTaskIds.delete(key)
+      }
+    }
   }
 
   const board = service.board()
@@ -112,6 +144,7 @@ export async function syncTaskflowToTeamBoard(
       deps: [],
     })
     tasksByKey.set(key, created)
+    options.knownTaskIds?.set(key, created.id)
   }
 
   // Second pass: reconcile status, subject, owner, and dependency IDs.
@@ -139,6 +172,7 @@ export async function syncTaskflowToTeamBoard(
   const currentKeys = new Set(cards.map(({ card }) => `${card.runId}:${card.issueKey}`))
   for (const [key, task] of tasksByKey) {
     if (currentKeys.has(key)) continue
+    options.knownTaskIds?.delete(key)
     if (teamBoard.deleteTask !== undefined) {
       await teamBoard.deleteTask(task.id)
     }
@@ -154,19 +188,33 @@ export function createTeamBoardSync(
   teamBoard: TeamBoardService,
   options: TeamBoardSyncOptions = {},
 ): () => void {
-  let tail: Promise<void> = Promise.resolve()
+  const knownTaskIds = new Map<string, string>()
+  const syncOptions: TeamBoardSyncOptions = { ...options, knownTaskIds }
+  let running = false
+  let pending = false
   let disposed = false
 
   const run = (): void => {
     if (disposed) return
-    tail = tail
-      .then(() => {
-        if (disposed) return
-        return syncTaskflowToTeamBoard(service, teamBoard, options)
-      })
+    if (running) {
+      // Coalesce dense ledger bursts: at most one trailing sync runs after
+      // the in-flight one, so notifications cannot pile up an unbounded
+      // serial queue.
+      pending = true
+      return
+    }
+    running = true
+    void syncTaskflowToTeamBoard(service, teamBoard, syncOptions)
       .catch((error: unknown) => {
         // A board mirror must never break the taskflow ledger or its routes.
         console.error('[taskflow] team-board sync failed', error)
+      })
+      .finally(() => {
+        running = false
+        if (pending && !disposed) {
+          pending = false
+          run()
+        }
       })
   }
 

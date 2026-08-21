@@ -179,7 +179,8 @@ function useSseRefresh(onEvent: () => void): void {
     const handler = (): void => onEvent()
     for (const kind of SSE_EVENT_KINDS) source.addEventListener(kind, handler)
     source.onmessage = handler
-    source.onerror = () => { source.close() }
+    // Intentionally no onerror handler: EventSource reconnects automatically
+    // after transient failures; the stream is only closed on unmount below.
     return () => { source.close() }
   }, [onEvent])
 }
@@ -193,7 +194,8 @@ function useRunSse(runId: string | null, onEvent: () => void): void {
     const handler = (): void => onEvent()
     for (const kind of SSE_EVENT_KINDS) source.addEventListener(kind, handler)
     source.onmessage = handler
-    source.onerror = () => { source.close() }
+    // Intentionally no onerror handler: EventSource reconnects automatically;
+    // closing happens only when the effect cleans up (drawer/component unmount).
     return () => { source.close() }
   }, [runId, onEvent])
 }

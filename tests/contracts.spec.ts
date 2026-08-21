@@ -24,7 +24,7 @@ describe('P8.0 automation config contract', () => {
     // Existing P7 fields remain intact.
     expect(parsed.maxConcurrent).toBe(1)
     expect(parsed.integrationBranch).toBe('taskflow/integration')
-    expect(parsed.worktreesRoot).toBe('.taskflow/worktrees')
+    expect(parsed.worktreesRoot).toBe('')
   })
 
   it('accepts explicit automation overrides', () => {
@@ -75,5 +75,6 @@ describe('P8.0 contract vocabulary', () => {
     expect(config.enabled).toBe(true)
     expect(config.maxExecutorProcesses).toBeGreaterThan(0)
     expect(config.maxReviewCycles).toBeGreaterThan(0)
+    expect(config.requireExecutionPermission).toBe(true)
   })
 })

@@ -4,10 +4,11 @@
  * timeout retry, and parse failures — all driven through a fake executor.
  */
 
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { getEventListeners } from 'node:events'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   CodexPlanner,
   PlannerError,
@@ -15,6 +16,7 @@ import {
   lastAssistantText,
   parsePlanText,
   resolveCodexCli,
+  spawnCodexProcess,
   type ProcessExecutor,
   type ProcessResult,
 } from '../src/planner.ts'
@@ -32,13 +34,55 @@ afterEach(async () => {
   roots.length = 0
 })
 
+async function waitForPidFile(path: string, timeoutMs: number): Promise<number> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      const pid = Number((await readFile(path, 'utf8')).trim())
+      if (Number.isInteger(pid) && pid > 0) return pid
+    } catch {
+      // not written yet
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  throw new Error(`pid file not written within ${timeoutMs}ms: ${path}`)
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH'
+  }
+}
+
 /** Fake executor recording requests and returning scripted results. */
 class FakeExecutor implements ProcessExecutor {
-  readonly requests: Array<{ command: readonly string[]; cwd: string; stdinText: string }> = []
+  readonly requests: Array<{
+    command: readonly string[]
+    cwd: string
+    stdinText: string
+    signal?: AbortSignal
+    maxOutputBytes?: number
+  }> = []
   results: ProcessResult[] = []
 
-  run(request: { command: readonly string[]; cwd: string; stdinText: string; timeoutMs: number }): Promise<ProcessResult> {
-    this.requests.push({ command: request.command, cwd: request.cwd, stdinText: request.stdinText })
+  run(request: {
+    command: readonly string[]
+    cwd: string
+    stdinText: string
+    timeoutMs: number
+    signal?: AbortSignal
+    maxOutputBytes?: number
+  }): Promise<ProcessResult> {
+    this.requests.push({
+      command: request.command,
+      cwd: request.cwd,
+      stdinText: request.stdinText,
+      signal: request.signal,
+      maxOutputBytes: request.maxOutputBytes,
+    })
     const result = this.results.shift()
     if (result === undefined) {
       return Promise.reject(new Error('fake executor: no scripted result'))
@@ -174,6 +218,51 @@ describe('CodexPlanner', () => {
     void base
   })
 
+  it('forwards an optional abort signal to the process executor', async () => {
+    const root = await freshRoot()
+    const executor = new FakeExecutor()
+    executor.results = [{ exitCode: 0, stdout: agentMessageEvent(PLAN_JSON), stderr: '', timedOut: false }]
+    const controller = new AbortController()
+    const planner = new CodexPlanner(executor, 60_000)
+
+    await planner.plan({ ...INPUT, workDir: join(root, 'spool'), signal: controller.signal })
+
+    expect(executor.requests).toHaveLength(1)
+    expect(executor.requests[0].signal).toBe(controller.signal)
+  })
+
+  it('treats an abort/timeout race as cancellation without retrying', async () => {
+    const root = await freshRoot()
+    const executor = new FakeExecutor()
+    executor.results = [{ exitCode: null, stdout: '', stderr: '', timedOut: true, aborted: true }]
+    const planner = new CodexPlanner(executor, 60_000)
+
+    await expect(planner.plan({ ...INPUT, workDir: join(root, 'spool') })).rejects.toMatchObject({
+      code: 'process-failed',
+      message: expect.stringContaining('aborted'),
+    })
+    expect(executor.requests).toHaveLength(1)
+  })
+
+  it('reports output-limit termination without retrying, ahead of timeout', async () => {
+    const root = await freshRoot()
+    const executor = new FakeExecutor()
+    executor.results = [{
+      exitCode: null,
+      stdout: 'truncated',
+      stderr: '',
+      timedOut: true,
+      outputLimitExceeded: true,
+    }]
+    const planner = new CodexPlanner(executor, 60_000)
+
+    await expect(planner.plan({ ...INPUT, workDir: join(root, 's') })).rejects.toMatchObject({
+      code: 'process-failed',
+      message: expect.stringContaining('output limit exceeded'),
+    })
+    expect(executor.requests).toHaveLength(1)
+  })
+
   it('throws process-failed with stderr detail on a non-zero exit', async () => {
     const root = await freshRoot()
     const executor = new FakeExecutor()
@@ -278,5 +367,143 @@ describe('resolveCodexCli', () => {
       if (appData === undefined) delete process.env.APPDATA
       else process.env.APPDATA = appData
     }
+  })
+})
+
+describe('spawnCodexProcess', () => {
+  it('executes a JS entry through the current Node runtime', async () => {
+    const root = await freshRoot()
+    const script = join(root, 'entry.js')
+    await writeFile(script, 'process.stdout.write(JSON.stringify(process.argv.slice(2)))\n', 'utf8')
+    const controller = new AbortController()
+    const result = await spawnCodexProcess.run({
+      command: [script, '--model', 'gpt-test'],
+      cwd: root,
+      stdinText: '',
+      timeoutMs: 5000,
+      signal: controller.signal,
+    })
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout).toContain('--model')
+    expect(result.stdout).toContain('gpt-test')
+    expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0)
+  })
+
+  it('spawns a native executable path directly without prepending Node', async () => {
+    const root = await freshRoot()
+    const result = await spawnCodexProcess.run({
+      command: [process.execPath, '-e', 'process.stdout.write("native-ok")'],
+      cwd: root,
+      stdinText: '',
+      timeoutMs: 5000,
+    })
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout).toContain('native-ok')
+  })
+
+  it('rejects .cmd/.bat launchers instead of passing arguments through a shell', async () => {
+    const root = await freshRoot()
+    const script = join(root, 'echo-args.cmd')
+    const printer = join(root, 'print-args.cjs')
+    await writeFile(printer, 'process.stdout.write(JSON.stringify(process.argv.slice(2)) + "\\n")\n', 'utf8')
+    await writeFile(script, [
+      '@echo off',
+      `@"${process.execPath}" "%~dp0print-args.cjs" %*`,
+      'exit /b %errorlevel%',
+      '',
+    ].join('\r\n'), 'utf8')
+    const pending = spawnCodexProcess.run({
+      command: [script, 'a&b', 'two words', 'x"y', 'model_reasoning_effort="high"'],
+      cwd: root,
+      stdinText: '',
+      timeoutMs: 5000,
+    })
+    await expect(pending).rejects.toThrow('.cmd/.bat launchers are not supported')
+  })
+
+  it('settles with aborted when the signal is already aborted', async () => {
+    const root = await freshRoot()
+    const script = join(root, 'hang.js')
+    await writeFile(script, 'setInterval(() => {}, 1000)\n', 'utf8')
+    const controller = new AbortController()
+    controller.abort()
+    const result = await spawnCodexProcess.run({
+      command: [script],
+      cwd: root,
+      stdinText: '',
+      timeoutMs: 30_000,
+      signal: controller.signal,
+    })
+    expect(result.aborted).toBe(true)
+    expect(result.exitCode).toBeNull()
+    expect(result.timedOut).toBe(false)
+    expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0)
+  })
+
+  it('terminates the whole child tree on a mid-run abort', async () => {
+    const root = await freshRoot()
+    const pidFile = join(root, 'grandchild.pid')
+    const script = join(root, 'tree.js')
+    await writeFile(script, [
+      "const { spawn } = require('node:child_process')",
+      "const { writeFileSync } = require('node:fs')",
+      `const pidFile = ${JSON.stringify(pidFile)}`,
+      "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'])",
+      "child.on('spawn', () => writeFileSync(pidFile, String(child.pid)))",
+      'setInterval(() => {}, 1000)',
+      '',
+    ].join('\n'), 'utf8')
+    const controller = new AbortController()
+    const pending = spawnCodexProcess.run({
+      command: [script],
+      cwd: root,
+      stdinText: '',
+      timeoutMs: 30_000,
+      signal: controller.signal,
+    })
+    try {
+      const grandchildPid = await waitForPidFile(pidFile, 5000)
+      controller.abort()
+      const result = await pending
+      expect(result.aborted).toBe(true)
+      expect(result.exitCode).toBeNull()
+      await vi.waitFor(() => {
+        expect(isProcessAlive(grandchildPid)).toBe(false)
+      }, { timeout: 5000 })
+    } finally {
+      controller.abort()
+      await pending.catch(() => undefined)
+    }
+  })
+
+  it('kills the child and reports timedOut on timeout', async () => {
+    const root = await freshRoot()
+    const script = join(root, 'hang.js')
+    await writeFile(script, 'setInterval(() => {}, 1000)\n', 'utf8')
+    const result = await spawnCodexProcess.run({
+      command: [script],
+      cwd: root,
+      stdinText: '',
+      timeoutMs: 150,
+    })
+    expect(result.timedOut).toBe(true)
+    expect(result.exitCode).toBeNull()
+    expect(result.aborted).toBeUndefined()
+  })
+
+  it('settles once with outputLimitExceeded when combined output exceeds the cap', async () => {
+    const root = await freshRoot()
+    const script = join(root, 'noisy.js')
+    await writeFile(script, "process.stdout.write('x'.repeat(8 * 1024 * 1024))\n", 'utf8')
+    const result = await spawnCodexProcess.run({
+      command: [script],
+      cwd: root,
+      stdinText: '',
+      timeoutMs: 5000,
+      maxOutputBytes: 1024,
+    })
+    expect(result.outputLimitExceeded).toBe(true)
+    expect(result.timedOut).toBe(false)
+    expect(Buffer.byteLength(result.stdout, 'utf8')).toBeLessThanOrEqual(1024)
   })
 })

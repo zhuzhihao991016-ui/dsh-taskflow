@@ -222,6 +222,25 @@ describe('syncTaskflowToTeamBoard', () => {
     expect(teamBoard.tasks[0]?.subject).toContain('issue-001')
   })
 
+  it('updates an edited subject in place instead of recreating the task', async () => {
+    const { repository, service } = harness()
+    seedRun(repository, { id: 'run-0001', status: 'READY', issues: [issueA], executions: [] })
+    const teamBoard = new FakeTeamBoard()
+
+    await syncTaskflowToTeamBoard(service, teamBoard)
+    const originalId = teamBoard.tasks[0]?.id
+
+    await repository.updateRun('run-0001', (current) => ({
+      ...current,
+      issues: [{ key: 'issue-001', acceptance: '验收 A（修改后）' }],
+    }))
+    await syncTaskflowToTeamBoard(service, teamBoard)
+
+    expect(teamBoard.tasks).toHaveLength(1)
+    expect(teamBoard.tasks[0]?.id).toBe(originalId)
+    expect(teamBoard.tasks[0]?.subject).toContain('验收 A（修改后）')
+  })
+
   it('removes mirrored tasks that disappear after replanning', async () => {
     const { repository, service } = harness()
     seedRun(repository, { id: 'run-0001', status: 'READY', issues: [issueA], executions: [] })
@@ -268,5 +287,95 @@ describe('createTeamBoardSync', () => {
     } finally {
       dispose()
     }
+  })
+
+  it('matches a user-edited subject that lost the marker via runtime-known task ids', async () => {
+    const { repository, service } = harness()
+    seedRun(repository, {
+      id: 'run-0001',
+      status: 'READY',
+      issues: [issueA],
+      executions: [],
+    })
+    const teamBoard = new FakeTeamBoard()
+    const dispose = createTeamBoardSync(service, teamBoard)
+    try {
+      await vi.waitFor(() => {
+        expect(teamBoard.tasks).toHaveLength(1)
+      })
+      const originalId = teamBoard.tasks[0]?.id
+      teamBoard.tasks[0] = { ...teamBoard.tasks[0]!, subject: '用户改标题' }
+
+      await service.command('run-0001', 'cancel')
+      await vi.waitFor(() => {
+        expect(teamBoard.tasks).toHaveLength(1)
+        expect(teamBoard.tasks[0]?.id).toBe(originalId)
+        expect(teamBoard.tasks[0]?.subject).toContain('[taskflow]')
+      })
+    } finally {
+      dispose()
+    }
+  })
+
+  it('coalesces a dense burst of notifications into one trailing sync', async () => {
+    const { repository, service } = harness()
+    seedRun(repository, { id: 'run-0001', status: 'READY', issues: [issueA], executions: [] })
+    const teamBoard = new FakeTeamBoard()
+
+    let notify: (() => void) | undefined
+    vi.spyOn(service, 'subscribe').mockImplementation((listener) => {
+      notify = listener
+      return () => {}
+    })
+    const listSpy = vi.spyOn(teamBoard, 'listTasks')
+    let releaseFirst: (() => void) | undefined
+    listSpy.mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => {
+        releaseFirst = resolve
+      })
+      return []
+    })
+
+    const dispose = createTeamBoardSync(service, teamBoard)
+    expect(listSpy).toHaveBeenCalledTimes(1)
+
+    for (let i = 0; i < 25; i += 1) notify?.()
+    expect(listSpy).toHaveBeenCalledTimes(1)
+
+    releaseFirst?.()
+    await vi.waitFor(() => {
+      expect(listSpy).toHaveBeenCalledTimes(2)
+    })
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 20))
+    expect(listSpy).toHaveBeenCalledTimes(2)
+    dispose()
+  })
+
+  it('does not queue further syncs after disposal while one is in flight', async () => {
+    const { repository, service } = harness()
+    seedRun(repository, { id: 'run-0001', status: 'READY', issues: [issueA], executions: [] })
+    const teamBoard = new FakeTeamBoard()
+
+    let notify: (() => void) | undefined
+    vi.spyOn(service, 'subscribe').mockImplementation((listener) => {
+      notify = listener
+      return () => {}
+    })
+    const listSpy = vi.spyOn(teamBoard, 'listTasks')
+    let releaseFirst: (() => void) | undefined
+    listSpy.mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => {
+        releaseFirst = resolve
+      })
+      return []
+    })
+
+    const dispose = createTeamBoardSync(service, teamBoard)
+    for (let i = 0; i < 10; i += 1) notify?.()
+    dispose()
+
+    releaseFirst?.()
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 20))
+    expect(listSpy).toHaveBeenCalledTimes(1)
   })
 })

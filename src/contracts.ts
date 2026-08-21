@@ -140,14 +140,15 @@ export interface AutomationConfig {
   requireExecutionPermission: boolean
 }
 
-/** P8 default automation configuration; automation is on from P8.6 onward. */
+/** P8 default automation configuration; automation is on from P8.6 onward.
+ * Execution is gated behind a human release by default (secure default). */
 export const DEFAULT_AUTOMATION_CONFIG: AutomationConfig = {
   enabled: true,
   autoPlan: true,
   autoReview: true,
   maxExecutorProcesses: 2,
   maxReviewCycles: 3,
-  requireExecutionPermission: false,
+  requireExecutionPermission: true,
 }
 
 /** Re-export the base executor result for contract consumers. */
